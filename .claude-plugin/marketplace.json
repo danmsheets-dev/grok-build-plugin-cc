@@ -1,0 +1,21 @@
+{
+  "name": "xai-grok-build",
+  "owner": {
+    "name": "xAI"
+  },
+  "metadata": {
+    "description": "Grok Build ↔ Claude Code bridge plugins for review, critique, and delegation.",
+    "version": "0.2.0"
+  },
+  "plugins": [
+    {
+      "name": "grok-build",
+      "description": "Grok Build ↔ Claude Code bridge for review, critique, and delegation.",
+      "version": "0.2.0",
+      "author": {
+        "name": "xAI"
+      },
+      "source": "./plugins/grok-build"
+    }
+  ]
+}
