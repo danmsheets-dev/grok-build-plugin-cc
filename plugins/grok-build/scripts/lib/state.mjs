@@ -86,6 +86,54 @@ function writeFileAtomic(filePath, content) {
   fs.renameSync(tempPath, filePath);
 }
 
+// Confirmed directly: a lock file left behind by a crashed process (no PID,
+// no timestamp, just an empty file) permanently blocked every future
+// withStateLock call for that workspace - every run, /stop, doctor, and
+// prune - with no way to recover except a human manually deleting the file.
+const STALE_LOCK_TTL_MS = 5 * 60 * 1000;
+
+function isPidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== "ESRCH";
+  }
+}
+
+function reclaimLockIfStale(lockPath) {
+  let content;
+  try {
+    content = fs.readFileSync(lockPath, "utf8");
+  } catch {
+    return;
+  }
+
+  let holder = null;
+  try {
+    holder = JSON.parse(content);
+  } catch {
+    // Empty or unparseable lock content (an older format, or a crash mid-write)
+    // carries no way to tell who holds it or when - treat it as stale rather
+    // than blocking forever on data we can never validate.
+  }
+
+  const pid = Number(holder?.pid);
+  const createdAt = Number(holder?.createdAt);
+  const pidLooksDead = !Number.isFinite(pid) || !isPidAlive(pid);
+  const tooOld = !Number.isFinite(createdAt) || Date.now() - createdAt > STALE_LOCK_TTL_MS;
+
+  if (pidLooksDead || tooOld) {
+    try {
+      fs.unlinkSync(lockPath);
+    } catch {
+      // Another process may have already reclaimed or released it - fine,
+      // the normal wx-exclusive retry loop below is what actually decides
+      // who wins the next attempt.
+    }
+  }
+}
+
 export function withStateLock(cwd, fn) {
   ensureStateDir(cwd);
   const lockPath = path.join(resolveStateDir(cwd), LOCK_FILE_NAME);
@@ -96,10 +144,18 @@ export function withStateLock(cwd, fn) {
       fd = fs.openSync(lockPath, "wx");
     } catch (error) {
       if (error?.code === "EEXIST") {
+        reclaimLockIfStale(lockPath);
         sleepMs(LOCK_RETRY_MS);
         continue;
       }
       throw error;
+    }
+
+    try {
+      fs.writeSync(fd, JSON.stringify({ pid: process.pid, createdAt: Date.now() }));
+    } catch {
+      // Metadata is an aid to staleness detection, not a correctness
+      // requirement - an unparseable/empty lock is itself treated as stale.
     }
 
     try {
@@ -348,8 +404,19 @@ function pruneJobs(jobs) {
 }
 
 function removeFileIfExists(filePath) {
-  if (filePath && fs.existsSync(filePath)) {
+  if (!filePath) {
+    return;
+  }
+  try {
     fs.unlinkSync(filePath);
+  } catch {
+    // Best-effort. This runs during job-artifact pruning inside
+    // claimJobTerminal, which must not fail because an UNRELATED old job's
+    // leftover log file happens to be transiently locked (a Windows AV
+    // scanner opening a just-written file is a common, real cause) - a run
+    // that finished cleanly would otherwise report stuck as "running"
+    // forever because pruning some other job's leftovers threw partway
+    // through the save.
   }
 }
 
@@ -445,8 +512,10 @@ export function readJobFile(jobFile) {
 }
 
 function removeJobFile(jobFile) {
-  if (fs.existsSync(jobFile)) {
+  try {
     fs.unlinkSync(jobFile);
+  } catch {
+    // Best-effort; see removeFileIfExists.
   }
 }
 

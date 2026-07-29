@@ -3,6 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { pathToFileURL } from "node:url";
 
 import { makeTempDir } from "./helpers.mjs";
 import {
@@ -11,7 +13,8 @@ import {
   resolveJobLogFile,
   resolveStateDir,
   resolveStateFile,
-  saveState
+  saveState,
+  withStateLock
 } from "../plugins/grok-build/scripts/lib/state.mjs";
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
@@ -297,4 +300,123 @@ test("a heartbeat failure never propagates", () => {
     patchImpl: () => { throw new Error("state locked"); }
   });
   stop();
+});
+
+test("withStateLock reclaims a stale lock left by a crashed process", () => {
+  // Regression: a lock file left behind with no owner information (an empty
+  // file, matching what a crash mid-acquisition would leave) permanently
+  // blocked every future withStateLock call for that workspace - confirmed
+  // directly, it failed after ~3s and every retry after that failed
+  // identically forever, with no way to recover except deleting the file
+  // by hand.
+  const workspace = makeTempDir();
+  fs.mkdirSync(resolveStateDir(workspace), { recursive: true });
+  const lockPath = path.join(resolveStateDir(workspace), "state.json.lock");
+  fs.writeFileSync(lockPath, "");
+
+  const start = Date.now();
+  let ran = false;
+  withStateLock(workspace, () => {
+    ran = true;
+  });
+  assert.equal(ran, true);
+  assert.ok(Date.now() - start < 2000, "should reclaim quickly, not exhaust the full retry budget");
+});
+
+test("withStateLock reclaims a lock whose recorded pid is no longer alive", () => {
+  const workspace = makeTempDir();
+  fs.mkdirSync(resolveStateDir(workspace), { recursive: true });
+  const lockPath = path.join(resolveStateDir(workspace), "state.json.lock");
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: 999999, createdAt: Date.now() }));
+
+  let ran = false;
+  withStateLock(workspace, () => {
+    ran = true;
+  });
+  assert.equal(ran, true);
+});
+
+test("withStateLock reclaims a lock older than the staleness window even with a live pid", () => {
+  const workspace = makeTempDir();
+  fs.mkdirSync(resolveStateDir(workspace), { recursive: true });
+  const lockPath = path.join(resolveStateDir(workspace), "state.json.lock");
+  fs.writeFileSync(lockPath, JSON.stringify({ pid: process.pid, createdAt: Date.now() - 10 * 60 * 1000 }));
+
+  let ran = false;
+  withStateLock(workspace, () => {
+    ran = true;
+  });
+  assert.equal(ran, true);
+});
+
+test("withStateLock does NOT reclaim a genuinely live, recent lock", async () => {
+  // The critical safety property: real contention must still be respected.
+  // A second real process holding the lock must make withStateLock wait,
+  // not treat it as stale just because someone else got there first.
+  const workspace = makeTempDir();
+  const holderScript = path.join(workspace, "holder.mjs");
+  fs.writeFileSync(
+    holderScript,
+    `import { withStateLock } from ${JSON.stringify(
+      pathToFileURL(path.resolve("plugins/grok-build/scripts/lib/state.mjs")).href
+    )};\n` +
+      `withStateLock(${JSON.stringify(workspace)}, () => {\n` +
+      `  const end = Date.now() + 1200;\n` +
+      `  while (Date.now() < end) {}\n` +
+      `});\n`
+  );
+
+  const child = spawn(process.execPath, [holderScript], { stdio: "ignore" });
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  const start = Date.now();
+  let ran = false;
+  withStateLock(workspace, () => {
+    ran = true;
+  });
+  const elapsed = Date.now() - start;
+
+  await new Promise((resolve) => child.on("exit", resolve));
+
+  assert.equal(ran, true);
+  assert.ok(elapsed > 700, `expected to wait for real contention, only waited ${elapsed}ms`);
+});
+
+test("saveState survives an unlink failure on a pruned job artifact", () => {
+  // Regression: removeFileIfExists/removeJobFile did existsSync-then-unlinkSync
+  // with no error handling at all. A prune target that unlinkSync cannot
+  // remove for any reason (a Windows AV scanner transiently holding a
+  // just-written log file is the real-world trigger; a directory reproduces
+  // the same EPERM deterministically here) aborted the ENTIRE saveState call
+  // - which runs inside claimJobTerminal - so a run that finished cleanly
+  // could get stuck reporting "running" forever because pruning some
+  // UNRELATED old job's leftovers threw partway through the save.
+  const workspace = makeTempDir();
+  const stateFile = resolveStateFile(workspace);
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+
+  const jobs = Array.from({ length: 51 }, (_, index) => {
+    const jobId = `job-${index}`;
+    const updatedAt = new Date(Date.UTC(2026, 0, 1, 0, index, 0)).toISOString();
+    const logFile = resolveJobLogFile(workspace, jobId);
+    const jobFile = resolveJobFile(workspace, jobId);
+    fs.writeFileSync(logFile, `log ${jobId}\n`, "utf8");
+    fs.writeFileSync(jobFile, JSON.stringify({ id: jobId, status: "completed" }), "utf8");
+    return { id: jobId, status: "completed", logFile, updatedAt, createdAt: updatedAt };
+  });
+  fs.writeFileSync(stateFile, JSON.stringify({ version: 1, config: {}, jobs }), "utf8");
+
+  // job-0 falls outside the retained MAX_JOBS window, so it is exactly what
+  // gets pruned. Make its job file a directory so unlinkSync deterministically
+  // throws EPERM rather than actually deleting it.
+  const prunedJobFile = resolveJobFile(workspace, "job-0");
+  fs.rmSync(prunedJobFile, { force: true });
+  fs.mkdirSync(prunedJobFile);
+
+  assert.doesNotThrow(() => {
+    saveState(workspace, { version: 1, config: {}, jobs });
+  });
+
+  const savedState = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  assert.equal(savedState.jobs.length, 50, "pruning must still complete for every OTHER job");
 });

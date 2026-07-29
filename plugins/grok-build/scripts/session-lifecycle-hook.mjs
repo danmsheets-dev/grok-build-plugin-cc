@@ -4,7 +4,7 @@ import fs from "node:fs";
 import process from "node:process";
 
 import { terminateProcessTree } from "./lib/process.mjs";
-import { claimJobTerminal, loadState, resolveStateFile, saveState } from "./lib/state.mjs";
+import { claimJobTerminal, loadState, resolveStateFile, updateState } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveJobKillTargets, SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
@@ -71,10 +71,15 @@ function cleanupSessionJobs(cwd, sessionId) {
     }
   }
 
-  const nextState = loadState(workspaceRoot);
-  saveState(workspaceRoot, {
-    ...nextState,
-    jobs: nextState.jobs.filter((job) => job.sessionId !== sessionId)
+  // updateState reads and writes under ONE lock acquisition. The previous code
+  // read state, then separately called saveState with that now-possibly-stale
+  // snapshot - if another process (a different session, or this session's own
+  // background worker) added a job in between, saveState's pruning logic saw
+  // that job as "dropped" relative to the stale snapshot and deleted its files
+  // from disk. Confirmed directly: a job from an unrelated session, created in
+  // that exact window, had its job file deleted by this cleanup.
+  updateState(workspaceRoot, (state) => {
+    state.jobs = state.jobs.filter((job) => job.sessionId !== sessionId);
   });
 }
 
