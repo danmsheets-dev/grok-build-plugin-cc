@@ -174,6 +174,32 @@ export function resolveJobKillTargets(job = {}) {
   return targets;
 }
 
+export const HEARTBEAT_INTERVAL_MS = 15000;
+
+/**
+ * Patch lastHeartbeatAt on a fixed interval for the life of a run.
+ *
+ * Independent of the event stream on purpose: lastEventAt only advances when Grok
+ * emits something, so a run that dies before its first event would otherwise look
+ * untouched rather than dead.
+ */
+export function startHeartbeat(workspaceRoot, jobId, options = {}) {
+  const intervalMs = options.intervalMs ?? HEARTBEAT_INTERVAL_MS;
+  const patch = options.patchImpl ?? patchJobIfActive;
+  const beat = () => {
+    try {
+      patch(workspaceRoot, jobId, { lastHeartbeatAt: nowIso() });
+    } catch {
+      // A heartbeat must never take down the run it is reporting on.
+    }
+  };
+
+  beat();
+  const timer = setInterval(beat, intervalMs);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
+
 export async function runTrackedJob(job, runner, options = {}) {
   const bridgePid = process.pid;
   const logFile = options.logFile ?? job.logFile ?? null;
@@ -181,6 +207,7 @@ export async function runTrackedJob(job, runner, options = {}) {
     status: "running",
     startedAt: nowIso(),
     phase: "starting",
+    lastHeartbeatAt: nowIso(),
     bridgePid,
     pid: bridgePid,
     agentPid: job.agentPid ?? null,
@@ -235,20 +262,32 @@ export async function runTrackedJob(job, runner, options = {}) {
     }
   }
 
+  const stopHeartbeat = options.startHeartbeatImpl
+    ? options.startHeartbeatImpl(job.workspaceRoot, job.id)
+    : startHeartbeat(job.workspaceRoot, job.id);
+
   try {
     const execution = await runner();
-    const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
+    // A run that finished but whose verify never passed is terminal, and is not
+    // success. Only an explicitly unverified execution downgrades a zero exit.
+    const completionStatus =
+      execution.exitStatus === 0
+        ? (execution.verified === false ? "completed-unverified" : "completed")
+        : "failed";
     const claim = claimJobTerminal(job.workspaceRoot, job.id, completionStatus, {
       threadId: execution.threadId ?? null,
       turnId: execution.turnId ?? null,
       summary: execution.summary,
       result: execution.payload,
       usage: execution.usage ?? null,
+      grokVersion: execution.grokVersion ?? null,
+      verify: execution.verify ?? null,
+      worktree: execution.worktree ?? job.worktree ?? null,
       rendered: execution.rendered,
       bridgePid,
       agentPid: null,
       pid: null,
-      phase: completionStatus === "completed" ? "done" : "failed",
+      phase: completionStatus === "completed" ? "done" : completionStatus,
       logFile: options.logFile ?? job.logFile ?? null
     });
 
@@ -300,6 +339,9 @@ export async function runTrackedJob(job, runner, options = {}) {
       throw error;
     }
     throw error;
+  } finally {
+    // Every exit path, or the interval keeps the worker process alive.
+    stopHeartbeat();
   }
 }
 

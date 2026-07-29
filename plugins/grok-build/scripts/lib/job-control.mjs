@@ -116,6 +116,50 @@ export function formatRelativeAge(isoValue, now = Date.now()) {
   return minutes > 0 ? `${minutes}m ${seconds}s ago` : `${seconds}s ago`;
 }
 
+/**
+ * Is any tracked pid for this run still alive?
+ *
+ * kill(pid, 0) delivers no signal; it only asks whether the process exists.
+ * EPERM means it exists but belongs to another user, which still counts as alive.
+ * Returns null when the run records no pids at all, so "unknown" is never
+ * mistaken for "dead".
+ */
+export function isJobProcessAlive(job = {}, options = {}) {
+  const killImpl = options.killImpl ?? process.kill.bind(process);
+  const pids = [job.agentPid, job.bridgePid, job.companionPid, job.pid]
+    .map((value) => Number(value))
+    .filter((value) => Number.isFinite(value) && value > 0);
+
+  if (pids.length === 0) {
+    return null;
+  }
+
+  for (const pid of new Set(pids)) {
+    try {
+      killImpl(pid, 0);
+      return true;
+    } catch (error) {
+      if (error?.code === "EPERM" || error?.code === "EACCES") {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * A run whose tracked processes are all gone but whose status still says active.
+ * Reported at read time rather than written to state; reaping it is /prune.
+ */
+export function classifyJobLiveness(job = {}, options = {}) {
+  const active = job.status === "queued" || job.status === "running";
+  if (!active) {
+    return { abandoned: false, alive: null };
+  }
+  const alive = isJobProcessAlive(job, options);
+  return { abandoned: alive === false, alive };
+}
+
 function computeIdleSeconds(job, now = Date.now()) {
   if (job.status !== "queued" && job.status !== "running") {
     return null;
@@ -203,12 +247,22 @@ export function enrichJob(job, options = {}) {
         ? formatElapsedDuration(job.startedAt ?? job.createdAt, job.completedAt ?? job.updatedAt)
         : null,
     idleSeconds: computeIdleSeconds(job),
-    lastEventAge: formatRelativeAge(job.lastEventAt)
+    lastEventAge: formatRelativeAge(job.lastEventAt),
+    lastHeartbeatAge: formatRelativeAge(job.lastHeartbeatAt)
   };
+
+  const liveness = classifyJobLiveness(job, options);
 
   return {
     ...enriched,
-    phase: enriched.phase ?? inferLegacyJobPhase(enriched, enriched.progressPreview)
+    alive: liveness.alive,
+    abandoned: liveness.abandoned,
+    // An abandoned run's stored status still says running. Report what is true
+    // rather than what was last written; reaping it into state is /prune.
+    displayStatus: liveness.abandoned ? "abandoned" : enriched.status,
+    phase: liveness.abandoned
+      ? "abandoned"
+      : (enriched.phase ?? inferLegacyJobPhase(enriched, enriched.progressPreview))
   };
 }
 

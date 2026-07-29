@@ -172,3 +172,65 @@ test("enrichJob leaves idleSeconds null for a finished run", () => {
   });
   assert.equal(enriched.idleSeconds, null);
 });
+
+import { classifyJobLiveness, isJobProcessAlive } from "../plugins/grok-build/scripts/lib/job-control.mjs";
+import { startHeartbeat } from "../plugins/grok-build/scripts/lib/tracked-jobs.mjs";
+
+test("isJobProcessAlive returns null when a run records no pids", () => {
+  assert.equal(isJobProcessAlive({}), null);
+});
+
+test("isJobProcessAlive treats EPERM as alive", () => {
+  const alive = isJobProcessAlive({ agentPid: 42 }, {
+    killImpl: () => {
+      const error = new Error("denied");
+      error.code = "EPERM";
+      throw error;
+    }
+  });
+  assert.equal(alive, true);
+});
+
+test("a running job whose pids are all dead is classified abandoned", () => {
+  // The exact failure seen in the field: the process tree died and the record
+  // still read running/starting 38 minutes later.
+  const result = classifyJobLiveness(
+    { status: "running", bridgePid: 11908, agentPid: 10860 },
+    {
+      killImpl: () => {
+        const error = new Error("gone");
+        error.code = "ESRCH";
+        throw error;
+      }
+    }
+  );
+  assert.equal(result.abandoned, true);
+  assert.equal(result.alive, false);
+});
+
+test("a finished job is never classified abandoned", () => {
+  const result = classifyJobLiveness(
+    { status: "completed", bridgePid: 11908 },
+    { killImpl: () => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); } }
+  );
+  assert.equal(result.abandoned, false);
+});
+
+test("startHeartbeat patches immediately and returns a stopper", () => {
+  const patches = [];
+  const stop = startHeartbeat("/ws", "run-1", {
+    intervalMs: 1000,
+    patchImpl: (_ws, _id, patch) => patches.push(patch)
+  });
+  stop();
+  assert.equal(patches.length, 1, "should beat once immediately, not only after the interval");
+  assert.ok(patches[0].lastHeartbeatAt, "beat must carry a timestamp");
+});
+
+test("a heartbeat failure never propagates", () => {
+  const stop = startHeartbeat("/ws", "run-1", {
+    intervalMs: 1000,
+    patchImpl: () => { throw new Error("state locked"); }
+  });
+  stop();
+});

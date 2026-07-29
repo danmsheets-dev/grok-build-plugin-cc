@@ -119,7 +119,10 @@ export function withStateLock(cwd, fn) {
   throw new Error(`Timed out acquiring state lock at ${lockPath}`);
 }
 
-const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
+// completed-unverified is terminal but NOT success: the run finished and its
+// verify command never passed. cancelled still wins over everything, so a run the
+// user stopped is never reported as finished by a worker that lands moments later.
+const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "completed-unverified", "timed-out"]);
 
 export function isTerminalJobStatus(status) {
   return TERMINAL_STATUSES.has(status);
