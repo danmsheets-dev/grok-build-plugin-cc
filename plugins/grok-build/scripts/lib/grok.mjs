@@ -6,6 +6,7 @@ import process from "node:process";
 
 import { readJsonFile } from "./fs.mjs";
 import { binaryAvailable, runCommand } from "./process.mjs";
+import { resolveSpawnInvocation } from "./which.mjs";
 
 export const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
@@ -220,10 +221,16 @@ export function runHeadlessAgent(cwd, options = {}) {
   const platform = options.platform ?? process.platform;
   const detached = options.detached ?? platform !== "win32";
 
+  const spawnEnv = options.env ?? process.env;
+  // Resolve through PATH/PATHEXT so an extensionless shebang script on PATH is
+  // honoured. Without this, Windows CreateProcess skips it and silently runs a
+  // real `grok.exe` from elsewhere on PATH instead.
+  const invocation = resolveSpawnInvocation(binary, args, spawnEnv, platform);
+
   return new Promise((resolve, reject) => {
-    const child = spawn(binary, args, {
+    const child = spawn(invocation.executable, invocation.args, {
       cwd,
-      env: options.env ?? process.env,
+      env: spawnEnv,
       stdio: ["ignore", "pipe", "pipe"],
       detached,
       windowsHide: true

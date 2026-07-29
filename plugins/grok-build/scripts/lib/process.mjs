@@ -1,6 +1,8 @@
 import { spawnSync } from "node:child_process";
 import process from "node:process";
 
+import { resolveSpawnInvocation } from "./which.mjs";
+
 function sleepMs(ms) {
   const duration = Math.max(0, Number(ms) || 0);
   if (duration <= 0) {
@@ -12,14 +14,16 @@ function sleepMs(ms) {
 
 export function runCommand(command, args = [], options = {}) {
   const spawnSyncImpl = options.spawnSyncImpl ?? spawnSync;
-  const result = spawnSyncImpl(command, args, {
+  const env = options.env ?? process.env;
+  const platform = options.platform ?? process.platform;
+  const invocation = resolveSpawnInvocation(command, args, env, platform);
+  const result = spawnSyncImpl(invocation.executable, invocation.args, {
     cwd: options.cwd,
     env: options.env,
     encoding: "utf8",
     input: options.input,
     maxBuffer: options.maxBuffer,
     stdio: options.stdio ?? "pipe",
-    shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
     windowsHide: true
   });
 

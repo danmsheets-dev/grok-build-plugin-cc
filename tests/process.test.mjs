@@ -1,6 +1,11 @@
+import fs from "node:fs";
+import path from "node:path";
+import process from "node:process";
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { makeTempDir } from "./helpers.mjs";
+import { resolveExecutable } from "../plugins/grok-build/scripts/lib/which.mjs";
 import { runCommand, terminateProcessTree } from "../plugins/grok-build/scripts/lib/process.mjs";
 
 test("terminateProcessTree uses taskkill on Windows", () => {
@@ -129,4 +134,32 @@ test("runCommand preserves explicit zero status without a signal", () => {
 
   assert.equal(result.status, 0);
   assert.equal(result.signal, null);
+});
+
+test("resolveExecutable finds a PATHEXT match on windows", () => {
+  const dir = makeTempDir();
+  fs.writeFileSync(path.join(dir, "widget.cmd"), "@echo off\r\necho hi\r\n");
+
+  const resolved = resolveExecutable("widget", { PATH: dir, PATHEXT: ".COM;.EXE;.BAT;.CMD" }, "win32");
+  assert.equal(resolved, path.join(dir, "widget.cmd"));
+});
+
+test("resolveExecutable returns the command unchanged when nothing matches", () => {
+  const dir = makeTempDir();
+  assert.equal(resolveExecutable("nope", { PATH: dir, PATHEXT: ".EXE" }, "win32"), "nope");
+});
+
+test("resolveExecutable is a passthrough off windows", () => {
+  assert.equal(resolveExecutable("git", { PATH: "/usr/bin" }, "linux"), "git");
+});
+
+test("resolveExecutable leaves absolute paths alone", () => {
+  const absolute = path.join(makeTempDir(), "tool.exe");
+  assert.equal(resolveExecutable(absolute, { PATH: "" }, "win32"), absolute);
+});
+
+test("runCommand emits no DEP0190 deprecation warning", () => {
+  const result = runCommand(process.execPath, ["--version"]);
+  assert.equal(result.status, 0);
+  assert.doesNotMatch(result.stderr, /DEP0190/);
 });

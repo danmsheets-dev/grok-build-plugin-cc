@@ -15,12 +15,24 @@ import {
 } from "../plugins/grok-build/scripts/lib/state.mjs";
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
+  // The temp fallback only applies when CLAUDE_PLUGIN_DATA is unset; clear it so
+  // the test is hermetic rather than dependent on the host's plugin data root.
+  const previousPluginData = process.env.CLAUDE_PLUGIN_DATA;
+  delete process.env.CLAUDE_PLUGIN_DATA;
+  try {
   const workspace = makeTempDir();
   const stateDir = resolveStateDir(workspace);
 
   assert.equal(stateDir.startsWith(os.tmpdir()), true);
   assert.match(path.basename(stateDir), /.+-[a-f0-9]{16}$/);
   assert.match(stateDir, /grok-cc-runs/);
+  } finally {
+    if (previousPluginData === undefined) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previousPluginData;
+    }
+  }
 });
 
 test("resolveStateDir uses CLAUDE_PLUGIN_DATA when it is provided", () => {
