@@ -30,15 +30,18 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" land "$ARGUMENTS"
 node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" land "$ARGUMENTS" --preview --json
 ```
 
-- If that reports an error, return the error verbatim and stop. Two errors are expected
-  and are not bugs:
-  - the run has no worktree, meaning it ran without isolation
-  - the working tree is dirty, meaning the user must commit or stash first
+- If that reports an error, return the error verbatim and stop. One error is expected
+  and is not a bug: the run has no worktree, meaning it ran without isolation (or was
+  already landed or discarded earlier).
 - Otherwise use `AskUserQuestion` exactly once with two options:
   - `Apply to my working tree (Recommended)`
   - `Discard the run`
 - On apply, run the bridge `land` without `--preview` and without `--discard`. On discard,
   re-run it with `--discard`.
+- **The dirty-working-tree check only runs on the apply step, never during `--preview`.**
+  `--preview` is read-only and returns before that check exists in the code at all — the
+  diff can be shown even with a dirty tree. If apply then reports the tree is dirty, tell
+  the user to commit or stash first and stop; do not retry with `--discard`.
 
 After a successful apply:
 
