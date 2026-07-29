@@ -1,0 +1,179 @@
+/**
+ * Git worktree lifecycle for isolated agent runs.
+ */
+
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import process from "node:process";
+
+import { ensureGitRepository, git, gitChecked } from "./git.mjs";
+
+/**
+ * Artifacts produced by RUNNING a project, never by editing it.
+ *
+ * Deliberately excludes anything ambiguous: `dist/` and `build/` are committed
+ * deliberately by plenty of projects, so they are not listed.
+ */
+const GENERATED_ARTIFACT_PATTERNS = Object.freeze([
+  "__pycache__/",
+  "*.py[cod]",
+  ".pytest_cache/",
+  ".mypy_cache/",
+  ".ruff_cache/",
+  ".tox/",
+  "*.egg-info/",
+  "node_modules/",
+  "target/",
+  "obj/",
+  ".gradle/",
+  "*.tsbuildinfo"
+]);
+
+/**
+ * @param {string} runId
+ * @param {{ dataDir?: string, env?: NodeJS.ProcessEnv }} [options]
+ */
+export function resolveWorktreePath(runId, options = {}) {
+  const env = options.env ?? process.env;
+  if (options.dataDir) {
+    return path.join(options.dataDir, "worktrees", runId);
+  }
+  if (env.CLAUDE_PLUGIN_DATA) {
+    return path.join(env.CLAUDE_PLUGIN_DATA, "worktrees", runId);
+  }
+  return path.join(os.tmpdir(), "grok-cc-worktrees", runId);
+}
+
+/**
+ * Create a worktree for a run.
+ *
+ * @param {object} options
+ * @param {string} options.cwd - source repository cwd
+ * @param {string} options.runId
+ * @param {string} [options.baseRef] - defaults to HEAD
+ * @param {string} [options.dataDir]
+ * @param {NodeJS.ProcessEnv} [options.env]
+ */
+export function createWorktree({ cwd, runId, baseRef = "HEAD", dataDir, env }) {
+  const repoRoot = ensureGitRepository(cwd);
+  if (!runId) {
+    throw new Error("runId is required");
+  }
+
+  const branchName = `grok-build/${runId}`;
+  const worktreePath = resolveWorktreePath(runId, { dataDir, env });
+  const baseSha = gitChecked(repoRoot, ["rev-parse", baseRef]).stdout.trim();
+
+  fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+
+  if (fs.existsSync(worktreePath)) {
+    throw new Error(`Worktree path already exists: ${worktreePath}`);
+  }
+
+  const result = git(repoRoot, ["worktree", "add", "-b", branchName, worktreePath, baseSha]);
+  if (result.status !== 0) {
+    // Branch may already exist from a crashed run — try without -b
+    const retry = git(repoRoot, ["worktree", "add", worktreePath, branchName]);
+    if (retry.status !== 0) {
+      const combined = [result.stderr, result.stdout, retry.stderr, retry.stdout]
+        .map((s) => (s || "").trim())
+        .filter(Boolean)
+        .join("\n");
+      throw new Error(`Failed to create worktree: ${combined}`);
+    }
+  }
+
+  return {
+    worktreePath,
+    branchName,
+    baseSha,
+    baseRef,
+    repoRoot,
+    runId
+  };
+}
+
+/**
+ * Remove a worktree and optionally its branch.
+ *
+ * @param {object} options
+ * @param {string} options.repoRoot
+ * @param {string} options.worktreePath
+ * @param {string} [options.branchName]
+ * @param {boolean} [options.deleteBranch]
+ */
+export function removeWorktree({ repoRoot, worktreePath, branchName, deleteBranch = true }) {
+  if (worktreePath && fs.existsSync(worktreePath)) {
+    const result = git(repoRoot, ["worktree", "remove", "--force", worktreePath]);
+    if (result.status !== 0) {
+      try {
+        fs.rmSync(worktreePath, { recursive: true, force: true });
+      } catch {
+        // best-effort
+      }
+      git(repoRoot, ["worktree", "prune"]);
+    }
+  } else {
+    git(repoRoot, ["worktree", "prune"]);
+  }
+
+  if (deleteBranch && branchName) {
+    git(repoRoot, ["branch", "-D", branchName]);
+  }
+
+  return { removed: true, worktreePath, branchName };
+}
+
+/**
+ * Pathspecs that stage everything except generated artifacts.
+ *
+ * Pathspec magic is used instead of info/exclude: in a linked worktree git
+ * reads excludes from the common git dir, so per-worktree exclude files are
+ * ignored. Pathspecs apply to one `git add` and write nothing into repo metadata.
+ *
+ * @returns {string[]}
+ */
+export function artifactExcludePathspecs() {
+  return GENERATED_ARTIFACT_PATTERNS.map(
+    (pattern) => `:(exclude,glob)**/${pattern.replace(/\/$/, "/**")}`
+  );
+}
+
+/**
+ * Commit any uncommitted agent changes inside the worktree.
+ * @param {string} worktreePath
+ * @param {string} [message]
+ */
+export function commitWorktreeChanges(worktreePath, message = "grok agent changes") {
+  const status = git(worktreePath, ["status", "--porcelain"]);
+  if (status.status !== 0 || !status.stdout.trim()) {
+    return {
+      committed: false,
+      sha: gitChecked(worktreePath, ["rev-parse", "HEAD"]).stdout.trim()
+    };
+  }
+
+  // Stage everything except artifacts the verify command produced. Falls back
+  // to plain `add -A` if the pathspec form is rejected (older git).
+  const staged = git(worktreePath, ["add", "-A", "--", ".", ...artifactExcludePathspecs()]);
+  if (staged.status !== 0) {
+    gitChecked(worktreePath, ["add", "-A"]);
+  }
+
+  // Nothing left after excluding artifacts means the run produced only build
+  // output — there is no agent work to commit.
+  const stagedNames = git(worktreePath, ["diff", "--cached", "--name-only"]);
+  if (stagedNames.status === 0 && !stagedNames.stdout.trim()) {
+    return {
+      committed: false,
+      sha: gitChecked(worktreePath, ["rev-parse", "HEAD"]).stdout.trim()
+    };
+  }
+
+  gitChecked(worktreePath, ["commit", "-m", message]);
+  return {
+    committed: true,
+    sha: gitChecked(worktreePath, ["rev-parse", "HEAD"]).stdout.trim()
+  };
+}
