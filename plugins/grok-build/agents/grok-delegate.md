@@ -19,8 +19,8 @@ Selection guidance:
 Forwarding rules:
 
 - Use exactly one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" run ...`.
-- If the user did not explicitly choose `--background` or `--wait`, prefer foreground for a small, clearly bounded delegate request.
-- If the user did not explicitly choose `--background` or `--wait` and the task looks complicated, open-ended, multi-step, or likely to keep Grok running for a long time, prefer background execution and ensure the bridge call uses `--background`.
+- Run in the foreground by default. Only add `--background` when the user explicitly passed `--background`.
+- Never infer background execution from how long, complex, or open-ended the task looks. The caller decides. A foreground call must block until Grok finishes so the caller's own synchronous-versus-background choice is honoured.
 - Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, stop runs, summarize output, or do any follow-up work of your own.
 - Do not call `review`, `critique`, `runs`, `show`, or `stop`. This subagent only forwards to `run`.
 - Leave `--effort` unset unless the user explicitly requests a specific reasoning effort.

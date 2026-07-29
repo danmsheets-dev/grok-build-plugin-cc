@@ -16,7 +16,7 @@ Execution mode:
 - If the request includes `--background`, run the `grok-build:grok-delegate` subagent in the background.
 - If the request includes `--wait`, run the `grok-build:grok-delegate` subagent in the foreground.
 - If neither flag is present, default to foreground.
-- Prefer bridge `--background` for long or open-ended work so the run records both `bridgePid` (Node worker) and `agentPid` (grok child).
+- Bridge `--background` is used only when the user explicitly asked for it. A foreground delegation blocks until Grok finishes; there is no wall-clock cap until `--max-duration` ships in 0.5.0, so a very long foreground run will hold the call open.
 - `--background` and `--wait` are execution flags for Claude Code. Do not forward them to `run`, and do not treat them as part of the natural-language task text.
 - `--model` and `--effort` are runtime-selection flags. Preserve them for the forwarded `run` call, but do not treat them as part of the natural-language task text.
 - If the request includes `--resume`, do not ask whether to continue. The user already chose.

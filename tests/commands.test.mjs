@@ -131,3 +131,23 @@ test("runtime skill only forwards run once", () => {
   assert.match(resultHandling, /do not turn a failed or incomplete Grok run into a Claude-side implementation attempt/i);
   assert.match(resultHandling, /if Grok was never successfully invoked, do not generate a substitute answer at all/i);
 });
+
+test("the delegate subagent never chooses background on its own", () => {
+  const agent = read(path.join("agents", "grok-delegate.md"));
+  assert.match(
+    agent,
+    /only add `--background` when the user explicitly passed/i,
+    "the agent must not infer background from task complexity"
+  );
+  assert.doesNotMatch(
+    agent,
+    /looks complicated, open-ended, multi-step/i,
+    "the complexity-based background heuristic must be removed"
+  );
+});
+
+test("the delegate runtime skill states the same rule", () => {
+  const skill = read(path.join("skills", "grok-delegate-runtime", "SKILL.md"));
+  assert.match(skill, /only add `--background` when the user explicitly passed/i);
+  assert.doesNotMatch(skill, /Prefer bridge `--background` for long work/i);
+});

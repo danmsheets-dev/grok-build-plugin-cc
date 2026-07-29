@@ -22,7 +22,7 @@ Execution rules:
 
 Command selection:
 - Use exactly one `run` invocation per delegate handoff.
-- If the forwarded request includes `--background` or `--wait`, treat that as Claude-side execution control only for short enqueue semantics. Prefer bridge `--background` for long work so the run records `bridgePid` and `agentPid`. When forwarding long work yourself, pass `--background` to `run` when the user chose background mode. Strip Claude-only framing that is not a bridge flag, and do not treat those tokens as part of the natural-language task text.
+- Only add `--background` when the user explicitly passed `--background`. Otherwise run in the foreground and let the call block. Do not infer background execution from task size. Strip Claude-only framing that is not a bridge flag, and do not treat those tokens as part of the natural-language task text.
 - If the forwarded request includes `--model`, pass it through to `run`.
 - If the forwarded request includes `--effort`, pass it through to `run`.
 - If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.
