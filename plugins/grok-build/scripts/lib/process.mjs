@@ -25,6 +25,12 @@ export function runCommand(command, args = [], options = {}) {
     maxBuffer: options.maxBuffer,
     stdio: options.stdio ?? "pipe",
     windowsHide: true,
+    // Confirmed dead without this: a 300ms timeout let a 4-second command run
+    // to completion, timedOut:false. Any verify command that hangs - a stuck
+    // cargo test, pytest, npm test, or Godot headless check - wedged the
+    // bridge worker forever with no way to notice.
+    timeout: options.timeout,
+    killSignal: options.killSignal,
     // The resolver may itself require verbatim args (routing a .cmd/.bat
     // target through cmd.exe with an already-quoted command line); an
     // explicit option from the caller (verify.mjs's own cmd.exe wrapping)

@@ -159,3 +159,18 @@ test("runVerifyCommand still reports a real failure inside a quoted command", ()
   assert.equal(result.exitCode, 1);
   assert.doesNotMatch(result.output, /SyntaxError|Unterminated/);
 });
+
+test("runVerifyCommand actually enforces its timeout on a hung command", () => {
+  // Regression: the timeout option never reached spawnSync at all. A 300ms
+  // budget let a 4-second command run to completion with timedOut:false -
+  // any hung cargo test / pytest / npm test / Godot headless check would
+  // have wedged the bridge worker forever.
+  const start = Date.now();
+  const result = runVerifyCommand(`node -e "setTimeout(()=>{}, 4000)"`, process.cwd(), {
+    timeoutMs: 300
+  });
+  const elapsed = Date.now() - start;
+  assert.equal(result.timedOut, true);
+  assert.equal(result.ok, false);
+  assert.ok(elapsed < 3000, `expected the command to be killed near its budget, took ${elapsed}ms`);
+});
