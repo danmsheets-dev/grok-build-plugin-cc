@@ -24,10 +24,10 @@ Flow:
 node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" land "$ARGUMENTS"
 ```
 
-- Otherwise, first show the user what would land:
+- Otherwise, first show the user what would land (read-only preview — no merge):
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" land "$ARGUMENTS" --json
+node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" land "$ARGUMENTS" --preview --json
 ```
 
 - If that reports an error, return the error verbatim and stop. Two errors are expected
@@ -37,7 +37,8 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" land "$ARGUMENTS" --json
 - Otherwise use `AskUserQuestion` exactly once with two options:
   - `Apply to my working tree (Recommended)`
   - `Discard the run`
-- On apply, run the bridge `land` without `--discard`. On discard, re-run it with `--discard`.
+- On apply, run the bridge `land` without `--preview` and without `--discard`. On discard,
+  re-run it with `--discard`.
 
 After a successful apply:
 
@@ -52,3 +53,5 @@ Notes:
 - The worktree and its branch are removed afterwards either way.
 - Only runs started with isolation have a worktree. A run started with `--no-isolate`
   edited the working tree directly and has nothing to land.
+- Always pass `--preview` for the first read-only step. Without it, `land` performs the
+  squash-merge immediately.

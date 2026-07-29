@@ -193,3 +193,115 @@ test("land refuses to apply when the live working tree is dirty", () => {
     }
   }
 });
+
+test("land --preview returns diff without merging or removing the worktree", () => {
+  const repo = makeTempDir("grok-land-preview-");
+  const binDir = makeTempDir("grok-land-bin-");
+  const pluginDataDir = makeTempDir("grok-land-data-");
+  installFakeGrok(binDir);
+  seedRepo(repo);
+
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  try {
+    const jobId = generateJobId("run");
+    const created = createWorktree({
+      cwd: repo,
+      runId: jobId,
+      dataDir: pluginDataDir
+    });
+    fs.writeFileSync(path.join(created.worktreePath, "agent.txt"), "from agent\n");
+    run("git", ["add", "agent.txt"], { cwd: created.worktreePath });
+    run("git", ["commit", "-m", "agent change"], { cwd: created.worktreePath });
+
+    seedFinishedJob(repo, pluginDataDir, {
+      id: jobId,
+      worktree: {
+        path: created.worktreePath,
+        branch: created.branchName,
+        baseSha: created.baseSha
+      }
+    });
+
+    const headBefore = run("git", ["rev-parse", "HEAD"], { cwd: repo }).stdout.trim();
+    const stagedBefore = run("git", ["diff", "--cached", "--name-only"], { cwd: repo }).stdout.trim();
+
+    const result = run("node", [SCRIPT, "land", jobId, "--preview", "--json"], {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir)
+    });
+
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const payload = JSON.parse(result.stdout);
+    assert.equal(payload.jobId, jobId);
+    assert.equal(payload.action, "preview");
+    assert.ok(typeof payload.diffStat === "string");
+    assert.match(payload.diffStat, /agent\.txt/);
+    assert.ok(typeof payload.diff === "string");
+    assert.match(payload.diff, /from agent/);
+
+    // No mutation: worktree, branch, HEAD, and index must be unchanged.
+    assert.equal(fs.existsSync(created.worktreePath), true);
+    const branchAfter = run("git", ["branch", "--list", created.branchName], { cwd: repo });
+    assert.match(branchAfter.stdout, /grok-build\//);
+    const headAfter = run("git", ["rev-parse", "HEAD"], { cwd: repo }).stdout.trim();
+    assert.equal(headAfter, headBefore);
+    const stagedAfter = run("git", ["diff", "--cached", "--name-only"], { cwd: repo }).stdout.trim();
+    assert.equal(stagedAfter, stagedBefore);
+  } finally {
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
+});
+
+test("land without --preview still squash-merges (apply path unchanged)", () => {
+  const repo = makeTempDir("grok-land-apply-");
+  const binDir = makeTempDir("grok-land-bin-");
+  const pluginDataDir = makeTempDir("grok-land-data-");
+  installFakeGrok(binDir);
+  seedRepo(repo);
+
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  try {
+    const jobId = generateJobId("run");
+    const created = createWorktree({
+      cwd: repo,
+      runId: jobId,
+      dataDir: pluginDataDir
+    });
+    fs.writeFileSync(path.join(created.worktreePath, "landed.txt"), "landed body\n");
+    run("git", ["add", "landed.txt"], { cwd: created.worktreePath });
+    run("git", ["commit", "-m", "agent change"], { cwd: created.worktreePath });
+
+    seedFinishedJob(repo, pluginDataDir, {
+      id: jobId,
+      worktree: {
+        path: created.worktreePath,
+        branch: created.branchName,
+        baseSha: created.baseSha
+      }
+    });
+
+    const result = run("node", [SCRIPT, "land", jobId, "--json"], {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir)
+    });
+
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const payload = JSON.parse(result.stdout);
+    assert.equal(payload.action, "apply");
+    assert.equal(fs.existsSync(created.worktreePath), false);
+    const staged = run("git", ["diff", "--cached", "--name-only"], { cwd: repo });
+    assert.match(staged.stdout, /landed\.txt/);
+  } finally {
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
+});

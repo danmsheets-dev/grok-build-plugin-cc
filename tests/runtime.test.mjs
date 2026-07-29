@@ -448,6 +448,178 @@ function readStoredJobFromDisk(workspaceRoot, jobId) {
   return JSON.parse(fs.readFileSync(jobFile, "utf8"));
 }
 
+test("isolated write run patches worktree onto the job before the agent finishes", async () => {
+  const repo = makeTempDir("grok-wt-early-");
+  const binDir = makeTempDir("grok-wt-early-bin-");
+  const pluginDataDir = makeTempDir("grok-wt-early-data-");
+
+  // Slow fake so we can observe the job mid-run after createWorktree patches.
+  fs.mkdirSync(binDir, { recursive: true });
+  const fakePath = path.join(binDir, "grok");
+  fs.writeFileSync(
+    fakePath,
+    `#!/usr/bin/env node
+const argv = process.argv.slice(2);
+if (argv[0] === "version" || argv[0] === "--version" || argv[0] === "-V") {
+  process.stdout.write("grok 0.2.83-fake\\n");
+  process.exit(0);
+}
+if (argv[0] === "models") {
+  process.stdout.write("You are logged in with grok.com.\\n");
+  process.exit(0);
+}
+const isPrint = argv.includes("-p") || argv.includes("--print");
+if (isPrint) {
+  // Stay alive long enough for the bridge to create + patch the worktree.
+  const end = Date.now() + 8000;
+  while (Date.now() < end) {
+    // busy-wait: no ESM top-level await required
+  }
+  const emit = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
+  emit({ type: "text", data: "slow agent done" });
+  emit({
+    type: "end",
+    stopReason: "EndTurn",
+    sessionId: "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+    usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+    num_turns: 1,
+    total_cost_usd: 0.001
+  });
+  process.exit(0);
+}
+process.stderr.write("fake grok unknown\\n");
+process.exit(1);
+`,
+    { encoding: "utf8", mode: 0o755 }
+  );
+
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+
+  const child = spawn(
+    process.execPath,
+    [SCRIPT, "run", "--write", "--json", "edit something in isolation"],
+    {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir),
+      stdio: ["ignore", "pipe", "pipe"]
+    }
+  );
+
+  let jobId = null;
+  try {
+    const deadline = Date.now() + 15000;
+    let found = null;
+    while (Date.now() < deadline) {
+      const jobs = listJobs(repo);
+      const active = jobs.find((job) => job.status === "running" || job.status === "queued");
+      if (active) {
+        jobId = active.id;
+        const stored = readStoredJobFromDisk(repo, jobId);
+        if (stored?.worktree?.path && stored?.worktree?.branch && stored?.worktree?.baseSha) {
+          found = stored;
+          break;
+        }
+      }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+
+    assert.ok(jobId, "expected a tracked job while the slow agent was running");
+    assert.ok(
+      found?.worktree?.path,
+      "worktree descriptor must be patched onto the job before the agent finishes"
+    );
+    assert.ok(fs.existsSync(found.worktree.path), "worktree path must exist on disk");
+    assert.match(found.worktree.branch, /^grok-build\//);
+    assert.ok(found.worktree.baseSha);
+  } finally {
+    if (child.pid) {
+      try {
+        process.kill(child.pid, "SIGTERM");
+      } catch {
+        // already exited
+      }
+    }
+    // Ensure we do not leave the process hanging the test runner.
+    await new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // ignore
+        }
+        resolve();
+      }, 2000);
+      child.on("exit", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
+});
+
+test("bogus --verify-attempts still yields a definite verified boolean", () => {
+  const repo = makeTempDir("grok-verify-attempts-");
+  const binDir = makeTempDir("grok-verify-attempts-bin-");
+  const pluginDataDir = makeTempDir("grok-verify-attempts-data-");
+  installFakeGrok(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  // Non-integer attempts used to leave verified null → reported as plain completed.
+  const result = run(
+    "node",
+    [
+      SCRIPT,
+      "run",
+      "--json",
+      "--verify",
+      "node -e process.exit(1)",
+      "--verify-attempts",
+      "2.5",
+      "do something"
+    ],
+    {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir)
+    }
+  );
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(typeof payload.verified, "boolean");
+  assert.notEqual(payload.verified, null);
+  assert.notEqual(payload.verified, undefined);
+  assert.equal(payload.verified, false);
+
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  try {
+    const jobs = listJobs(repo);
+    assert.ok(jobs.length >= 1);
+    assert.equal(jobs[0].status, "completed-unverified");
+  } finally {
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
+});
+
+
 test("import uses grok import and prints resume hint", () => {
   const home = makeTempDir();
   const projects = path.join(home, ".claude", "projects", "demo");

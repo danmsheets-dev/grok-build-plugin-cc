@@ -103,7 +103,7 @@ function printUsage() {
       "Usage:",
       "  node scripts/grok-bridge.mjs check [--json]",
       "  node scripts/grok-bridge.mjs doctor [--json]",
-      "  node scripts/grok-bridge.mjs prune [--apply] [--json]",
+      "  node scripts/grok-bridge.mjs prune [--apply] [--include-unlanded] [--json]",
       "  node scripts/grok-bridge.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <low|medium|high>]",
       "  node scripts/grok-bridge.mjs critique [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <low|medium|high>] [focus text]",
       "  node scripts/grok-bridge.mjs run [--background] [--write] [--resume-last|--resume|--fresh] [--model <model>] [--effort <low|medium|high>] [prompt]",
@@ -111,7 +111,7 @@ function printUsage() {
       "  node scripts/grok-bridge.mjs runs [run-id] [--all] [--json]",
       "  node scripts/grok-bridge.mjs show [run-id] [--json]",
       "  node scripts/grok-bridge.mjs stop [run-id] [--json]",
-      "  node scripts/grok-bridge.mjs land [run-id] [--discard] [--json]"
+      "  node scripts/grok-bridge.mjs land [run-id] [--preview|--discard] [--json]"
     ].join("\n")
   );
 }
@@ -126,10 +126,9 @@ function normalizeVerifyCommands(raw) {
 
 function resolveVerifyAttempts(raw) {
   const parsed = Number(raw);
-  if (Number.isFinite(parsed) && parsed >= 1) {
-    return parsed;
-  }
-  return 2;
+  const verifyAttempts =
+    Number.isFinite(parsed) && Number.isInteger(parsed) && parsed >= 1 ? parsed : 2;
+  return verifyAttempts;
 }
 
 function resolveMaxDurationSeconds(raw) {
@@ -513,13 +512,26 @@ function buildDoctorReport(cwd) {
   });
 
   // Prefer reading the full job file for worktree when the index is sparse.
+  // Completed runs with unlanded commits are "awaiting land", not prunable staleness.
   const staleWithPaths = [];
+  const awaitingLand = [];
   for (const job of jobs) {
     if (!isTerminalJobStatus(job.status)) {
       continue;
     }
     const stored = readStoredJob(workspaceRoot, job.id) ?? job;
-    if (stored.worktree?.path && fs.existsSync(stored.worktree.path)) {
+    if (!(stored.worktree?.path && fs.existsSync(stored.worktree.path))) {
+      continue;
+    }
+    const status = stored.status ?? job.status;
+    const unmerged = countUnmergedCommits(
+      workspaceRoot,
+      stored.worktree.baseSha,
+      stored.worktree.branch
+    );
+    if (unmerged > 0 && status === "completed") {
+      awaitingLand.push({ ...job, worktree: stored.worktree, unmergedCommits: unmerged });
+    } else {
       staleWithPaths.push({ ...job, worktree: stored.worktree });
     }
   }
@@ -533,13 +545,38 @@ function buildDoctorReport(cwd) {
     fix:
       staleWithPaths.length === 0
         ? null
-        : "Run `node scripts/grok-bridge.mjs prune --apply` or `/grok-build:land` to remove finished worktrees."
+        : "Run `node scripts/grok-bridge.mjs prune --apply` to remove finished worktrees with no unlanded work."
+  });
+  checks.push({
+    name: "awaiting land",
+    ok: awaitingLand.length === 0,
+    detail:
+      awaitingLand.length === 0
+        ? "none"
+        : `${awaitingLand.length} run(s) awaiting land`,
+    fix:
+      awaitingLand.length === 0
+        ? null
+        : "Run `/grok-build:land` to apply or discard unlanded isolated work."
   });
 
   return {
     ok: checks.every((check) => check.ok),
     checks
   };
+}
+
+/** Commits on branch that are not reachable from baseSha (unlanded work). */
+function countUnmergedCommits(repoRoot, baseSha, branchName) {
+  if (!baseSha || !branchName) {
+    return 0;
+  }
+  const result = git(repoRoot, ["rev-list", "--count", `${baseSha}..${branchName}`]);
+  if (result.status !== 0) {
+    return 0;
+  }
+  const count = Number(String(result.stdout ?? "").trim());
+  return Number.isFinite(count) && count > 0 ? count : 0;
 }
 
 async function handleDoctor(argv) {
@@ -556,11 +593,14 @@ async function handleDoctor(argv) {
   }
 }
 
-function collectPrunePlan(cwd) {
+function collectPrunePlan(cwd, options = {}) {
+  const includeUnlanded = Boolean(options.includeUnlanded);
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const jobs = listJobs(workspaceRoot);
   /** @type {{ type: string, jobId: string, detail: string, apply: () => void }[]} */
   const actions = [];
+  /** @type {{ jobId: string, branch: string|null, unmergedCommits: number, detail: string }[]} */
+  const awaitingLand = [];
 
   for (const job of jobs) {
     if (classifyJobLiveness(job).abandoned) {
@@ -584,7 +624,8 @@ function collectPrunePlan(cwd) {
 
   for (const job of jobs) {
     const stored = readStoredJob(workspaceRoot, job.id) ?? job;
-    if (!isTerminalJobStatus(stored.status ?? job.status)) {
+    const status = stored.status ?? job.status;
+    if (!isTerminalJobStatus(status)) {
       continue;
     }
     const worktree = stored.worktree;
@@ -597,6 +638,20 @@ function collectPrunePlan(cwd) {
     const jobId = job.id;
     const worktreePath = worktree.path;
     const branchName = worktree.branch ?? null;
+    const unmerged = countUnmergedCommits(workspaceRoot, worktree.baseSha, branchName);
+
+    // Successful completed runs with commits still on the branch are awaiting
+    // land — never delete that branch unless the user opts in explicitly.
+    if (unmerged > 0 && status === "completed" && !includeUnlanded) {
+      awaitingLand.push({
+        jobId,
+        branch: branchName,
+        unmergedCommits: unmerged,
+        detail: `Run ${jobId} has unlanded work (${unmerged} commit(s) on ${branchName ?? "branch"}); use /grok-build:land or pass --include-unlanded to prune.`
+      });
+      continue;
+    }
+
     actions.push({
       type: "worktree",
       jobId,
@@ -612,23 +667,36 @@ function collectPrunePlan(cwd) {
     });
   }
 
-  return { workspaceRoot, actions };
+  return { workspaceRoot, actions, awaitingLand };
 }
 
 function renderPruneReport(plan, applied) {
   const mode = applied ? "applied" : "dry-run";
   const lines = ["# Grok Build Prune", "", `Mode: ${mode}`, ""];
+  const awaiting = plan.awaitingLand ?? [];
 
-  if (plan.actions.length === 0) {
+  if (plan.actions.length === 0 && awaiting.length === 0) {
     lines.push("Nothing to prune.");
     return `${lines.join("\n").trimEnd()}\n`;
   }
 
-  lines.push(`Items (${plan.actions.length}):`);
-  for (const action of plan.actions) {
-    lines.push(`- [${mode}] ${action.detail}`);
+  if (plan.actions.length > 0) {
+    lines.push(`Items (${plan.actions.length}):`);
+    for (const action of plan.actions) {
+      lines.push(`- [${mode}] ${action.detail}`);
+    }
+  } else {
+    lines.push("No prunable items in the default plan.");
   }
-  if (!applied) {
+
+  if (awaiting.length > 0) {
+    lines.push("", `Awaiting land (${awaiting.length}) — not pruned without --include-unlanded:`);
+    for (const item of awaiting) {
+      lines.push(`- ${item.detail}`);
+    }
+  }
+
+  if (!applied && plan.actions.length > 0) {
     lines.push("", "Re-run with --apply to perform these actions.");
   }
   return `${lines.join("\n").trimEnd()}\n`;
@@ -637,12 +705,12 @@ function renderPruneReport(plan, applied) {
 async function handlePrune(argv) {
   const { options } = parseCommandInput(argv, {
     valueOptions: ["cwd"],
-    booleanOptions: ["json", "apply"]
+    booleanOptions: ["json", "apply", "include-unlanded"]
   });
 
   const cwd = resolveCommandCwd(options);
   const apply = Boolean(options.apply);
-  const plan = collectPrunePlan(cwd);
+  const plan = collectPrunePlan(cwd, { includeUnlanded: options["include-unlanded"] });
 
   if (apply) {
     for (const action of plan.actions) {
@@ -659,6 +727,12 @@ async function handlePrune(argv) {
       jobId: action.jobId,
       detail: action.detail,
       applied: apply
+    })),
+    awaitingLand: (plan.awaitingLand ?? []).map((item) => ({
+      jobId: item.jobId,
+      branch: item.branch,
+      unmergedCommits: item.unmergedCommits,
+      detail: item.detail
     }))
   };
 
@@ -906,6 +980,17 @@ async function executeTaskRun(request) {
   let runCwd = workspaceRoot;
   if (isolate && write) {
     created = createWorktree({ cwd: workspaceRoot, runId: request.jobId });
+    // Persist worktree descriptor immediately so cancel/crash cannot orphan it
+    // from land/prune/doctor (descriptor must not wait until the run returns).
+    if (request.jobId) {
+      patchJobIfActive(workspaceRoot, request.jobId, {
+        worktree: {
+          path: created.worktreePath,
+          branch: created.branchName,
+          baseSha: created.baseSha
+        }
+      });
+    }
     const plan = planWorktreeLinks(created.repoRoot, created.worktreePath);
     provisionWorktree(plan);
     runCwd = created.worktreePath;
@@ -1094,6 +1179,12 @@ async function executeTaskRun(request) {
         budgetStopped = "max-cost";
       }
       attempt += 1;
+    }
+
+    // Never leave verified null when verify commands ran: null is treated as
+    // success by completion status (completed vs completed-unverified).
+    if (verified == null) {
+      verified = false;
     }
   }
 
@@ -1560,7 +1651,7 @@ function porcelainDirtyPaths(statusOutput) {
 async function handleLand(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd"],
-    booleanOptions: ["json", "discard"]
+    booleanOptions: ["json", "discard", "preview"]
   });
 
   const cwd = resolveCommandCwd(options);
@@ -1595,6 +1686,36 @@ async function handleLand(argv) {
     return;
   }
 
+  if (!branchName) {
+    throw new Error(`Run ${job.id} worktree is missing a branch name.`);
+  }
+  if (!baseSha) {
+    throw new Error(`Run ${job.id} worktree is missing baseSha.`);
+  }
+
+  const diffRange = `${baseSha}..${branchName}`;
+  const diffResult = git(repoRoot, ["diff", "--stat", diffRange]);
+  const diffStat = (diffResult.stdout || "").trim();
+  const diffBodyResult = git(repoRoot, ["diff", diffRange]);
+  const diffBody = diffBodyResult.stdout || "";
+
+  // Preview is read-only: show what would land without merging or removing.
+  if (options.preview) {
+    const payload = {
+      jobId: job.id,
+      action: "preview",
+      worktree,
+      diffStat,
+      diff: diffBody
+    };
+    const text =
+      (diffStat ? `${diffStat}\n\n` : "No changes between base and run branch.\n\n") +
+      (diffBody ? `${diffBody.endsWith("\n") ? diffBody : `${diffBody}\n`}` : "") +
+      `\nPreview only for ${job.id}: nothing was merged or removed. Re-run without --preview to apply, or with --discard to drop.\n`;
+    outputCommandResult(payload, text, options.json);
+    return;
+  }
+
   const dirty = git(repoRoot, ["status", "--porcelain"]);
   if (dirty.status !== 0) {
     throw new Error(
@@ -1608,17 +1729,6 @@ async function handleLand(argv) {
       `Refusing to land into a dirty working tree. Commit or stash first. Dirty files: ${named}`
     );
   }
-
-  if (!branchName) {
-    throw new Error(`Run ${job.id} worktree is missing a branch name.`);
-  }
-  if (!baseSha) {
-    throw new Error(`Run ${job.id} worktree is missing baseSha.`);
-  }
-
-  const diffRange = `${baseSha}..${branchName}`;
-  const diffResult = git(repoRoot, ["diff", "--stat", diffRange]);
-  const diffStat = (diffResult.stdout || "").trim();
 
   gitChecked(repoRoot, ["merge", "--squash", branchName]);
 

@@ -173,6 +173,70 @@ test("enrichJob leaves idleSeconds null for a finished run", () => {
   assert.equal(enriched.idleSeconds, null);
 });
 
+test("enrichJob computes duration for completed-unverified and timed-out", () => {
+  const startedAt = "2026-07-29T12:00:00.000Z";
+  const completedAt = "2026-07-29T12:05:30.000Z";
+
+  for (const status of ["completed-unverified", "timed-out"]) {
+    const enriched = enrichJob({
+      id: `run-${status}`,
+      status,
+      kind: "task",
+      jobClass: "task",
+      startedAt,
+      completedAt
+    });
+    assert.equal(
+      enriched.duration,
+      "5m 30s",
+      `duration missing for terminal status ${status}`
+    );
+  }
+});
+
+test("resolveResultJob finds completed-unverified and timed-out runs", async () => {
+  const { resolveResultJob } = await import("../plugins/grok-build/scripts/lib/job-control.mjs");
+  const {
+    generateJobId,
+    upsertJob,
+    writeJobFile
+  } = await import("../plugins/grok-build/scripts/lib/state.mjs");
+
+  const workspace = makeTempDir("grok-result-job-");
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  const pluginDataDir = makeTempDir("grok-result-data-");
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+
+  try {
+    for (const status of ["completed-unverified", "timed-out"]) {
+      const jobId = generateJobId("run");
+      const job = {
+        id: jobId,
+        status,
+        kind: "task",
+        kindLabel: "delegate",
+        title: "Grok Build Delegate",
+        jobClass: "task",
+        summary: status,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+      writeJobFile(workspace, jobId, job);
+      upsertJob(workspace, job);
+
+      const resolved = resolveResultJob(workspace, jobId);
+      assert.equal(resolved.job.id, jobId);
+      assert.equal(resolved.job.status, status);
+    }
+  } finally {
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
+});
+
 import { classifyJobLiveness, isJobProcessAlive } from "../plugins/grok-build/scripts/lib/job-control.mjs";
 import { startHeartbeat } from "../plugins/grok-build/scripts/lib/tracked-jobs.mjs";
 

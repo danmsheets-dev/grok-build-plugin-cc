@@ -1,6 +1,6 @@
 import fs from "node:fs";
 
-import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
+import { getConfig, isTerminalJobStatus, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -242,10 +242,9 @@ export function enrichJob(job, options = {}) {
         ? readJobProgressPreview(job.logFile, maxProgressLines)
         : [],
     elapsed: formatElapsedDuration(job.startedAt ?? job.createdAt, job.completedAt ?? null),
-    duration:
-      job.status === "completed" || job.status === "failed" || job.status === "cancelled"
-        ? formatElapsedDuration(job.startedAt ?? job.createdAt, job.completedAt ?? job.updatedAt)
-        : null,
+    duration: isTerminalJobStatus(job.status)
+      ? formatElapsedDuration(job.startedAt ?? job.createdAt, job.completedAt ?? job.updatedAt)
+      : null,
     idleSeconds: computeIdleSeconds(job),
     lastEventAge: formatRelativeAge(job.lastEventAt),
     lastHeartbeatAge: formatRelativeAge(job.lastHeartbeatAt)
@@ -344,7 +343,7 @@ export function resolveResultJob(cwd, reference) {
   const selected = matchJobReference(
     jobs,
     reference,
-    (job) => job.status === "completed" || job.status === "failed" || job.status === "cancelled"
+    (job) => isTerminalJobStatus(job.status)
   );
 
   if (selected) {

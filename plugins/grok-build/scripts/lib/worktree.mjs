@@ -172,6 +172,26 @@ export function removeWorktree({ repoRoot, worktreePath, branchName, deleteBranc
     git(repoRoot, ["branch", "-D", branchName]);
   }
 
+  const reasons = [];
+  if (worktreePath && fs.existsSync(worktreePath)) {
+    reasons.push("worktree directory still exists after removal attempt");
+  }
+  if (deleteBranch && branchName) {
+    const branchCheck = git(repoRoot, ["rev-parse", "--verify", branchName]);
+    if (branchCheck.status === 0) {
+      reasons.push(`branch ${branchName} still exists after delete attempt`);
+    }
+  }
+
+  if (reasons.length > 0) {
+    return {
+      removed: false,
+      worktreePath,
+      branchName,
+      reason: reasons.join("; ")
+    };
+  }
+
   return { removed: true, worktreePath, branchName };
 }
 

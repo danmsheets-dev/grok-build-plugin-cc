@@ -120,6 +120,31 @@ test("removeWorktree deletes the directory and the branch", () => {
   assert.equal(branches.stdout.trim(), "");
 });
 
+test("removeWorktree reports removed:false when the branch cannot be deleted", () => {
+  const cwd = makeTempDir("grok-wt-remove-fail-");
+  const dataDir = makeTempDir("grok-wt-remove-fail-data-");
+  seedRepo(cwd);
+
+  const created = createWorktree({ cwd, runId: "remove-fail-1", dataDir });
+  // Ask to delete the currently checked-out branch (main) — git refuses, so
+  // the function must report failure rather than silently claiming success.
+  const currentBranch = run("git", ["branch", "--show-current"], { cwd }).stdout.trim() || "main";
+
+  const removed = removeWorktree({
+    repoRoot: created.repoRoot,
+    worktreePath: created.worktreePath,
+    branchName: currentBranch,
+    deleteBranch: true
+  });
+
+  assert.equal(removed.removed, false);
+  assert.match(removed.reason ?? "", /still exists/i);
+  assert.match(removed.reason ?? "", new RegExp(currentBranch));
+
+  // Real agent branch must still be cleaned up by the test.
+  run("git", ["branch", "-D", created.branchName], { cwd });
+});
+
 test("commitWorktreeChanges commits a new file and returns committed:true with a sha", () => {
   const cwd = makeTempDir("grok-wt-commit-");
   const dataDir = makeTempDir("grok-wt-commit-data-");
