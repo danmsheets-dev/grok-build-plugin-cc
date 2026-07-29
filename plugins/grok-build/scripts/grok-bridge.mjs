@@ -1713,10 +1713,14 @@ async function handleLand(argv) {
   }
 
   const diffRange = `${baseSha}..${branchName}`;
-  const diffResult = git(repoRoot, ["diff", "--stat", diffRange]);
-  const diffStat = (diffResult.stdout || "").trim();
-  const diffBodyResult = git(repoRoot, ["diff", diffRange]);
-  const diffBody = diffBodyResult.stdout || "";
+  // gitChecked, not the unchecked git() wrapper: confirmed directly that a
+  // stale ref (e.g. a branch already deleted by a prior land or discard)
+  // makes `git diff` fail non-zero with empty stdout, and the unchecked
+  // wrapper's empty-string result was indistinguishable from a genuinely
+  // empty diff - "No changes between base and run branch" printed with
+  // total confidence for a run whose branch does not exist at all.
+  const diffStat = gitChecked(repoRoot, ["diff", "--stat", diffRange]).stdout.trim();
+  const diffBody = gitChecked(repoRoot, ["diff", diffRange]).stdout;
 
   // Preview is read-only: show what would land without merging or removing.
   if (options.preview) {

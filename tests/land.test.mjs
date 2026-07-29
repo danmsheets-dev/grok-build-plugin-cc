@@ -305,3 +305,50 @@ test("land without --preview still squash-merges (apply path unchanged)", () => 
     }
   }
 });
+
+test("land --preview errors on a stale branch ref instead of silently claiming no changes", () => {
+  // Regression found by a second-round audit: the diff computation used the
+  // unchecked git() wrapper, so a branch that no longer exists (e.g. a job
+  // already landed once, or manually cleaned up) made `git diff` fail
+  // non-zero with empty stdout - and empty stdout was indistinguishable
+  // from a genuinely empty diff, printing "No changes between base and run
+  // branch" with total confidence for a run whose branch does not exist.
+  const repo = makeTempDir("grok-land-stale-ref-");
+  const binDir = makeTempDir("grok-land-stale-ref-bin-");
+  const pluginDataDir = makeTempDir("grok-land-stale-ref-data-");
+  installFakeGrok(binDir);
+  seedRepo(repo);
+
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  try {
+    const jobId = generateJobId("run");
+    const baseSha = run("git", ["rev-parse", "HEAD"], { cwd: repo }).stdout.trim();
+    seedFinishedJob(repo, pluginDataDir, {
+      id: jobId,
+      worktree: {
+        path: path.join(pluginDataDir, "worktrees", "does-not-exist"),
+        branch: "grok-build/does-not-exist",
+        baseSha
+      }
+    });
+
+    const result = run("node", [SCRIPT, "land", jobId, "--preview"], {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir)
+    });
+
+    assert.notEqual(result.status, 0, "must fail rather than silently succeed");
+    assert.doesNotMatch(
+      `${result.stdout}${result.stderr}`,
+      /No changes between base and run branch/,
+      "must not report false confidence for a branch that does not exist"
+    );
+  } finally {
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
+});
