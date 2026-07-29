@@ -185,7 +185,7 @@ test("prune --apply marks a seeded abandoned job terminal", () => {
   });
 });
 
-function seedCompletedUnlandedWorktree(repo, pluginDataDir) {
+function seedCompletedUnlandedWorktree(repo, pluginDataDir, status = "completed") {
   fs.writeFileSync(path.join(repo, "README.md"), "# seed\n");
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
@@ -203,7 +203,7 @@ function seedCompletedUnlandedWorktree(repo, pluginDataDir) {
   withPluginData(pluginDataDir, () => {
     const job = {
       id: jobId,
-      status: "completed",
+      status,
       phase: "done",
       kind: "task",
       kindLabel: "delegate",
@@ -285,4 +285,71 @@ test("doctor reports completed unlanded work as awaiting land, not prunable stal
   const stale = payload.checks.find((check) => /stale worktrees/i.test(check.name));
   assert.ok(stale);
   assert.equal(stale.ok, true, "unlanded completed work must not count as prunable staleness");
+});
+
+test("prune plan also excludes completed-unverified and timed-out unlanded work", () => {
+  // Regression found by a second-round audit: the awaiting-land guard only
+  // recognized the literal string "completed", so a completed-unverified
+  // run (it ran to completion, it just never passed verification) or a
+  // timed-out run had its branch and real, unlanded commit destroyed by
+  // prune --apply - and doctor's own recommended fix for exactly this case
+  // was to run prune --apply, making the tool's own advice destructive.
+  for (const status of ["completed-unverified", "timed-out"]) {
+    const binDir = makeTempDir();
+    const pluginDataDir = makeTempDir();
+    const repo = makeTempDir();
+    installFakeGrok(binDir);
+    initGitRepo(repo);
+
+    const { jobId, created } = withPluginData(pluginDataDir, () =>
+      seedCompletedUnlandedWorktree(repo, pluginDataDir, status)
+    );
+
+    const dryRun = run("node", [SCRIPT, "prune", "--json"], {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir)
+    });
+    assert.equal(dryRun.status, 0, dryRun.stderr);
+    const dryPayload = JSON.parse(dryRun.stdout);
+    assert.ok(
+      dryPayload.awaitingLand.some((item) => item.jobId === jobId),
+      `${status}: must appear under awaitingLand`
+    );
+
+    const applied = run("node", [SCRIPT, "prune", "--apply", "--json"], {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir)
+    });
+    assert.equal(applied.status, 0, applied.stderr);
+
+    assert.equal(fs.existsSync(created.worktreePath), true, `${status}: worktree must survive --apply`);
+    const branchList = run("git", ["branch", "--list", created.branchName], { cwd: repo });
+    assert.match(branchList.stdout, /grok-build\//, `${status}: branch must survive --apply`);
+  }
+});
+
+test("doctor reports completed-unverified unlanded work as awaiting land, not prunable staleness", () => {
+  const binDir = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const repo = makeTempDir();
+  installFakeGrok(binDir);
+  initGitRepo(repo);
+
+  withPluginData(pluginDataDir, () =>
+    seedCompletedUnlandedWorktree(repo, pluginDataDir, "completed-unverified")
+  );
+
+  const result = run("node", [SCRIPT, "doctor", "--json"], {
+    cwd: repo,
+    env: pluginDataEnv(pluginDataDir, binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  const stale = payload.checks.find((check) => /stale worktree/i.test(check.name));
+  assert.equal(stale?.ok, true, "must NOT be reported as stale worktree staleness");
+  const awaiting = payload.checks.find((check) => /awaiting land/i.test(check.name));
+  assert.ok(awaiting, "doctor must include an awaiting land check");
+  assert.equal(awaiting.ok, false);
+  assert.doesNotMatch(awaiting.fix ?? "", /prune/i, "must not recommend the destructive prune remedy");
 });

@@ -98,6 +98,17 @@ const VALID_REASONING_EFFORTS = new Set(["low", "medium", "high"]);
 // on a slow cold build, misattributing every pre-existing failure to the run.
 const BASELINE_PROBE_TIMEOUT_MS = 900000;
 
+// Terminal statuses whose worktree may still hold real, unlanded commits
+// worth protecting from prune/doctor. Confirmed by direct reproduction: a
+// completed-unverified run's worktree - it ran to completion, it just never
+// passed verification - had its branch and the agent's real commit deleted
+// by prune --apply, because the guard checked only the literal string
+// "completed". A run whose verification failed or that hit --max-duration
+// is exactly the kind of work most worth reviewing before it is discarded,
+// not less. failed/cancelled/abandoned are deliberately excluded: those
+// represent a run that did not produce work worth preserving by default.
+const AWAITING_LAND_STATUSES = new Set(["completed", "completed-unverified", "timed-out"]);
+
 function printUsage() {
   console.log(
     [
@@ -533,7 +544,7 @@ function buildDoctorReport(cwd) {
       stored.worktree.baseSha,
       stored.worktree.branch
     );
-    if (unmerged > 0 && status === "completed") {
+    if (unmerged > 0 && AWAITING_LAND_STATUSES.has(status)) {
       awaitingLand.push({ ...job, worktree: stored.worktree, unmergedCommits: unmerged });
     } else {
       staleWithPaths.push({ ...job, worktree: stored.worktree });
@@ -646,7 +657,7 @@ function collectPrunePlan(cwd, options = {}) {
 
     // Successful completed runs with commits still on the branch are awaiting
     // land — never delete that branch unless the user opts in explicitly.
-    if (unmerged > 0 && status === "completed" && !includeUnlanded) {
+    if (unmerged > 0 && AWAITING_LAND_STATUSES.has(status) && !includeUnlanded) {
       awaitingLand.push({
         jobId,
         branch: branchName,
