@@ -240,8 +240,16 @@ function pushJobDetails(lines, job, options = {}) {
     lines.push(`  Show: /grok-build:show ${job.id}`);
   }
   if (job.status !== "queued" && job.status !== "running" && job.jobClass === "task" && job.write && options.showReviewHint) {
-    lines.push("  Review changes: /grok-build:review --wait");
-    lines.push("  Stricter pass: /grok-build:critique --wait");
+    if (job.worktree?.path) {
+      // An isolated run never touched the working tree at all, so
+      // /grok-build:review here would review the wrong thing entirely - it
+      // would find nothing, since the actual changes sit unlanded in the
+      // worktree. Point at land instead, which is what actually shows them.
+      lines.push(`  Review and land: /grok-build:land ${job.id}`);
+    } else {
+      lines.push("  Review changes: /grok-build:review --wait");
+      lines.push("  Stricter pass: /grok-build:critique --wait");
+    }
   }
   if (job.progressPreview?.length) {
     lines.push("  Progress:");
@@ -398,14 +406,53 @@ export function renderNativeReviewResult(result, meta) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-export function renderTaskResult(parsedResult, meta) {
-  const rawOutput = typeof parsedResult?.rawOutput === "string" ? parsedResult.rawOutput : "";
-  if (rawOutput) {
-    return rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
+/**
+ * Build the trailing status block for a delegate run: verification result,
+ * worktree location, and any budget stop. Previously this information was
+ * computed by executeTaskRun (verified, worktree, verify.note, budgetStopped)
+ * but never appended to the rendered output at all - the terminal text a
+ * user actually sees after a delegate run said nothing about whether
+ * verification passed, whether a worktree was created, or whether a budget
+ * stop cut the run short. This is the third instance of that exact failure
+ * shape in this plugin's history (streaming was inert because outputFormat
+ * was forced to plain; abandoned runs displayed as running because the
+ * renderer read job.status instead of the computed liveness) - a value
+ * computed correctly and then never actually reaching the user.
+ */
+function buildTaskStatusLines(meta = {}) {
+  const lines = [];
+  if (meta.verified === true) {
+    lines.push(`Verified: yes${meta.verifyNote ? ` (${meta.verifyNote})` : ""}`);
+  } else if (meta.verified === false) {
+    lines.push("Verified: no - verification did not pass within the attempt budget.");
   }
 
-  const message = String(parsedResult?.failureMessage ?? "").trim() || "Grok did not return a final message.";
-  return `${message}\n`;
+  if (meta.worktree?.path) {
+    lines.push(`Worktree: ${meta.worktree.path} (branch ${meta.worktree.branch ?? "unknown"})`);
+    if (meta.jobId) {
+      lines.push(`Review and land with: /grok-build:land ${meta.jobId}`);
+    }
+  }
+
+  if (meta.budgetStopped) {
+    lines.push(`Budget: run stopped early (${meta.budgetStopped}).`);
+  }
+
+  return lines;
+}
+
+export function renderTaskResult(parsedResult, meta) {
+  const rawOutput = typeof parsedResult?.rawOutput === "string" ? parsedResult.rawOutput : "";
+  const base = rawOutput
+    ? (rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`)
+    : `${String(parsedResult?.failureMessage ?? "").trim() || "Grok did not return a final message."}\n`;
+
+  const statusLines = buildTaskStatusLines(meta);
+  if (statusLines.length === 0) {
+    return base;
+  }
+
+  return `${base}\n${statusLines.join("\n")}\n`;
 }
 
 export function renderStatusReport(report) {

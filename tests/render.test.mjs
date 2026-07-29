@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { renderReviewResult, renderStoredJobResult } from "../plugins/grok-build/scripts/lib/render.mjs";
+import { renderReviewResult, renderStoredJobResult, renderTaskResult } from "../plugins/grok-build/scripts/lib/render.mjs";
 
 test("renderReviewResult degrades gracefully when JSON is missing required review fields", () => {
   const output = renderReviewResult(
@@ -150,4 +150,97 @@ test("an abandoned run is displayed as abandoned, not running", () => {
   assert.match(output, /abandoned/i);
   assert.doesNotMatch(output, /run-dead \| running/);
   assert.match(output, /prune --apply/);
+});
+
+test("renderTaskResult renders exactly the raw output when there is nothing extra to report", () => {
+  const output = renderTaskResult({ rawOutput: "Handled the task." }, { title: "Grok Build Delegate" });
+  assert.equal(output, "Handled the task.\n");
+});
+
+test("renderTaskResult surfaces a passing verification", () => {
+  // Regression: verified/worktree/budget were all computed by executeTaskRun
+  // and then never appended to the rendered output at all - a run's actual
+  // terminal text said nothing about whether verification passed.
+  const output = renderTaskResult(
+    { rawOutput: "Fixed the bug." },
+    { title: "Grok Build Delegate", verified: true }
+  );
+  assert.match(output, /Verified: yes/);
+});
+
+test("renderTaskResult surfaces a failing verification with its note", () => {
+  const output = renderTaskResult(
+    { rawOutput: "Attempted a fix." },
+    { title: "Grok Build Delegate", verified: false, verifyNote: "still failing after 2 attempts" }
+  );
+  assert.match(output, /Verified: no/);
+});
+
+test("renderTaskResult surfaces the worktree and a land hint", () => {
+  const output = renderTaskResult(
+    { rawOutput: "Created a file." },
+    {
+      title: "Grok Build Delegate",
+      jobId: "run-abc123",
+      worktree: { path: "/tmp/worktrees/run-abc123", branch: "grok-build/run-abc123" }
+    }
+  );
+  assert.match(output, /Worktree: \/tmp\/worktrees\/run-abc123 \(branch grok-build\/run-abc123\)/);
+  assert.match(output, /\/grok-build:land run-abc123/);
+});
+
+test("renderTaskResult surfaces a budget stop", () => {
+  const output = renderTaskResult(
+    { rawOutput: "Partial work done." },
+    { title: "Grok Build Delegate", budgetStopped: "max-cost" }
+  );
+  assert.match(output, /Budget: run stopped early \(max-cost\)/);
+});
+
+test("renderTaskResult can surface all three at once", () => {
+  const output = renderTaskResult(
+    { rawOutput: "Did some work." },
+    {
+      title: "Grok Build Delegate",
+      jobId: "run-xyz",
+      verified: true,
+      verifyNote: "failures unchanged from baseline",
+      worktree: { path: "/tmp/wt", branch: "grok-build/run-xyz" },
+      budgetStopped: null
+    }
+  );
+  assert.match(output, /Verified: yes \(failures unchanged from baseline\)/);
+  assert.match(output, /Worktree: \/tmp\/wt/);
+  assert.doesNotMatch(output, /Budget:/, "no budget line when budgetStopped is null");
+});
+
+test("an isolated write run's follow-up hint points at land, not review", () => {
+  // Regression: the hint suggested /grok-build:review --wait for EVERY write
+  // run, but an isolated run never touches the working tree at all - review
+  // would look at the wrong thing entirely and find nothing, since the real
+  // changes sit unlanded in the worktree.
+  const output = renderJobStatusReport({
+    id: "run-iso",
+    status: "completed",
+    jobClass: "task",
+    write: true,
+    kindLabel: "delegate",
+    title: "Grok Build Delegate",
+    worktree: { path: "/tmp/wt/run-iso", branch: "grok-build/run-iso" }
+  });
+  assert.match(output, /Review and land: \/grok-build:land run-iso/);
+  assert.doesNotMatch(output, /\/grok-build:review --wait/);
+});
+
+test("a non-isolated write run keeps the review/critique hint", () => {
+  const output = renderJobStatusReport({
+    id: "run-direct",
+    status: "completed",
+    jobClass: "task",
+    write: true,
+    kindLabel: "delegate",
+    title: "Grok Build Delegate"
+  });
+  assert.match(output, /\/grok-build:review --wait/);
+  assert.match(output, /\/grok-build:critique --wait/);
 });

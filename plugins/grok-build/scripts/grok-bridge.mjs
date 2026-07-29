@@ -1218,7 +1218,11 @@ async function executeTaskRun(request) {
         {
           title: taskMetadata.title,
           jobId: request.jobId ?? null,
-          write
+          write,
+          verified,
+          verifyNote,
+          worktree,
+          budgetStopped
         }
       );
 
