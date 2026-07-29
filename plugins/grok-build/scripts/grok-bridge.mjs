@@ -332,7 +332,9 @@ async function executeReviewRun(request) {
     sandbox: "read-only",
     model: request.model,
     effort: request.effort,
-    outputFormat: structured ? "json" : "plain",
+    // Structured critique must stay "json": --json-schema implies it. The plain
+    // review path streams so it reports live phases and usage like delegate runs.
+    outputFormat: structured ? "json" : "streaming-json",
     jsonSchema: structured ? readOutputSchema(REVIEW_SCHEMA) : undefined,
     onProgress: request.onProgress
   });
@@ -447,7 +449,7 @@ async function executeTaskRun(request) {
     alwaysApprove: write,
     permissionMode: write ? undefined : "plan",
     sandbox: write ? undefined : "read-only",
-    outputFormat: "plain",
+    outputFormat: "streaming-json",
     onProgress: request.onProgress
   });
 

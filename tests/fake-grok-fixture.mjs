@@ -87,6 +87,39 @@ if (isPrint || hasFlag("-r") || hasFlag("--resume") || hasFlag("-c") || hasFlag(
   const prompt = printIndex !== -1 ? (argv[printIndex + 1] ?? "") : "";
   const wantsJson = hasFlag("--json-schema") || flagValue("--output-format") === "json";
 
+  if (flagValue("--output-format") === "streaming-json") {
+    const emit = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
+    // Mirror the plain-mode prompt branching below, so streaming callers get
+    // content shaped like their request rather than generic task text.
+    const isReview = /code review|Review the provided repository|Reviewing/i.test(prompt) || hasFlag("--agent");
+    const firstTurn = isReview ? ["Reviewing ", "uncommitted changes."] : ["Starting ", "the requested task."];
+    const secondTurn = isReview
+      ? ["Reviewed uncommitted changes.", "\\nNo material issues found."]
+      : ["Handled ", "the requested task."];
+    emit({ type: "thought", data: "planning the task" });
+    emit({ type: "text", data: firstTurn[0] });
+    emit({ type: "text", data: firstTurn[1] });
+    emit({ type: "thought", data: "double-checking" });
+    emit({ type: "text", data: secondTurn[0] });
+    emit({ type: "text", data: secondTurn[1] });
+    emit({
+      type: "end",
+      stopReason: "EndTurn",
+      sessionId: "99999999-8888-4777-8666-555555555555",
+      requestId: "fake-request",
+      usage: {
+        input_tokens: 1200,
+        cache_read_input_tokens: 400,
+        output_tokens: 40,
+        reasoning_tokens: 12,
+        total_tokens: 1652
+      },
+      num_turns: 2,
+      total_cost_usd: 0.0123
+    });
+    process.exit(0);
+  }
+
   if (wantsJson || /critique|adversarial|structured|Return only valid JSON/i.test(prompt)) {
     const payload = {
       verdict: "approve",

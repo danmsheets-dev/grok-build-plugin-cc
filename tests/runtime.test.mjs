@@ -221,6 +221,14 @@ test("run delegates through fake grok and stores a finished job", () => {
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Handled the requested task/);
+  // Proves the delegate path actually streams. The fake emits two turns; under
+  // --output-format plain they would concatenate with no separator, which is the
+  // Summary run-together defect. Guards against the bridge reverting to "plain".
+  assert.match(
+    result.stdout,
+    /Starting the requested task\.\s*\n\s*\nHandled the requested task\./,
+    "delegate output must be turn-separated, proving streaming-json is in use"
+  );
 
   const previous = process.env.CLAUDE_PLUGIN_DATA;
   process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;

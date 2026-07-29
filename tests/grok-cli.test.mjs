@@ -3,7 +3,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import { buildEnv, installFakeGrok } from "./fake-grok-fixture.mjs";
-import { makeTempDir } from "./helpers.mjs";
+import { makeTempDir, run } from "./helpers.mjs";
 import {
   buildReviewPrompt,
   getGrokAuthStatus,
@@ -159,4 +159,82 @@ test("live grok --help advertises headless flags when grok is on PATH", () => {
   ]) {
     assert.match(text, new RegExp(flag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
+});
+
+test("fake grok emits a two-turn streaming-json transcript", () => {
+  const dir = makeTempDir();
+  const binDir = path.join(dir, "bin");
+  installFakeGrok(binDir);
+
+  const result = run(path.join(binDir, "grok"), [
+    "-p",
+    "do the task",
+    "--output-format",
+    "streaming-json"
+  ], { env: buildEnv(binDir), cwd: dir });
+
+  assert.equal(result.status, 0);
+  const events = result.stdout.split(/\r?\n/).filter(Boolean).map((line) => JSON.parse(line));
+  const types = events.map((event) => event.type);
+
+  assert.ok(types.includes("thought"), "expected thought events");
+  assert.equal(types.filter((type) => type === "text").length >= 2, true);
+  assert.equal(types.at(-1), "end");
+
+  const end = events.at(-1);
+  assert.ok(end.sessionId, "end event must carry a sessionId");
+  assert.equal(typeof end.usage.input_tokens, "number");
+  assert.equal(typeof end.total_cost_usd, "number");
+
+  const textIndexes = types.map((type, index) => (type === "text" ? index : -1)).filter((i) => i !== -1);
+  const hasNonTextGap = textIndexes.some((index, i) => i > 0 && index !== textIndexes[i - 1] + 1);
+  assert.ok(hasNonTextGap, "the two text runs must be separated by a non-text event");
+});
+
+test("runHeadlessAgent parses streaming output, separates turns and reports usage", async () => {
+  const dir = makeTempDir();
+  const binDir = path.join(dir, "bin");
+  installFakeGrok(binDir);
+
+  const phases = [];
+  const result = await runHeadlessAgent(dir, {
+    prompt: "do the task",
+    binary: path.join(binDir, "grok"),
+    env: buildEnv(binDir),
+    onProgress: (event) => {
+      if (event && typeof event === "object" && event.phase) {
+        phases.push(event.phase);
+      }
+    }
+  });
+
+  assert.equal(result.status, 0);
+  assert.equal(
+    result.finalMessage,
+    "Starting the requested task.\n\nHandled the requested task.",
+    "turns must be separated by a blank line"
+  );
+  assert.equal(result.threadId, "99999999-8888-4777-8666-555555555555", "session id comes from the end event");
+  assert.equal(result.usage.inputTokens, 1200);
+  assert.equal(result.usage.costUsd, 0.0123);
+  assert.equal(result.usage.numTurns, 2);
+  assert.ok(phases.includes("thinking"), `expected a thinking phase, saw ${phases.join(",")}`);
+  assert.ok(phases.includes("writing"), `expected a writing phase, saw ${phases.join(",")}`);
+});
+
+test("runHeadlessAgent still returns plain output verbatim when asked", async () => {
+  const dir = makeTempDir();
+  const binDir = path.join(dir, "bin");
+  installFakeGrok(binDir);
+
+  const result = await runHeadlessAgent(dir, {
+    prompt: "do the task",
+    outputFormat: "plain",
+    binary: path.join(binDir, "grok"),
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.status, 0);
+  assert.equal(result.finalMessage, "Handled the requested task.");
+  assert.equal(result.usage, null);
 });

@@ -6,6 +6,7 @@ import process from "node:process";
 
 import { readJsonFile } from "./fs.mjs";
 import { binaryAvailable, runCommand } from "./process.mjs";
+import { createNdjsonDecoder, createStreamTranscript, parseStreamEvent } from "./stream-events.mjs";
 import { resolveSpawnInvocation } from "./which.mjs";
 
 export const DEFAULT_CONTINUE_PROMPT =
@@ -190,7 +191,7 @@ function buildHeadlessArgs(prompt, options = {}) {
   if (options.outputFormat) {
     args.push("--output-format", options.outputFormat);
   } else {
-    args.push("--output-format", "plain");
+    args.push("--output-format", "streaming-json");
   }
   if (options.jsonSchema) {
     const schemaText =
@@ -227,6 +228,9 @@ export function runHeadlessAgent(cwd, options = {}) {
   // real `grok.exe` from elsewhere on PATH instead.
   const invocation = resolveSpawnInvocation(binary, args, spawnEnv, platform);
 
+  const outputFormat = options.outputFormat ?? "streaming-json";
+  const streaming = outputFormat === "streaming-json";
+
   return new Promise((resolve, reject) => {
     const child = spawn(invocation.executable, invocation.args, {
       cwd,
@@ -245,11 +249,40 @@ export function runHeadlessAgent(cwd, options = {}) {
 
     let stdout = "";
     let stderr = "";
+    const decoder = streaming ? createNdjsonDecoder() : null;
+    const transcript = streaming ? createStreamTranscript() : null;
+    let lastPhase = null;
+
+    function consumeLine(line) {
+      const event = parseStreamEvent(line);
+      if (!event) {
+        return;
+      }
+      const outcome = transcript.accept(event);
+      if (outcome.messageCompleted) {
+        emitProgress(options.onProgress, outcome.messageCompleted, outcome.phase ?? lastPhase, {
+          threadId: sessionId,
+          agentPid
+        });
+      }
+      if (outcome.phase && outcome.phase !== lastPhase) {
+        lastPhase = outcome.phase;
+        emitProgress(options.onProgress, `Grok is ${outcome.phase}.`, outcome.phase, {
+          threadId: sessionId,
+          agentPid
+        });
+      }
+    }
 
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     child.stdout.on("data", (chunk) => {
       stdout += chunk;
+      if (streaming) {
+        for (const line of decoder.push(chunk)) {
+          consumeLine(line);
+        }
+      }
     });
     child.stderr.on("data", (chunk) => {
       stderr += chunk;
@@ -261,21 +294,35 @@ export function runHeadlessAgent(cwd, options = {}) {
 
     child.on("close", (code, signal) => {
       const status = code ?? (signal ? 1 : 0);
+      let result = null;
+      if (streaming) {
+        for (const line of decoder.flush()) {
+          consumeLine(line);
+        }
+        result = transcript.finish();
+      }
+
+      const resolvedThreadId = result?.sessionId || sessionId;
       emitProgress(
         options.onProgress,
         status === 0 ? "Grok finished." : `Grok exited with status ${status}.`,
         status === 0 ? "finalizing" : "failed",
-        { threadId: sessionId, agentPid }
+        { threadId: resolvedThreadId, agentPid }
       );
+
       resolve({
         status,
         signal,
         stdout,
         stderr,
-        sessionId,
-        threadId: sessionId,
+        sessionId: resolvedThreadId,
+        threadId: resolvedThreadId,
         agentPid,
-        finalMessage: stdout.trimEnd(),
+        finalMessage: result ? result.finalMessage : stdout.trimEnd(),
+        messages: result ? result.messages : null,
+        usage: result?.usage ?? null,
+        stopReason: result?.stopReason ?? null,
+        unknownEventTypes: result?.unknownTypes ?? [],
         args,
         binary
       });
