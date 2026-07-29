@@ -352,3 +352,54 @@ test("land --preview errors on a stale branch ref instead of silently claiming n
     }
   }
 });
+
+test("landing a job twice gives a clean error on the second call, not a raw git error", () => {
+  // Regression found by a second-round audit: land never cleared the job's
+  // worktree field after a successful apply or discard, so a second
+  // /grok-build:land call on the same job id fell through past the
+  // "no worktree to land" guard and hit a git diff against a branch
+  // removeWorktree had already deleted - a raw, unfriendly git error
+  // instead of a clear "already landed" message. It also left the
+  // render.mjs land-hint pointing at a job with nothing left to land.
+  const repo = makeTempDir("grok-land-twice-");
+  const binDir = makeTempDir("grok-land-twice-bin-");
+  const pluginDataDir = makeTempDir("grok-land-twice-data-");
+  installFakeGrok(binDir);
+  seedRepo(repo);
+
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  try {
+    const jobId = generateJobId("run");
+    const created = createWorktree({ cwd: repo, runId: jobId, dataDir: pluginDataDir });
+    fs.writeFileSync(path.join(created.worktreePath, "agent.txt"), "from agent\n");
+    run("git", ["add", "agent.txt"], { cwd: created.worktreePath });
+    run("git", ["commit", "-m", "agent change"], { cwd: created.worktreePath });
+
+    seedFinishedJob(repo, pluginDataDir, {
+      id: jobId,
+      worktree: { path: created.worktreePath, branch: created.branchName, baseSha: created.baseSha }
+    });
+
+    const first = run("node", [SCRIPT, "land", jobId], {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir)
+    });
+    assert.equal(first.status, 0, first.stderr);
+    run("git", ["commit", "-am", "keep landed work"], { cwd: repo });
+
+    const second = run("node", [SCRIPT, "land", jobId], {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir)
+    });
+    assert.notEqual(second.status, 0);
+    assert.match(`${second.stdout}${second.stderr}`, /has no worktree to land/i);
+    assert.doesNotMatch(`${second.stdout}${second.stderr}`, /fatal:|unknown revision/i);
+  } finally {
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
+});

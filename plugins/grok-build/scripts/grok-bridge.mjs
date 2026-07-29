@@ -1667,6 +1667,25 @@ function porcelainDirtyPaths(statusOutput) {
     .filter(Boolean);
 }
 
+/**
+ * Clear a job's worktree field after it has been successfully landed or
+ * discarded. Reuses the existing "no worktree to land" guard at the top of
+ * handleLand: without this, a second `land` call against the same job id
+ * fell through to the git-diff computation against a branch that
+ * removeWorktree had already deleted, surfacing a raw git error instead of
+ * a clear "already landed" message. Also keeps the render.mjs land-hint
+ * from suggesting `/grok-build:land <id>` forever for a job with nothing
+ * left to land.
+ */
+function markJobLanded(workspaceRoot, jobId, storedJob, action) {
+  writeJobFile(workspaceRoot, jobId, {
+    ...storedJob,
+    worktree: null,
+    landedAt: nowIso(),
+    landAction: action
+  });
+}
+
 async function handleLand(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd"],
@@ -1694,6 +1713,7 @@ async function handleLand(argv) {
       branchName,
       deleteBranch: true
     });
+    markJobLanded(workspaceRoot, job.id, storedJob, "discard");
     const payload = {
       jobId: job.id,
       action: "discard",
@@ -1761,6 +1781,7 @@ async function handleLand(argv) {
     branchName,
     deleteBranch: true
   });
+  markJobLanded(workspaceRoot, job.id, storedJob, "apply");
 
   const currentBranch = getCurrentBranch(repoRoot);
   const payload = {
