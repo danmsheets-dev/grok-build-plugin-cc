@@ -9,6 +9,7 @@ import {
   removeWorktree,
   resolveWorktreePath
 } from "../plugins/grok-build/scripts/lib/worktree.mjs";
+import { planWorktreeLinks, provisionWorktree } from "../plugins/grok-build/scripts/lib/provision.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 
 function seedRepo(cwd) {
@@ -261,4 +262,58 @@ test("removing a worktree never destroys a junction/symlink's real target", () =
     "REAL DEPENDENCY - MUST SURVIVE\n",
     "content must be byte-identical, not merely present"
   );
+});
+
+test("a Godot import cache is linked in, excluded from commits, and survives teardown", () => {
+  // End-to-end for the Godot ecosystem specifically: .godot (Godot 4's asset
+  // import cache) must be linked into a fresh worktree so a headless import
+  // does not start from scratch, must never be committed onto the run
+  // branch (it is regenerated, not source), and - per the junction-safety
+  // fix - the real cache must survive worktree teardown even though a NEW
+  // cache entry was written into it during the run.
+  const cwd = makeTempDir();
+  seedRepo(cwd);
+
+  const realImportDir = path.join(cwd, ".godot", "imported");
+  fs.mkdirSync(realImportDir, { recursive: true });
+  const markerFile = path.join(realImportDir, "marker.txt");
+  fs.writeFileSync(markerFile, "REAL IMPORT CACHE\n", "utf8");
+
+  const dataDir = makeTempDir();
+  const created = createWorktree({ cwd, runId: "godot-e2e", dataDir });
+  const plan = planWorktreeLinks(created.repoRoot, created.worktreePath);
+  assert.ok(
+    plan.links.some((link) => path.basename(link.from) === ".godot"),
+    ".godot must be planned for linking"
+  );
+  provisionWorktree(plan);
+
+  const linkedMarker = path.join(created.worktreePath, ".godot", "imported", "marker.txt");
+  assert.equal(fs.existsSync(linkedMarker), true, "the import cache must be visible through the link");
+
+  // The "agent" adds a real scene file, and a headless Godot import writes a
+  // new cache entry into the linked .godot directory.
+  fs.writeFileSync(path.join(created.worktreePath, "new_scene.tscn"), "[gd_scene]\n", "utf8");
+  fs.mkdirSync(path.join(created.worktreePath, ".godot", "imported"), { recursive: true });
+  fs.writeFileSync(
+    path.join(created.worktreePath, ".godot", "imported", "new_cache_entry.import"),
+    "cache data\n",
+    "utf8"
+  );
+
+  const committed = commitWorktreeChanges(created.worktreePath, "grok-build godot test");
+  assert.equal(committed.committed, true);
+
+  const shown = run("git", ["show", "--name-only", "--pretty=format:", "HEAD"], { cwd: created.worktreePath });
+  assert.match(shown.stdout, /new_scene\.tscn/);
+  assert.doesNotMatch(shown.stdout, /\.godot/, ".godot must never be committed onto the run branch");
+
+  removeWorktree({
+    repoRoot: created.repoRoot,
+    worktreePath: created.worktreePath,
+    branchName: created.branchName,
+    deleteBranch: true
+  });
+
+  assert.equal(fs.existsSync(markerFile), true, "the real import cache must survive worktree teardown");
 });

@@ -146,3 +146,21 @@ test("provisionWorktree does not throw when mkdirSync fails", () => {
   assertModule.equal(result.failed.length, 1);
   assertModule.match(result.failed[0].reason, /EPERM/);
 });
+
+describe("PROVISION_LINK_DIRS ecosystem coverage", () => {
+  test("includes Godot's asset import caches for both Godot 3 and 4", () => {
+    assertModule.ok(PROVISION_LINK_DIRS.includes(".godot"), "Godot 4 import cache");
+    assertModule.ok(PROVISION_LINK_DIRS.includes(".import"), "Godot 3 import cache");
+  });
+
+  test("includes Python tox and PDM environments", () => {
+    assertModule.ok(PROVISION_LINK_DIRS.includes(".tox"));
+    assertModule.ok(PROVISION_LINK_DIRS.includes("__pypackages__"));
+  });
+
+  test("includes common JS/web framework build caches", () => {
+    for (const dir of [".next", ".nuxt", ".svelte-kit", ".turbo", ".parcel-cache"]) {
+      assertModule.ok(PROVISION_LINK_DIRS.includes(dir), `missing ${dir}`);
+    }
+  });
+});

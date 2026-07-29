@@ -2,7 +2,30 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
-export const PROVISION_LINK_DIRS = Object.freeze(["node_modules", ".venv", "venv", "target", "vendor"]);
+// Heavyweight directories linked from the source repo into a fresh worktree
+// so the first verify command does not fail for lack of dependencies. Covers
+// the five target ecosystems: Godot's import cache (.godot for Godot 4,
+// .import for Godot 3 - without this, a fresh worktree re-imports every
+// asset from scratch on the first headless run), Rust (target), Python
+// (.venv/venv, plus .tox for tox environments and __pypackages__ for PDM),
+// JS/web (node_modules, plus framework build caches that speed up or are
+// required for a working dev/build command), and generic vendor dirs.
+export const PROVISION_LINK_DIRS = Object.freeze([
+  "node_modules",
+  ".venv",
+  "venv",
+  "target",
+  "vendor",
+  ".godot",
+  ".import",
+  ".tox",
+  "__pypackages__",
+  ".next",
+  ".nuxt",
+  ".svelte-kit",
+  ".turbo",
+  ".parcel-cache"
+]);
 
 export function planWorktreeLinks(repoRoot, worktreePath, options = {}) {
   const platform = options.platform ?? process.platform;
