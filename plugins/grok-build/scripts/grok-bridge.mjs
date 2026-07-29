@@ -9,7 +9,14 @@ import { fileURLToPath } from "node:url";
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
-import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
+import {
+  collectReviewContext,
+  ensureGitRepository,
+  getCurrentBranch,
+  git,
+  gitChecked,
+  resolveReviewTarget
+} from "./lib/git.mjs";
 import {
   buildReviewPrompt,
   DEFAULT_CONTINUE_PROMPT,
@@ -34,6 +41,7 @@ import {
 } from "./lib/job-control.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
+import { planWorktreeLinks, provisionWorktree } from "./lib/provision.mjs";
 import {
   claimJobTerminal,
   generateJobId,
@@ -53,7 +61,18 @@ import {
   runTrackedJob,
   SESSION_ID_ENV
 } from "./lib/tracked-jobs.mjs";
+import {
+  compareFailureSignatures,
+  deriveVerifyTimeoutMs,
+  runVerifyCommand,
+  summarizeFailures
+} from "./lib/verify.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
+import {
+  commitWorktreeChanges,
+  createWorktree,
+  removeWorktree
+} from "./lib/worktree.mjs";
 import {
   renderCancelReport,
   renderJobStatusReport,
@@ -82,8 +101,43 @@ function printUsage() {
       "  node scripts/grok-bridge.mjs import [--source <claude-jsonl>] [--json]",
       "  node scripts/grok-bridge.mjs runs [run-id] [--all] [--json]",
       "  node scripts/grok-bridge.mjs show [run-id] [--json]",
-      "  node scripts/grok-bridge.mjs stop [run-id] [--json]"
+      "  node scripts/grok-bridge.mjs stop [run-id] [--json]",
+      "  node scripts/grok-bridge.mjs land [run-id] [--discard] [--json]"
     ].join("\n")
+  );
+}
+
+function normalizeVerifyCommands(raw) {
+  if (raw == null || raw === "") {
+    return [];
+  }
+  const list = Array.isArray(raw) ? raw : [raw];
+  return list.map((entry) => String(entry).trim()).filter(Boolean);
+}
+
+function resolveVerifyAttempts(raw) {
+  const parsed = Number(raw);
+  if (Number.isFinite(parsed) && parsed >= 1) {
+    return parsed;
+  }
+  return 2;
+}
+
+function resolveIsolateOption(options, write) {
+  if (options["no-isolate"]) {
+    return false;
+  }
+  if (options.isolate) {
+    return true;
+  }
+  return Boolean(write);
+}
+
+function buildBoundedVerifyFixPrompt(command, output) {
+  return (
+    `The verify command \`${command}\` failed. Fix the cause, then re-run only that exact command until it passes. ` +
+    `Do not investigate unrelated failures, do not run the full test suite, and do not change any test to make it pass.\n\n` +
+    `Output:\n${output}`
   );
 }
 
@@ -440,8 +494,38 @@ async function executeTaskRun(request) {
 
   const prompt = String(request.prompt ?? "").trim() || (resumeSessionId ? DEFAULT_CONTINUE_PROMPT : "");
   const write = Boolean(request.write);
+  const isolate = Boolean(request.isolate);
+  const verifyCommands = normalizeVerifyCommands(request.verifyCommands);
+  const verifyAttempts = resolveVerifyAttempts(request.verifyAttempts);
 
-  const result = await runHeadlessAgent(workspaceRoot, {
+  const grokVersion = getGrokAvailability(request.cwd).detail ?? null;
+
+  let created = null;
+  let runCwd = workspaceRoot;
+  if (isolate && write) {
+    created = createWorktree({ cwd: workspaceRoot, runId: request.jobId });
+    const plan = planWorktreeLinks(created.repoRoot, created.worktreePath);
+    provisionWorktree(plan);
+    runCwd = created.worktreePath;
+  }
+
+  /** @type {{ command: string, ok: boolean, ms: number, signature: string[] }[]} */
+  const baselines = [];
+  if (verifyCommands.length > 0 && created) {
+    for (const command of verifyCommands) {
+      const started = Date.now();
+      const probe = runVerifyCommand(command, runCwd, { timeoutMs: 120000 });
+      const ms = Date.now() - started;
+      baselines.push({
+        command,
+        ok: probe.ok,
+        ms,
+        signature: summarizeFailures(probe.output).signature
+      });
+    }
+  }
+
+  let result = await runHeadlessAgent(runCwd, {
     prompt,
     resumeSessionId,
     model: request.model,
@@ -450,8 +534,91 @@ async function executeTaskRun(request) {
     permissionMode: write ? undefined : "plan",
     sandbox: write ? undefined : "read-only",
     outputFormat: "streaming-json",
-    onProgress: request.onProgress
+    onProgress: request.onProgress,
+    cwd: runCwd
   });
+
+  let verified = null;
+  let verifyNote = null;
+  /** @type {object[]} */
+  let verifyResults = [];
+  let attempt = 0;
+
+  if (verifyCommands.length > 0) {
+    while (attempt <= verifyAttempts) {
+      const iterationResults = [];
+      let firstFailure = null;
+
+      for (const command of verifyCommands) {
+        const baselineEntry = baselines.find((entry) => entry.command === command);
+        const baselineMs =
+          baselineEntry && Number.isFinite(baselineEntry.ms) ? baselineEntry.ms : 120000;
+        const timeoutMs = deriveVerifyTimeoutMs(baselineMs);
+        const outcome = runVerifyCommand(command, runCwd, { timeoutMs });
+        const signature = summarizeFailures(outcome.output).signature;
+        iterationResults.push({
+          command,
+          ok: outcome.ok,
+          exitCode: outcome.exitCode,
+          timedOut: outcome.timedOut,
+          output: outcome.output,
+          signature
+        });
+        if (!outcome.ok && !firstFailure) {
+          firstFailure = { command, output: outcome.output, signature };
+        }
+      }
+
+      verifyResults = iterationResults;
+
+      if (!firstFailure) {
+        verified = true;
+        break;
+      }
+
+      const baselineEntry = baselines.find((entry) => entry.command === firstFailure.command);
+      const comparison = compareFailureSignatures(
+        firstFailure.signature,
+        baselineEntry?.signature ?? []
+      );
+      if (comparison.outcome === "unchanged-from-baseline") {
+        verified = true;
+        verifyNote = "failures unchanged from baseline";
+        break;
+      }
+
+      if (attempt === verifyAttempts) {
+        verified = false;
+        break;
+      }
+
+      result = await runHeadlessAgent(runCwd, {
+        prompt: buildBoundedVerifyFixPrompt(firstFailure.command, firstFailure.output),
+        resumeSessionId: result.threadId,
+        model: request.model,
+        effort: request.effort,
+        alwaysApprove: true,
+        cwd: runCwd,
+        outputFormat: "streaming-json",
+        onProgress: request.onProgress
+      });
+      attempt += 1;
+    }
+  }
+
+  let worktree = null;
+  if (created) {
+    const committed = commitWorktreeChanges(
+      created.worktreePath,
+      `grok-build ${request.jobId}`
+    );
+    worktree = {
+      path: created.worktreePath,
+      branch: created.branchName,
+      baseSha: created.baseSha,
+      sha: committed.sha
+    };
+  }
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
   const failureMessage = result.status === 0 ? "" : result.stderr || "";
@@ -466,12 +633,24 @@ async function executeTaskRun(request) {
       write
     }
   );
+
+  const verify = {
+    commands: verifyCommands,
+    attempts: attempt,
+    note: verifyNote,
+    results: verifyResults
+  };
+
   const payload = {
     status: result.status,
     threadId: result.threadId,
     usage: result.usage ?? null,
     stopReason: result.stopReason ?? null,
-    rawOutput
+    rawOutput,
+    verified,
+    worktree,
+    grokVersion,
+    verify
   };
 
   return {
@@ -483,7 +662,11 @@ async function executeTaskRun(request) {
     summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
     jobTitle: taskMetadata.title,
     jobClass: "task",
-    write
+    write,
+    verified,
+    worktree,
+    grokVersion,
+    verify
   };
 }
 
@@ -545,7 +728,18 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({
+  cwd,
+  model,
+  effort,
+  prompt,
+  write,
+  resumeLast,
+  jobId,
+  isolate = false,
+  verifyCommands = [],
+  verifyAttempts = 2
+}) {
   return {
     cwd,
     model,
@@ -553,7 +747,10 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId
     prompt,
     write,
     resumeLast,
-    jobId
+    jobId,
+    isolate,
+    verifyCommands,
+    verifyAttempts
   };
 }
 
@@ -733,8 +930,8 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "verify", "verify-attempts"],
+    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "isolate", "no-isolate"],
     aliasMap: {
       m: "model"
     }
@@ -752,6 +949,9 @@ async function handleTask(argv) {
     throw new Error("Choose either --resume/--resume-last or --fresh.");
   }
   const write = Boolean(options.write);
+  const isolate = resolveIsolateOption(options, write);
+  const verifyCommands = normalizeVerifyCommands(options.verify);
+  const verifyAttempts = resolveVerifyAttempts(options["verify-attempts"]);
   const taskMetadata = buildTaskRunMetadata({
     prompt,
     resumeLast
@@ -771,7 +971,10 @@ async function handleTask(argv) {
         prompt,
         write,
         resumeLast,
-        jobId: job.id
+        jobId: job.id,
+        isolate,
+        verifyCommands,
+        verifyAttempts
       })
     };
     const { payload } = enqueueBackgroundJob(cwd, job, request);
@@ -791,10 +994,112 @@ async function handleTask(argv) {
         write,
         resumeLast,
         jobId: job.id,
+        isolate,
+        verifyCommands,
+        verifyAttempts,
         onProgress: progress
       }),
     { json: options.json }
   );
+}
+
+function porcelainDirtyPaths(statusOutput) {
+  return String(statusOutput ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter(Boolean)
+    .map((line) => {
+      // Porcelain: "XY path" or "XY origin -> path"
+      const body = line.length >= 3 ? line.slice(3) : line;
+      const arrow = body.indexOf(" -> ");
+      return (arrow === -1 ? body : body.slice(arrow + 4)).trim();
+    })
+    .filter(Boolean);
+}
+
+async function handleLand(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json", "discard"]
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const { workspaceRoot, job } = resolveResultJob(cwd, positionals[0] ?? "");
+  const storedJob = readStoredJob(workspaceRoot, job.id) ?? job;
+  const worktree = storedJob.worktree;
+
+  if (!worktree || typeof worktree !== "object" || !worktree.path) {
+    throw new Error(`Run ${job.id} has no worktree to land. It ran without isolation.`);
+  }
+
+  const repoRoot = ensureGitRepository(workspaceRoot);
+  const branchName = worktree.branch;
+  const worktreePath = worktree.path;
+  const baseSha = worktree.baseSha;
+
+  if (options.discard) {
+    removeWorktree({
+      repoRoot,
+      worktreePath,
+      branchName,
+      deleteBranch: true
+    });
+    const payload = {
+      jobId: job.id,
+      action: "discard",
+      worktree,
+      diffStat: null
+    };
+    const rendered = `Discarded ${job.id}: worktree and branch removed.\n`;
+    outputCommandResult(payload, rendered, options.json);
+    return;
+  }
+
+  const dirty = git(repoRoot, ["status", "--porcelain"]);
+  if (dirty.status !== 0) {
+    throw new Error(
+      `Unable to inspect working tree before land: ${(dirty.stderr || dirty.stdout || "").trim()}`
+    );
+  }
+  const dirtyFiles = porcelainDirtyPaths(dirty.stdout);
+  if (dirtyFiles.length > 0) {
+    const named = dirtyFiles.slice(0, 5).join(", ");
+    throw new Error(
+      `Refusing to land into a dirty working tree. Commit or stash first. Dirty files: ${named}`
+    );
+  }
+
+  if (!branchName) {
+    throw new Error(`Run ${job.id} worktree is missing a branch name.`);
+  }
+  if (!baseSha) {
+    throw new Error(`Run ${job.id} worktree is missing baseSha.`);
+  }
+
+  const diffRange = `${baseSha}..${branchName}`;
+  const diffResult = git(repoRoot, ["diff", "--stat", diffRange]);
+  const diffStat = (diffResult.stdout || "").trim();
+
+  gitChecked(repoRoot, ["merge", "--squash", branchName]);
+
+  removeWorktree({
+    repoRoot,
+    worktreePath,
+    branchName,
+    deleteBranch: true
+  });
+
+  const currentBranch = getCurrentBranch(repoRoot);
+  const payload = {
+    jobId: job.id,
+    action: "apply",
+    worktree,
+    diffStat
+  };
+  const text =
+    (diffStat ? `${diffStat}\n\n` : "") +
+    `Landed ${job.id} onto ${currentBranch}. Changes are staged; review with git diff --cached and commit when ready.\n`;
+  outputCommandResult(payload, text, options.json);
 }
 
 async function handleTransfer(argv) {
@@ -1086,6 +1391,9 @@ async function main() {
       break;
     case "stop":
       await handleCancel(argv);
+      break;
+    case "land":
+      await handleLand(argv);
       break;
     default:
       throw new Error(`Unknown subcommand: ${subcommand}`);
