@@ -1,6 +1,11 @@
 export function parseArgs(argv, config = {}) {
   const valueOptions = new Set(config.valueOptions ?? []);
   const booleanOptions = new Set(config.booleanOptions ?? []);
+  // A value option named here accumulates every occurrence into an array
+  // instead of the default last-wins overwrite. Without this, --verify "cargo
+  // test" --verify "cargo clippy" silently kept only "cargo clippy" - every
+  // earlier --verify value was dropped with no warning.
+  const repeatableOptions = new Set(config.repeatableOptions ?? []);
   const aliasMap = config.aliasMap ?? {};
   const unknownMode = config.unknownMode ?? "positional";
   const options = {};
@@ -40,7 +45,11 @@ export function parseArgs(argv, config = {}) {
         if (nextValue === undefined) {
           throw new Error(`Missing value for --${rawKey}`);
         }
-        options[key] = nextValue;
+        if (repeatableOptions.has(key)) {
+          options[key] = Array.isArray(options[key]) ? [...options[key], nextValue] : [nextValue];
+        } else {
+          options[key] = nextValue;
+        }
         if (inlineValue === undefined) {
           index += 1;
         }
@@ -71,7 +80,11 @@ export function parseArgs(argv, config = {}) {
       if (nextValue === undefined) {
         throw new Error(`Missing value for -${shortKey}`);
       }
-      options[key] = nextValue;
+      if (repeatableOptions.has(key)) {
+        options[key] = Array.isArray(options[key]) ? [...options[key], nextValue] : [nextValue];
+      } else {
+        options[key] = nextValue;
+      }
       index += 1;
       continue;
     }

@@ -74,3 +74,29 @@ test("splitRawArgumentString leaves a trailing lone backslash literal", () => {
   // "\U" or "\f" this one is never dropped, so a plain string literal is safe.
   assert.deepEqual(splitRawArgumentString("weird\\"), ["weird\\"]);
 });
+
+test("parseArgs accumulates a repeatable option across multiple occurrences", () => {
+  // Regression: --verify "cargo test" --verify "cargo clippy" silently kept
+  // only the last value. Every earlier --verify command was dropped with
+  // no warning at all.
+  const result = parseArgs(["--verify", "cargo test", "--verify", "cargo clippy"], {
+    valueOptions: ["verify"],
+    repeatableOptions: ["verify"]
+  });
+  assert.deepEqual(result.options.verify, ["cargo test", "cargo clippy"]);
+});
+
+test("parseArgs still overwrites a non-repeatable value option on repeat", () => {
+  const result = parseArgs(["--model", "a", "--model", "b"], {
+    valueOptions: ["model"]
+  });
+  assert.equal(result.options.model, "b");
+});
+
+test("parseArgs keeps a single occurrence of a repeatable option as an array", () => {
+  const result = parseArgs(["--verify", "cargo test"], {
+    valueOptions: ["verify"],
+    repeatableOptions: ["verify"]
+  });
+  assert.deepEqual(result.options.verify, ["cargo test"]);
+});

@@ -65,7 +65,7 @@ import {
   SESSION_ID_ENV
 } from "./lib/tracked-jobs.mjs";
 import {
-  compareFailureSignatures,
+  classifyVerifyFailure,
   deriveVerifyTimeoutMs,
   runVerifyCommand,
   summarizeFailures
@@ -92,6 +92,10 @@ const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json"
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
 const VALID_REASONING_EFFORTS = new Set(["low", "medium", "high"]);
+// Generous on purpose: this is the only chance to learn what already failed
+// before the agent ran. A tight cap here silently produced an empty baseline
+// on a slow cold build, misattributing every pre-existing failure to the run.
+const BASELINE_PROBE_TIMEOUT_MS = 900000;
 
 function printUsage() {
   console.log(
@@ -256,6 +260,32 @@ function buildBoundedVerifyFixPrompt(command, output) {
     `Do not investigate unrelated failures, do not run the full test suite, and do not change any test to make it pass.\n\n` +
     `Output:\n${output}`
   );
+}
+
+/**
+ * Sum two usage objects. The verify-fix loop can invoke the agent multiple
+ * times (initial run plus one per fix attempt); reporting only the last
+ * call's usage silently discarded every earlier turn's tokens and cost, and
+ * checking --max-cost against a single call's cost rather than the running
+ * total meant N calls each under budget could together blow well past it.
+ */
+function addUsage(a, b) {
+  if (!b) {
+    return a;
+  }
+  if (!a) {
+    return { ...b };
+  }
+  const numeric = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
+  return {
+    inputTokens: numeric(a.inputTokens) + numeric(b.inputTokens),
+    cachedInputTokens: numeric(a.cachedInputTokens) + numeric(b.cachedInputTokens),
+    outputTokens: numeric(a.outputTokens) + numeric(b.outputTokens),
+    reasoningTokens: numeric(a.reasoningTokens) + numeric(b.reasoningTokens),
+    totalTokens: numeric(a.totalTokens) + numeric(b.totalTokens),
+    costUsd: numeric(a.costUsd) + numeric(b.costUsd),
+    numTurns: numeric(a.numTurns) + numeric(b.numTurns)
+  };
 }
 
 function outputResult(value, asJson) {
@@ -881,18 +911,29 @@ async function executeTaskRun(request) {
     runCwd = created.worktreePath;
   }
 
-  /** @type {{ command: string, ok: boolean, ms: number, signature: string[] }[]} */
+  /** @type {{ command: string, ok: boolean, ms: number, signature: string[], rawCount: number, timedOut: boolean }[]} */
   const baselines = [];
   if (verifyCommands.length > 0 && created) {
     for (const command of verifyCommands) {
       const started = Date.now();
-      const probe = runVerifyCommand(command, runCwd, { timeoutMs: 120000 });
+      // A generous cap, not the derived per-attempt timeout: this is the ONLY
+      // chance to learn what was already broken before the agent touched
+      // anything, and a cold-build ecosystem (Godot's first asset import,
+      // a fresh cargo build) can legitimately take minutes. A tight cap here
+      // used to discard the timeout result silently, so any command that ran
+      // long got recorded as an empty baseline signature - and every one of
+      // its real, pre-existing failures then looked "new" once the agent's
+      // run finished, blaming it for something it never touched.
+      const probe = runVerifyCommand(command, runCwd, { timeoutMs: BASELINE_PROBE_TIMEOUT_MS });
       const ms = Date.now() - started;
+      const summary = summarizeFailures(probe.output);
       baselines.push({
         command,
         ok: probe.ok,
         ms,
-        signature: summarizeFailures(probe.output).signature
+        signature: summary.signature,
+        rawCount: summary.rawCount,
+        timedOut: Boolean(probe.timedOut)
       });
     }
   }
@@ -916,17 +957,21 @@ async function executeTaskRun(request) {
   );
   let result = firstAgent.result;
   let timedOut = firstAgent.timedOut;
+  let cumulativeUsage = result.usage ? { ...result.usage } : null;
 
   // Cost is only known when a turn ends (from the end event's total_cost_usd),
   // so max-cost is a post-hoc stop — not a pre-emptive cap. The run stops before
-  // the *next* turn / verify re-invoke rather than mid-turn.
+  // the *next* turn / verify re-invoke rather than mid-turn. Checked against the
+  // running total across every call this run has made so far, not just the
+  // latest one — otherwise N calls each individually under budget could
+  // together spend well past maxCostUsd without ever tripping the stop.
   let budgetStopped = null;
   if (
     !timedOut &&
     maxCostUsd != null &&
-    result.usage?.costUsd != null &&
-    Number.isFinite(Number(result.usage.costUsd)) &&
-    Number(result.usage.costUsd) > maxCostUsd
+    cumulativeUsage?.costUsd != null &&
+    Number.isFinite(Number(cumulativeUsage.costUsd)) &&
+    Number(cumulativeUsage.costUsd) > maxCostUsd
   ) {
     budgetStopped = "max-cost";
   }
@@ -940,7 +985,14 @@ async function executeTaskRun(request) {
   if (!timedOut && verifyCommands.length > 0) {
     while (attempt <= verifyAttempts) {
       const iterationResults = [];
-      let firstFailure = null;
+      // The first failure genuinely attributable to THIS run - as opposed to
+      // one that matches (or cannot be distinguished from) the pre-existing
+      // baseline. Every failing command used to be compared against baseline
+      // ONLY if it happened to be the first one iterated; a regression in a
+      // second --verify command was collected into iterationResults but never
+      // actually checked, so the run could report success while a real
+      // regression sat right there in the results array.
+      let firstBlamed = null;
 
       for (const command of verifyCommands) {
         const baselineEntry = baselines.find((entry) => entry.command === command);
@@ -948,35 +1000,43 @@ async function executeTaskRun(request) {
           baselineEntry && Number.isFinite(baselineEntry.ms) ? baselineEntry.ms : 120000;
         const timeoutMs = deriveVerifyTimeoutMs(baselineMs);
         const outcome = runVerifyCommand(command, runCwd, { timeoutMs });
-        const signature = summarizeFailures(outcome.output).signature;
-        iterationResults.push({
+        const summary = summarizeFailures(outcome.output);
+        const entryResult = {
           command,
           ok: outcome.ok,
           exitCode: outcome.exitCode,
           timedOut: outcome.timedOut,
           output: outcome.output,
-          signature
-        });
-        if (!outcome.ok && !firstFailure) {
-          firstFailure = { command, output: outcome.output, signature };
+          signature: summary.signature
+        };
+        iterationResults.push(entryResult);
+
+        if (outcome.ok) {
+          continue;
+        }
+
+        const classification = classifyVerifyFailure(summary, baselineEntry);
+        entryResult.attribution = classification.reason;
+        if (classification.comparison) {
+          entryResult.comparison = classification.comparison;
+        }
+
+        if (!classification.blamed) {
+          continue;
+        }
+
+        if (!firstBlamed) {
+          firstBlamed = entryResult;
         }
       }
 
       verifyResults = iterationResults;
 
-      if (!firstFailure) {
+      if (!firstBlamed) {
         verified = true;
-        break;
-      }
-
-      const baselineEntry = baselines.find((entry) => entry.command === firstFailure.command);
-      const comparison = compareFailureSignatures(
-        firstFailure.signature,
-        baselineEntry?.signature ?? []
-      );
-      if (comparison.outcome === "unchanged-from-baseline") {
-        verified = true;
-        verifyNote = "failures unchanged from baseline";
+        if (iterationResults.some((entry) => !entry.ok)) {
+          verifyNote = "remaining failures are unchanged from baseline or could not be attributed to this run";
+        }
         break;
       }
 
@@ -995,11 +1055,23 @@ async function executeTaskRun(request) {
       const fixAgent = await runHeadlessAgentWithDurationBudget(
         runCwd,
         {
-          prompt: buildBoundedVerifyFixPrompt(firstFailure.command, firstFailure.output),
+          prompt: buildBoundedVerifyFixPrompt(firstBlamed.command, firstBlamed.output),
           resumeSessionId: result.threadId,
           model: request.model,
           effort: request.effort,
-          alwaysApprove: true,
+          // Mirror the ORIGINAL run's write policy exactly. This used to be
+          // alwaysApprove:true unconditionally with no permissionMode/sandbox
+          // at all, so a run started read-only (permissionMode:"plan",
+          // sandbox:"read-only") got escalated to full write approval on its
+          // very first verify failure - and since isolation only applies to
+          // write runs, that write happened directly in the user's real
+          // working tree, not a worktree, despite the user asking for
+          // read-only. A read-only run with --verify still specified simply
+          // cannot fix anything (sandboxed), so it correctly re-fails and the
+          // run reports completed-unverified instead.
+          alwaysApprove: write,
+          permissionMode: write ? undefined : "plan",
+          sandbox: write ? undefined : "read-only",
           maxTurns,
           cwd: runCwd,
           outputFormat: "streaming-json",
@@ -1008,15 +1080,16 @@ async function executeTaskRun(request) {
         maxDurationSeconds
       );
       result = fixAgent.result;
+      cumulativeUsage = addUsage(cumulativeUsage, fixAgent.result.usage);
       if (fixAgent.timedOut) {
         timedOut = true;
         break;
       }
       if (
         maxCostUsd != null &&
-        result.usage?.costUsd != null &&
-        Number.isFinite(Number(result.usage.costUsd)) &&
-        Number(result.usage.costUsd) > maxCostUsd
+        cumulativeUsage?.costUsd != null &&
+        Number.isFinite(Number(cumulativeUsage.costUsd)) &&
+        Number(cumulativeUsage.costUsd) > maxCostUsd
       ) {
         budgetStopped = "max-cost";
       }
@@ -1078,7 +1151,7 @@ async function executeTaskRun(request) {
   const payload = {
     status: exitStatus,
     threadId: result.threadId,
-    usage: result.usage ?? null,
+    usage: cumulativeUsage ?? null,
     stopReason: timedOut ? "max-duration" : (result.stopReason ?? null),
     rawOutput,
     verified,
@@ -1107,7 +1180,7 @@ async function executeTaskRun(request) {
     worktree,
     grokVersion,
     verify,
-    usage: result.usage ?? null
+    usage: cumulativeUsage ?? null
   };
 }
 
@@ -1388,6 +1461,7 @@ async function handleTask(argv) {
       "max-turns",
       "max-cost"
     ],
+    repeatableOptions: ["verify"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "isolate", "no-isolate"],
     aliasMap: {
       m: "model"

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  classifyVerifyFailure,
   compareFailureSignatures,
   deriveVerifyTimeoutMs,
   normalizeFailureText,
@@ -173,4 +174,96 @@ test("runVerifyCommand actually enforces its timeout on a hung command", () => {
   assert.equal(result.timedOut, true);
   assert.equal(result.ok, false);
   assert.ok(elapsed < 3000, `expected the command to be killed near its budget, took ${elapsed}ms`);
+});
+
+test("compareFailureSignatures catches more raw failures hiding behind an identical id set", () => {
+  // Two genuinely different failures can normalize to the same string (paths
+  // truncated, line numbers stripped). A bare set comparison would call this
+  // "unchanged" even though there are now 2 distinct failure occurrences
+  // where baseline had only 1 - hiding a real regression the agent introduced.
+  const comparison = compareFailureSignatures(["assertionerror"], ["assertionerror"], {
+    currentRawCount: 2,
+    baselineRawCount: 1
+  });
+  assert.equal(comparison.outcome, "more-failures-same-signature");
+});
+
+test("compareFailureSignatures without raw counts still reports unchanged for an identical set", () => {
+  const comparison = compareFailureSignatures(["assertionerror"], ["assertionerror"]);
+  assert.equal(comparison.outcome, "unchanged-from-baseline");
+});
+
+test("summarizeFailures reports both the deduped and raw failure counts", () => {
+  const output = "exit_code: 1\nstderr:\nAssertionError: x\nAssertionError: x\nAssertionError: y";
+  const result = summarizeFailures(output);
+  assert.equal(result.rawCount, 3);
+  assert.ok(result.failureCount <= result.rawCount);
+});
+
+test("classifyVerifyFailure blames a genuine new failure", () => {
+  const result = classifyVerifyFailure(
+    { signature: ["new failure text"], rawCount: 1 },
+    { ok: true, signature: [], rawCount: 0, timedOut: false }
+  );
+  assert.equal(result.blamed, true);
+});
+
+test("classifyVerifyFailure does not blame a failure unchanged from baseline", () => {
+  const result = classifyVerifyFailure(
+    { signature: ["same failure"], rawCount: 1 },
+    { ok: false, signature: ["same failure"], rawCount: 1, timedOut: false }
+  );
+  assert.equal(result.blamed, false);
+  assert.equal(result.reason, "unchanged-from-baseline");
+});
+
+test("classifyVerifyFailure does not blame when the baseline probe itself timed out", () => {
+  // Regression: a hard-capped baseline probe silently produced an empty
+  // signature on timeout, so every real pre-existing failure looked new
+  // once the agent's run finished. Now the timeout is tracked explicitly
+  // and short-circuits to an honest "we don't know" instead.
+  const result = classifyVerifyFailure(
+    { signature: ["some failure"], rawCount: 1 },
+    { ok: false, signature: [], rawCount: 0, timedOut: true }
+  );
+  assert.equal(result.blamed, false);
+  assert.equal(result.reason, "baseline-unknown");
+});
+
+test("classifyVerifyFailure does not blame an already-failing baseline with unextractable output", () => {
+  // Regression: baselineEntry.ok was captured but never read, so a command
+  // whose output never matched a recognisable failure pattern (e.g. a bare
+  // `cargo fmt --check` diff) but was ALREADY red at baseline fell through
+  // to being blamed on the agent by default.
+  const result = classifyVerifyFailure(
+    { signature: [], rawCount: 0 },
+    { ok: false, signature: [], rawCount: 0, timedOut: false }
+  );
+  assert.equal(result.blamed, false);
+  assert.equal(result.reason, "baseline-already-failing");
+});
+
+test("classifyVerifyFailure blames unextractable output when the baseline actually passed", () => {
+  const result = classifyVerifyFailure(
+    { signature: [], rawCount: 0 },
+    { ok: true, signature: [], rawCount: 0, timedOut: false }
+  );
+  assert.equal(result.blamed, true);
+});
+
+test("runVerifyCommand labels an output-buffer overflow distinctly, not as a generic failure", () => {
+  // Regression: exceeding maxBuffer kills the process with no exit code, so
+  // there is no way to know whether the command was about to pass. A bare
+  // "Failed to run command" message sent the agent hunting for a code bug
+  // that never existed - the real cause is output volume.
+  const result = runVerifyCommand(
+    `node -e "for(let i=0;i<200000;i++){console.log('x'.repeat(100))}"`,
+    process.cwd(),
+    { timeoutMs: 15000 }
+  );
+  assert.equal(result.ok, false);
+  assert.equal(result.bufferExceeded, true);
+  assert.equal(result.timedOut, false);
+  assert.match(result.output, /exceeded the .* byte limit/);
+  assert.doesNotMatch(result.output, /^Failed to run command/);
 });

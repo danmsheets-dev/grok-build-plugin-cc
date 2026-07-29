@@ -58,6 +58,21 @@ export function runVerifyCommand(command, cwd, options = {}) {
     };
   }
 
+  if (result.error?.code === "ENOBUFS") {
+    // Node kills the process once its output exceeds maxBuffer, so there is
+    // no exit code to report - the command may well have been about to pass.
+    // Reporting a bare generic failure here sent the agent hunting for a
+    // code bug that does not exist; the real cause is output volume, and the
+    // fix is to make the command quieter, not to "fix" anything in the repo.
+    return {
+      ok: false,
+      exitCode: null,
+      timedOut: false,
+      bufferExceeded: true,
+      output: `command output exceeded the ${MAX_BUFFER} byte limit and was killed before it could finish. This is not a code failure - the command produced too much stdout/stderr to capture. Re-run it with a quieter or more targeted flag (e.g. a specific test file, --silent, or piping through a summary) rather than changing any source file.`
+    };
+  }
+
   if (result.error) {
     return {
       ok: false,
@@ -180,7 +195,14 @@ export function summarizeFailures(output) {
   const signature = [...new Set(ids)].sort();
   return {
     signature,
-    failureCount: signature.length
+    failureCount: signature.length,
+    // Pre-dedup count. Two DIFFERENT failures can normalize to the identical
+    // string after this function's own aggressive stripping (paths cut to
+    // two segments, timings and line numbers removed) - if that string also
+    // happens to match one baseline entry, a bare set comparison reports
+    // "unchanged" even though there are genuinely more distinct failures now
+    // than at baseline. rawCount lets compareFailureSignatures catch that.
+    rawCount: ids.length
   };
 }
 
@@ -197,7 +219,7 @@ export function summarizeFailures(output) {
  *   reason?: string
  * }}
  */
-export function compareFailureSignatures(current, baseline) {
+export function compareFailureSignatures(current, baseline, options = {}) {
   const cur = [
     ...new Set(
       [...(current ?? [])]
@@ -247,6 +269,25 @@ export function compareFailureSignatures(current, baseline) {
     };
   }
 
+  // The deduped id sets match exactly, but more distinct failure lines fired
+  // this time than at baseline: two different failures collapsed onto the
+  // same normalized string as one baseline entry. Reporting "unchanged" here
+  // would hide a real regression the agent introduced.
+  const { currentRawCount, baselineRawCount } = options;
+  if (
+    Number.isFinite(Number(currentRawCount)) &&
+    Number.isFinite(Number(baselineRawCount)) &&
+    Number(currentRawCount) > Number(baselineRawCount)
+  ) {
+    return {
+      outcome: "more-failures-same-signature",
+      newFailures: [],
+      remainingCount,
+      baselineCount: base.length,
+      reason: `${currentRawCount} failure occurrences now vs ${baselineRawCount} at baseline, despite an identical normalized id set`
+    };
+  }
+
   return {
     outcome: "unchanged-from-baseline",
     newFailures: [],
@@ -283,4 +324,43 @@ export function deriveVerifyTimeoutMs(baselineMs, options = {}) {
   }
 
   return Math.min(cap, Math.max(floor, Math.round(baselineMs * multiplier)));
+}
+
+/**
+ * Decide whether one command's post-agent failure is attributable to the
+ * agent, given what the baseline probe saw for that same command.
+ *
+ * Extracted so this can be unit tested directly and applied independently to
+ * EVERY failing --verify command, rather than only the first one a run
+ * happens to iterate — checking just the first command let a genuine
+ * regression in a second command go unnoticed.
+ *
+ * @param {{ signature: string[], rawCount: number }} current
+ * @param {{ ok: boolean, signature: string[], rawCount: number, timedOut: boolean }|undefined} baselineEntry
+ * @returns {{ blamed: boolean, reason: string, comparison?: string }}
+ */
+export function classifyVerifyFailure(current, baselineEntry) {
+  if (baselineEntry?.timedOut) {
+    // The baseline probe itself never finished, so there is no comparable
+    // pre-existing state - reporting a confident regression here would be a
+    // guess dressed up as fact.
+    return { blamed: false, reason: "baseline-unknown" };
+  }
+
+  const comparison = compareFailureSignatures(current.signature, baselineEntry?.signature ?? [], {
+    currentRawCount: current.rawCount,
+    baselineRawCount: baselineEntry?.rawCount
+  });
+
+  if (comparison.outcome === "unchanged-from-baseline") {
+    return { blamed: false, reason: "unchanged-from-baseline", comparison: comparison.outcome };
+  }
+
+  if (comparison.outcome === "incomparable" && baselineEntry?.ok === false) {
+    // Neither run's output matched a recognisable failure pattern, but this
+    // command was ALREADY failing before the agent started.
+    return { blamed: false, reason: "baseline-already-failing", comparison: comparison.outcome };
+  }
+
+  return { blamed: true, reason: comparison.outcome, comparison: comparison.outcome };
 }
