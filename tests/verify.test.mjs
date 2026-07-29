@@ -137,3 +137,25 @@ test("deriveVerifyTimeoutMs returns floor for invalid baselines and scales/clamp
   // very large baseline clamps at cap
   assert.equal(deriveVerifyTimeoutMs(1_000_000), 900_000);
 });
+
+test("runVerifyCommand does not corrupt a command containing double quotes", () => {
+  // Regression: passing the command string as a plain argv element to cmd.exe
+  // /d /s /c let Node apply its own escaping on top of the command's own
+  // quotes, corrupting anything with an embedded double quote. Reproduced
+  // directly before the fix: the process below received a truncated,
+  // syntactically invalid script instead of the real one-liner.
+  const result = runVerifyCommand(`node -e "console.log('hello world')"`, process.cwd(), {
+    timeoutMs: 10000
+  });
+  assert.equal(result.ok, true, `expected success, got: ${result.output}`);
+  assert.match(result.output, /hello world/);
+});
+
+test("runVerifyCommand still reports a real failure inside a quoted command", () => {
+  const result = runVerifyCommand(`node -e "process.exit(1)"`, process.cwd(), {
+    timeoutMs: 10000
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.exitCode, 1);
+  assert.doesNotMatch(result.output, /SyntaxError|Unterminated/);
+});

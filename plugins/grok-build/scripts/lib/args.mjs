@@ -89,21 +89,28 @@ export function parseArgs(argv, config = {}) {
   return { options, positionals, unknown };
 }
 
+const ESCAPABLE_NEXT = /[\s'"\\]/;
+
 export function splitRawArgumentString(raw) {
   const tokens = [];
+  const chars = Array.from(raw);
   let current = "";
   let quote = null;
-  let escaping = false;
 
-  for (const character of raw) {
-    if (escaping) {
-      current += character;
-      escaping = false;
-      continue;
-    }
+  for (let index = 0; index < chars.length; index += 1) {
+    const character = chars[index];
 
-    if (character === "\\") {
-      escaping = true;
+    // Backslash only escapes whitespace, a quote, or another backslash - the
+    // minimal set this parser actually needs (embedding a space in an
+    // unquoted token, or a literal quote/backslash inside one). Treating
+    // EVERY backslash as an escape character, as this used to do
+    // unconditionally, silently deleted every backslash in a Windows path
+    // passed through a delegate prompt or --verify command:
+    // C:\Users\me\file.txt became C:Usersmefile.txt.
+    const next = chars[index + 1];
+    if (character === "\\" && next !== undefined && ESCAPABLE_NEXT.test(next)) {
+      current += next;
+      index += 1;
       continue;
     }
 
@@ -130,10 +137,6 @@ export function splitRawArgumentString(raw) {
     }
 
     current += character;
-  }
-
-  if (escaping) {
-    current += "\\";
   }
 
   if (current) {

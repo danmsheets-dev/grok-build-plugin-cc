@@ -30,14 +30,23 @@ export function runVerifyCommand(command, cwd, options = {}) {
   const run = options.runCommandImpl ?? runCommand;
   const platform = options.platform ?? process.platform;
   const shell = platform === "win32" ? process.env.ComSpec || "cmd.exe" : "/bin/sh";
+
+  // On win32, passing `command` as a plain argv element lets Node apply its own
+  // cmd.exe-aware escaping on top of whatever quotes the command string already
+  // contains, corrupting anything with an embedded double quote (confirmed:
+  // `node -e "console.log('x')"` arrived at node truncated mid-string). The fix
+  // wraps the whole command line in exactly one extra pair of quotes and passes
+  // windowsVerbatimArguments so Node does not re-escape it; cmd.exe's own rule
+  // for `/c "..."` strips only that one outer pair, regardless of quotes inside.
   const shellArgs =
-    platform === "win32" ? ["/d", "/s", "/c", command] : ["-c", command];
+    platform === "win32" ? ["/d", "/s", "/c", `"${command}"`] : ["-c", command];
 
   const result = run(shell, shellArgs, {
     cwd,
     env: options.env,
     timeout: options.timeoutMs,
-    maxBuffer: MAX_BUFFER
+    maxBuffer: MAX_BUFFER,
+    windowsVerbatimArguments: platform === "win32" ? true : undefined
   });
 
   if (result.error?.code === "ETIMEDOUT") {

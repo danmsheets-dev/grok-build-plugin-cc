@@ -24,7 +24,12 @@ export function runCommand(command, args = [], options = {}) {
     input: options.input,
     maxBuffer: options.maxBuffer,
     stdio: options.stdio ?? "pipe",
-    windowsHide: true
+    windowsHide: true,
+    // The resolver may itself require verbatim args (routing a .cmd/.bat
+    // target through cmd.exe with an already-quoted command line); an
+    // explicit option from the caller (verify.mjs's own cmd.exe wrapping)
+    // takes precedence if set.
+    windowsVerbatimArguments: options.windowsVerbatimArguments ?? invocation.windowsVerbatimArguments
   });
 
   const status = result.status == null ? (result.signal ? 1 : null) : result.status;

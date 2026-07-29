@@ -163,3 +163,44 @@ test("runCommand emits no DEP0190 deprecation warning", () => {
   assert.equal(result.status, 0);
   assert.doesNotMatch(result.stderr, /DEP0190/);
 });
+
+test("resolveExecutable prefers a PATHEXT match over a sibling extensionless shim", () => {
+  // Regression: npm-style bin directories (node_modules/.bin/*, npm's global
+  // bin dir) ship an extensionless POSIX shim ALONGSIDE a .cmd wrapper for
+  // the same tool. Checking the bare name first resolved to the POSIX shim,
+  // which Windows CreateProcess cannot execute, producing ENOENT even though
+  // a working .cmd sat right next to it.
+  const dir = makeTempDir();
+  fs.writeFileSync(path.join(dir, "eslint"), "#!/bin/sh\necho posix shim\n", { mode: 0o755 });
+  fs.writeFileSync(path.join(dir, "eslint.cmd"), "@echo off\r\necho windows wrapper\r\n");
+
+  const resolved = resolveExecutable("eslint", { PATH: dir, PATHEXT: ".COM;.EXE;.BAT;.CMD" }, "win32");
+  assert.equal(resolved, path.join(dir, "eslint.cmd"));
+});
+
+test("resolveExecutable still falls back to a bare match when no PATHEXT sibling exists", () => {
+  const dir = makeTempDir();
+  fs.writeFileSync(path.join(dir, "widget"), "#!/usr/bin/env node\n", { mode: 0o755 });
+
+  const resolved = resolveExecutable("widget", { PATH: dir, PATHEXT: ".COM;.EXE;.BAT;.CMD" }, "win32");
+  assert.equal(resolved, path.join(dir, "widget"));
+});
+
+test("runCommand can actually invoke a resolved .cmd file end to end on Windows", () => {
+  if (process.platform !== "win32") {
+    return;
+  }
+  const dir = makeTempDir();
+  fs.writeFileSync(path.join(dir, "argecho.js"), 'console.log("ARGS:" + JSON.stringify(process.argv.slice(2)));\n');
+  fs.writeFileSync(path.join(dir, "argecho.cmd"), '@echo off\r\nnode "%~dp0argecho.js" %*\r\n');
+  fs.writeFileSync(path.join(dir, "argecho"), '#!/bin/sh\nexec node "$(dirname "$0")/argecho.js" "$@"\n', {
+    mode: 0o755
+  });
+
+  const env = { ...process.env, PATH: dir + path.delimiter + process.env.PATH };
+  const args = ["a", "b c", 'has "quotes" inside', "trailing\\"];
+  const result = runCommand("argecho", args, { env });
+
+  assert.equal(result.status, 0, result.error?.message ?? result.stderr);
+  assert.equal(result.stdout.trim(), "ARGS:" + JSON.stringify(args));
+});
