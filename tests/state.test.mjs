@@ -309,10 +309,18 @@ test("withStateLock reclaims a stale lock left by a crashed process", () => {
   // directly, it failed after ~3s and every retry after that failed
   // identically forever, with no way to recover except deleting the file
   // by hand.
+  //
+  // The lock's mtime is backdated here to represent what a REAL crashed
+  // lock looks like: old. A fresh empty lock is a different, narrower case
+  // (see "does NOT reclaim a brand-new, momentarily-empty lock" below) -
+  // treating a momentarily-empty lock as instantly stale is exactly the
+  // race a later fix had to close, so this test must not conflate the two.
   const workspace = makeTempDir();
   fs.mkdirSync(resolveStateDir(workspace), { recursive: true });
   const lockPath = path.join(resolveStateDir(workspace), "state.json.lock");
   fs.writeFileSync(lockPath, "");
+  const oldTime = new Date(Date.now() - 10 * 60 * 1000);
+  fs.utimesSync(lockPath, oldTime, oldTime);
 
   const start = Date.now();
   let ran = false;
@@ -419,4 +427,42 @@ test("saveState survives an unlink failure on a pruned job artifact", () => {
 
   const savedState = JSON.parse(fs.readFileSync(stateFile, "utf8"));
   assert.equal(savedState.jobs.length, 50, "pruning must still complete for every OTHER job");
+});
+
+test("withStateLock does NOT reclaim a brand-new, momentarily-empty lock", () => {
+  // Regression found by a second-round audit of the earlier stale-lock fix:
+  // the lock file is created via openSync(path, "wx") and only THEN has its
+  // {pid, createdAt} payload written by a separate write, leaving an
+  // observable window where the file exists but is empty. The original fix
+  // treated ANY unparseable content as instantly stale regardless of age,
+  // so a contender checking during that window reclaimed a brand-new lock
+  // after ~90ms - confirmed directly - letting two processes into the
+  // critical section simultaneously, exactly the race this lock exists to
+  // prevent. The fix falls back to the lock file's own mtime rather than
+  // assuming "no parseable content" means "dead".
+  const workspace = makeTempDir();
+  fs.mkdirSync(resolveStateDir(workspace), { recursive: true });
+  const lockPath = path.join(resolveStateDir(workspace), "state.json.lock");
+  fs.writeFileSync(lockPath, "");
+
+  assert.throws(
+    () => withStateLock(workspace, () => {}),
+    /Timed out acquiring state lock/,
+    "a fresh empty lock must be respected like real contention, not reclaimed instantly"
+  );
+});
+
+test("withStateLock reclaims empty/unparseable lock content once it is genuinely old", () => {
+  const workspace = makeTempDir();
+  fs.mkdirSync(resolveStateDir(workspace), { recursive: true });
+  const lockPath = path.join(resolveStateDir(workspace), "state.json.lock");
+  fs.writeFileSync(lockPath, "");
+  const oldTime = new Date(Date.now() - 10 * 60 * 1000);
+  fs.utimesSync(lockPath, oldTime, oldTime);
+
+  let ran = false;
+  withStateLock(workspace, () => {
+    ran = true;
+  });
+  assert.equal(ran, true);
 });

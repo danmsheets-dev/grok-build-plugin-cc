@@ -120,8 +120,20 @@ export function splitRawArgumentString(raw) {
     // unconditionally, silently deleted every backslash in a Windows path
     // passed through a delegate prompt or --verify command:
     // C:\Users\me\file.txt became C:Usersmefile.txt.
+    //
+    // Excludes one case: a backslash immediately followed by the CURRENTLY
+    // OPEN quote character. A quoted Windows path ending in a backslash
+    // (--cwd "C:\repo\", the trailing backslash is what Explorer's address
+    // bar always shows) has that backslash-quote pair right where the
+    // string is meant to close. Treating it as an escape instead swallowed
+    // the closing quote, so the parser kept consuming every token after it
+    // - including a following --verify flag - into one corrupted value.
+    // This does mean \" can no longer embed a literal quote of the SAME
+    // type the string is already using; wrap in the OTHER quote character
+    // for that (a single-quoted string can embed a literal " freely).
     const next = chars[index + 1];
-    if (character === "\\" && next !== undefined && ESCAPABLE_NEXT.test(next)) {
+    const escapingOwnClosingQuote = Boolean(quote) && next === quote;
+    if (character === "\\" && next !== undefined && ESCAPABLE_NEXT.test(next) && !escapingOwnClosingQuote) {
       current += next;
       index += 1;
       continue;

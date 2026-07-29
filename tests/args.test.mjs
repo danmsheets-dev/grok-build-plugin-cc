@@ -100,3 +100,25 @@ test("parseArgs keeps a single occurrence of a repeatable option as an array", (
   });
   assert.deepEqual(result.options.verify, ["cargo test"]);
 });
+
+test("splitRawArgumentString correctly closes a quote after a trailing path backslash", () => {
+  // Regression found by a second-round audit of the earlier backslash fix:
+  // a quoted Windows path ending in a backslash (--cwd "C:\repo\", exactly
+  // what Explorer's address bar shows) had its closing quote treated as an
+  // ESCAPED quote instead of the closing delimiter, so the parser kept
+  // consuming everything after it - including a following --verify flag -
+  // into one corrupted token.
+  //
+  // Note: a plain double-quoted JS string is used for the expected path
+  // rather than a template literal, because a template literal ending in a
+  // single trailing backslash escapes its own closing backtick and fails
+  // to parse. "\\" (double backslash) is required for each literal
+  // backslash - a single "\r" here would be a carriage return, not "r".
+  const tokens = splitRawArgumentString('--cwd "C:\\repo\\" --verify "npm test"');
+  assert.deepEqual(tokens, ["--cwd", "C:\\repo\\", "--verify", "npm test"]);
+});
+
+test("splitRawArgumentString closes a quote whose content ends in a backslash with nothing after it", () => {
+  const tokens = splitRawArgumentString('--cwd "C:\\repo\\"');
+  assert.deepEqual(tokens, ["--cwd", "C:\\repo\\"]);
+});

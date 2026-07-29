@@ -102,7 +102,25 @@ function isPidAlive(pid) {
 }
 
 function reclaimLockIfStale(lockPath) {
-  let content;
+  // Confirmed by direct reproduction: a lock file is created via
+  // openSync(path, "wx") and only THEN has its {pid, createdAt} payload
+  // written by a separate write - there is an observable window where the
+  // file exists but is empty. The original version of this function treated
+  // ANY unparseable content as instantly stale regardless of age, so a
+  // contender that happened to check during that window reclaimed a
+  // brand-new lock after ~90ms and entered the critical section alongside
+  // its rightful owner - the exact two-writer race this lock exists to
+  // prevent. The fix: when content cannot establish an age, fall back to the
+  // lock FILE's own mtime (set at creation, available even before any
+  // content is written) rather than assuming zero information means "dead".
+  let stat;
+  try {
+    stat = fs.statSync(lockPath);
+  } catch {
+    return;
+  }
+
+  let content = "";
   try {
     content = fs.readFileSync(lockPath, "utf8");
   } catch {
@@ -113,17 +131,19 @@ function reclaimLockIfStale(lockPath) {
   try {
     holder = JSON.parse(content);
   } catch {
-    // Empty or unparseable lock content (an older format, or a crash mid-write)
-    // carries no way to tell who holds it or when - treat it as stale rather
-    // than blocking forever on data we can never validate.
+    // Empty or unparseable: could be an old-format lock, a crash mid-write,
+    // or - the case that matters - a legitimate acquisition still in
+    // progress. Age is judged by mtime below rather than assumed.
   }
 
   const pid = Number(holder?.pid);
-  const createdAt = Number(holder?.createdAt);
-  const pidLooksDead = !Number.isFinite(pid) || !isPidAlive(pid);
-  const tooOld = !Number.isFinite(createdAt) || Date.now() - createdAt > STALE_LOCK_TTL_MS;
+  const recordedCreatedAt = Number(holder?.createdAt);
+  const referenceTime = Number.isFinite(recordedCreatedAt) ? recordedCreatedAt : stat.mtimeMs;
 
-  if (pidLooksDead || tooOld) {
+  const pidKnownDead = Number.isFinite(pid) && !isPidAlive(pid);
+  const tooOld = Date.now() - referenceTime > STALE_LOCK_TTL_MS;
+
+  if (pidKnownDead || tooOld) {
     try {
       fs.unlinkSync(lockPath);
     } catch {
