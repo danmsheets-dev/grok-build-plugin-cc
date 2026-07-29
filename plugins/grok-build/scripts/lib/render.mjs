@@ -81,8 +81,17 @@ function isStructuredReviewStoredResult(storedJob) {
   );
 }
 
+/**
+ * Prefer the liveness-derived status. enrichJob sets displayStatus to "abandoned"
+ * when a run's tracked processes are gone but its stored status still says running.
+ * Reporting the stored value would repeat the exact failure this was built to fix.
+ */
+function jobDisplayStatus(job) {
+  return job.displayStatus || job.status || "unknown";
+}
+
 function formatJobLine(job) {
-  const parts = [job.id, `${job.status || "unknown"}`];
+  const parts = [job.id, jobDisplayStatus(job)];
   if (job.kindLabel) {
     parts.push(job.kindLabel);
   }
@@ -116,7 +125,7 @@ function appendActiveJobsTable(lines, jobs) {
       actions.push(`/grok-build:stop ${job.id}`);
     }
     lines.push(
-      `| ${escapeMarkdownCell(job.id)} | ${escapeMarkdownCell(job.kindLabel)} | ${escapeMarkdownCell(job.status)} | ${escapeMarkdownCell(job.phase ?? "")} | ${escapeMarkdownCell(job.elapsed ?? "")} | ${escapeMarkdownCell(job.threadId ?? "")} | ${escapeMarkdownCell(job.summary ?? "")} | ${actions.map((action) => `\`${action}\``).join("<br>")} |`
+      `| ${escapeMarkdownCell(job.id)} | ${escapeMarkdownCell(job.kindLabel)} | ${escapeMarkdownCell(jobDisplayStatus(job))} | ${escapeMarkdownCell(job.phase ?? "")} | ${escapeMarkdownCell(job.elapsed ?? "")} | ${escapeMarkdownCell(job.threadId ?? "")} | ${escapeMarkdownCell(job.summary ?? "")} | ${actions.map((action) => `\`${action}\``).join("<br>")} |`
     );
   }
 }
@@ -145,6 +154,48 @@ export function formatUsageLine(usage) {
   return parts.join(" · ");
 }
 
+/**
+ * Sum token and cost usage across jobs that carry a usage object.
+ * @param {Array<{ usage?: object|null }>} jobs
+ * @returns {string|null}
+ */
+export function formatUsageTotals(jobs) {
+  if (!Array.isArray(jobs) || jobs.length === 0) {
+    return null;
+  }
+
+  let runs = 0;
+  let inputTokens = 0;
+  let cachedInputTokens = 0;
+  let outputTokens = 0;
+  let costUsd = 0;
+
+  for (const job of jobs) {
+    const usage = job?.usage;
+    if (!usage || typeof usage !== "object") {
+      continue;
+    }
+    runs += 1;
+    inputTokens += Number(usage.inputTokens ?? 0) || 0;
+    cachedInputTokens += Number(usage.cachedInputTokens ?? 0) || 0;
+    outputTokens += Number(usage.outputTokens ?? 0) || 0;
+    if (usage.costUsd != null && Number.isFinite(Number(usage.costUsd))) {
+      costUsd += Number(usage.costUsd);
+    }
+  }
+
+  if (runs === 0) {
+    return null;
+  }
+
+  const inputPart =
+    cachedInputTokens > 0
+      ? `${formatTokenCount(inputTokens)} in (${formatTokenCount(cachedInputTokens)} cached)`
+      : `${formatTokenCount(inputTokens)} in`;
+
+  return `Session totals: ${runs} runs - ${inputPart} / ${formatTokenCount(outputTokens)} out - $${costUsd.toFixed(4)}`;
+}
+
 function pushJobDetails(lines, job, options = {}) {
   lines.push(`- ${formatJobLine(job)}`);
   if (job.summary) {
@@ -153,8 +204,14 @@ function pushJobDetails(lines, job, options = {}) {
   if (job.phase) {
     lines.push(`  Phase: ${job.phase}`);
   }
+  if (job.abandoned) {
+    lines.push("  Abandoned: tracked processes are gone. Reclaim with `/grok-build:prune --apply`.");
+  }
   if (job.lastEventAge && (job.status === "queued" || job.status === "running")) {
     lines.push(`  Last activity: ${job.lastEventAge}`);
+  }
+  if (job.lastHeartbeatAge && (job.status === "queued" || job.status === "running")) {
+    lines.push(`  Last heartbeat: ${job.lastHeartbeatAge}`);
   }
   const usageLine = formatUsageLine(job.usage);
   if (usageLine) {
@@ -392,6 +449,16 @@ export function renderStatusReport(report) {
     lines.push("");
   } else if (report.running.length === 0 && !report.latestFinished) {
     lines.push("No runs recorded yet.", "");
+  }
+
+  const allJobs = [
+    ...(report.running ?? []),
+    ...(report.latestFinished ? [report.latestFinished] : []),
+    ...(report.recent ?? [])
+  ];
+  const totalsLine = formatUsageTotals(allJobs);
+  if (totalsLine) {
+    lines.push(totalsLine, "");
   }
 
   return `${lines.join("\n").trimEnd()}\n`;

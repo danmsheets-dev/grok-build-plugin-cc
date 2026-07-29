@@ -31,6 +31,7 @@ import {
 import {
   buildSingleJobSnapshot,
   buildStatusSnapshot,
+  classifyJobLiveness,
   filterJobsForSession,
   getSessionRuntimeStatus,
   readStoredJob,
@@ -45,8 +46,10 @@ import { planWorktreeLinks, provisionWorktree } from "./lib/provision.mjs";
 import {
   claimJobTerminal,
   generateJobId,
+  isTerminalJobStatus,
   listJobs,
   patchJobIfActive,
+  resolveStateDir,
   upsertJob,
   writeJobFile
 } from "./lib/state.mjs";
@@ -95,6 +98,8 @@ function printUsage() {
     [
       "Usage:",
       "  node scripts/grok-bridge.mjs check [--json]",
+      "  node scripts/grok-bridge.mjs doctor [--json]",
+      "  node scripts/grok-bridge.mjs prune [--apply] [--json]",
       "  node scripts/grok-bridge.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <low|medium|high>]",
       "  node scripts/grok-bridge.mjs critique [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <low|medium|high>] [focus text]",
       "  node scripts/grok-bridge.mjs run [--background] [--write] [--resume-last|--resume|--fresh] [--model <model>] [--effort <low|medium|high>] [prompt]",
@@ -121,6 +126,118 @@ function resolveVerifyAttempts(raw) {
     return parsed;
   }
   return 2;
+}
+
+function resolveMaxDurationSeconds(raw) {
+  if (raw == null || raw === "") {
+    return null;
+  }
+  const parsed = Number(raw);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    return parsed;
+  }
+  return null;
+}
+
+function resolveMaxTurns(raw) {
+  if (raw == null || raw === "") {
+    return null;
+  }
+  const parsed = Number(raw);
+  if (Number.isInteger(parsed) && parsed >= 1) {
+    return parsed;
+  }
+  // Accept whole numbers that arrive as floats from string parsing (e.g. "3.0").
+  if (Number.isFinite(parsed) && parsed >= 1 && Math.floor(parsed) === parsed) {
+    return parsed;
+  }
+  return null;
+}
+
+function resolveMaxCostUsd(raw) {
+  if (raw == null || raw === "") {
+    return null;
+  }
+  const parsed = Number(raw);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    return parsed;
+  }
+  return null;
+}
+
+/**
+ * Run the headless agent, optionally racing a wall-clock duration budget.
+ * Captures agentPid from onProgress so the watchdog can terminate the tree.
+ */
+async function runHeadlessAgentWithDurationBudget(runCwd, agentOptions, maxDurationSeconds) {
+  let agentPid = null;
+  const originalOnProgress = agentOptions.onProgress;
+  const wrappedOptions = {
+    ...agentOptions,
+    onProgress: (event) => {
+      if (event && typeof event === "object") {
+        const pid = Number(event.agentPid);
+        if (Number.isFinite(pid) && pid > 0) {
+          agentPid = pid;
+        }
+      }
+      originalOnProgress?.(event);
+    }
+  };
+
+  if (maxDurationSeconds == null) {
+    const result = await runHeadlessAgent(runCwd, wrappedOptions);
+    return { result, timedOut: false };
+  }
+
+  const agentPromise = runHeadlessAgent(runCwd, wrappedOptions);
+  let timer = null;
+  const timeoutPromise = new Promise((resolve) => {
+    timer = setTimeout(() => {
+      if (agentPid != null) {
+        terminateProcessTree(agentPid);
+      }
+      resolve({ timedOut: true });
+    }, Math.max(1, Math.round(maxDurationSeconds * 1000)));
+    timer.unref?.();
+  });
+
+  const raced = await Promise.race([
+    agentPromise.then((result) => ({ result, timedOut: false })),
+    timeoutPromise
+  ]);
+
+  if (timer) {
+    clearTimeout(timer);
+  }
+
+  if (raced.timedOut) {
+    let result;
+    try {
+      result = await agentPromise;
+    } catch {
+      result = {
+        status: 1,
+        stdout: "",
+        stderr: "Run exceeded --max-duration.",
+        threadId: null,
+        sessionId: null,
+        agentPid,
+        finalMessage: "",
+        usage: null,
+        stopReason: "max-duration"
+      };
+    }
+    return {
+      result: {
+        ...result,
+        status: 1
+      },
+      timedOut: true
+    };
+  }
+
+  return { result: raced.result, timedOut: false };
 }
 
 function resolveIsolateOption(options, write) {
@@ -264,6 +381,258 @@ async function handleCheck(argv) {
   const cwd = resolveCommandCwd(options);
   const finalReport = await buildCheckReport(cwd, []);
   outputResult(options.json ? finalReport : renderSetupReport(finalReport), options.json);
+}
+
+function renderDoctorReport(report) {
+  const lines = [
+    "# Grok Build Doctor",
+    "",
+    `Status: ${report.ok ? "ok" : "needs-attention"}`,
+    "",
+    "Checks:"
+  ];
+
+  for (const check of report.checks) {
+    const mark = check.ok ? "ok" : "FAIL";
+    lines.push(`- [${mark}] ${check.name}: ${check.detail}`);
+    if (!check.ok && check.fix) {
+      lines.push(`    Fix: ${check.fix}`);
+    }
+  }
+
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+function buildDoctorReport(cwd) {
+  const checks = [];
+
+  checks.push({
+    name: "node",
+    ok: true,
+    detail: process.version,
+    fix: null
+  });
+
+  const grok = getGrokAvailability(cwd);
+  checks.push({
+    name: "grok",
+    ok: Boolean(grok.available),
+    detail: grok.available
+      ? (grok.detail || "available")
+      : (grok.detail || "not available"),
+    fix: grok.available
+      ? null
+      : "Install the Grok CLI and ensure `grok` is on PATH (or set GROK_BINARY)."
+  });
+
+  const auth = getGrokAuthStatus(cwd);
+  checks.push({
+    name: "auth",
+    ok: Boolean(auth.loggedIn),
+    detail: auth.detail || (auth.loggedIn ? "authenticated" : "not authenticated"),
+    fix: auth.loggedIn
+      ? null
+      : "Authenticate the Grok CLI (run `grok` interactively), then verify with `grok models`."
+  });
+
+  const homeSet = Boolean(process.env.HOME || process.env.GROK_HOME);
+  checks.push({
+    name: "HOME/GROK_HOME",
+    ok: homeSet,
+    detail: homeSet
+      ? (process.env.GROK_HOME
+        ? `GROK_HOME=${process.env.GROK_HOME}`
+        : `HOME=${process.env.HOME}`)
+      : "neither HOME nor GROK_HOME is set",
+    fix: homeSet
+      ? null
+      : "Set HOME (on Windows, to %USERPROFILE%) because grok subcommands fail without it."
+  });
+
+  const stateDir = resolveStateDir(cwd);
+  let stateOk = false;
+  let stateDetail = stateDir;
+  try {
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.accessSync(stateDir, fs.constants.W_OK);
+    stateOk = true;
+    stateDetail = `${stateDir} (writable)`;
+  } catch (error) {
+    stateDetail = `${stateDir} (${error instanceof Error ? error.message : String(error)})`;
+  }
+  checks.push({
+    name: "state dir",
+    ok: stateOk,
+    detail: stateDetail,
+    fix: stateOk
+      ? null
+      : "Ensure CLAUDE_PLUGIN_DATA (or the fallback state root) is writable."
+  });
+
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const jobs = listJobs(workspaceRoot);
+  const abandoned = jobs.filter((job) => classifyJobLiveness(job).abandoned);
+  checks.push({
+    name: "abandoned runs",
+    ok: abandoned.length === 0,
+    detail:
+      abandoned.length === 0
+        ? "none"
+        : `${abandoned.length} abandoned (${abandoned.map((job) => job.id).join(", ")})`,
+    fix: abandoned.length === 0 ? null : "Run `node scripts/grok-bridge.mjs prune --apply` to reclaim abandoned runs."
+  });
+
+  // Prefer reading the full job file for worktree when the index is sparse.
+  const staleWithPaths = [];
+  for (const job of jobs) {
+    if (!isTerminalJobStatus(job.status)) {
+      continue;
+    }
+    const stored = readStoredJob(workspaceRoot, job.id) ?? job;
+    if (stored.worktree?.path && fs.existsSync(stored.worktree.path)) {
+      staleWithPaths.push({ ...job, worktree: stored.worktree });
+    }
+  }
+  checks.push({
+    name: "stale worktrees",
+    ok: staleWithPaths.length === 0,
+    detail:
+      staleWithPaths.length === 0
+        ? "none"
+        : `${staleWithPaths.length} worktree(s) still on disk for terminal runs`,
+    fix:
+      staleWithPaths.length === 0
+        ? null
+        : "Run `node scripts/grok-bridge.mjs prune --apply` or `/grok-build:land` to remove finished worktrees."
+  });
+
+  return {
+    ok: checks.every((check) => check.ok),
+    checks
+  };
+}
+
+async function handleDoctor(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json"]
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const report = buildDoctorReport(cwd);
+  outputResult(options.json ? report : renderDoctorReport(report), options.json);
+  if (!report.ok) {
+    process.exitCode = 0;
+  }
+}
+
+function collectPrunePlan(cwd) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const jobs = listJobs(workspaceRoot);
+  /** @type {{ type: string, jobId: string, detail: string, apply: () => void }[]} */
+  const actions = [];
+
+  for (const job of jobs) {
+    if (classifyJobLiveness(job).abandoned) {
+      const jobId = job.id;
+      actions.push({
+        type: "abandon",
+        jobId,
+        detail: `Claim abandoned run ${jobId} as failed (process tree is gone).`,
+        apply: () => {
+          claimJobTerminal(workspaceRoot, jobId, "failed", {
+            errorMessage: "Run abandoned; process tree is gone.",
+            phase: "failed",
+            bridgePid: null,
+            agentPid: null,
+            pid: null
+          });
+        }
+      });
+    }
+  }
+
+  for (const job of jobs) {
+    const stored = readStoredJob(workspaceRoot, job.id) ?? job;
+    if (!isTerminalJobStatus(stored.status ?? job.status)) {
+      continue;
+    }
+    const worktree = stored.worktree;
+    if (!worktree || typeof worktree !== "object" || !worktree.path) {
+      continue;
+    }
+    if (!fs.existsSync(worktree.path)) {
+      continue;
+    }
+    const jobId = job.id;
+    const worktreePath = worktree.path;
+    const branchName = worktree.branch ?? null;
+    actions.push({
+      type: "worktree",
+      jobId,
+      detail: `Remove worktree for terminal run ${jobId} at ${worktreePath}.`,
+      apply: () => {
+        removeWorktree({
+          repoRoot: workspaceRoot,
+          worktreePath,
+          branchName,
+          deleteBranch: Boolean(branchName)
+        });
+      }
+    });
+  }
+
+  return { workspaceRoot, actions };
+}
+
+function renderPruneReport(plan, applied) {
+  const mode = applied ? "applied" : "dry-run";
+  const lines = ["# Grok Build Prune", "", `Mode: ${mode}`, ""];
+
+  if (plan.actions.length === 0) {
+    lines.push("Nothing to prune.");
+    return `${lines.join("\n").trimEnd()}\n`;
+  }
+
+  lines.push(`Items (${plan.actions.length}):`);
+  for (const action of plan.actions) {
+    lines.push(`- [${mode}] ${action.detail}`);
+  }
+  if (!applied) {
+    lines.push("", "Re-run with --apply to perform these actions.");
+  }
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+async function handlePrune(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json", "apply"]
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const apply = Boolean(options.apply);
+  const plan = collectPrunePlan(cwd);
+
+  if (apply) {
+    for (const action of plan.actions) {
+      action.apply();
+    }
+  }
+
+  const payload = {
+    mode: apply ? "apply" : "dry-run",
+    applied: apply,
+    count: plan.actions.length,
+    items: plan.actions.map((action) => ({
+      type: action.type,
+      jobId: action.jobId,
+      detail: action.detail,
+      applied: apply
+    }))
+  };
+
+  outputCommandResult(payload, renderPruneReport(plan, apply), options.json);
 }
 
 function buildCritiquePrompt(context, focusText) {
@@ -497,6 +866,9 @@ async function executeTaskRun(request) {
   const isolate = Boolean(request.isolate);
   const verifyCommands = normalizeVerifyCommands(request.verifyCommands);
   const verifyAttempts = resolveVerifyAttempts(request.verifyAttempts);
+  const maxDurationSeconds = resolveMaxDurationSeconds(request.maxDurationSeconds);
+  const maxTurns = resolveMaxTurns(request.maxTurns);
+  const maxCostUsd = resolveMaxCostUsd(request.maxCostUsd);
 
   const grokVersion = getGrokAvailability(request.cwd).detail ?? null;
 
@@ -525,18 +897,39 @@ async function executeTaskRun(request) {
     }
   }
 
-  let result = await runHeadlessAgent(runCwd, {
-    prompt,
-    resumeSessionId,
-    model: request.model,
-    effort: request.effort,
-    alwaysApprove: write,
-    permissionMode: write ? undefined : "plan",
-    sandbox: write ? undefined : "read-only",
-    outputFormat: "streaming-json",
-    onProgress: request.onProgress,
-    cwd: runCwd
-  });
+  const firstAgent = await runHeadlessAgentWithDurationBudget(
+    runCwd,
+    {
+      prompt,
+      resumeSessionId,
+      model: request.model,
+      effort: request.effort,
+      alwaysApprove: write,
+      permissionMode: write ? undefined : "plan",
+      sandbox: write ? undefined : "read-only",
+      maxTurns,
+      outputFormat: "streaming-json",
+      onProgress: request.onProgress,
+      cwd: runCwd
+    },
+    maxDurationSeconds
+  );
+  let result = firstAgent.result;
+  let timedOut = firstAgent.timedOut;
+
+  // Cost is only known when a turn ends (from the end event's total_cost_usd),
+  // so max-cost is a post-hoc stop — not a pre-emptive cap. The run stops before
+  // the *next* turn / verify re-invoke rather than mid-turn.
+  let budgetStopped = null;
+  if (
+    !timedOut &&
+    maxCostUsd != null &&
+    result.usage?.costUsd != null &&
+    Number.isFinite(Number(result.usage.costUsd)) &&
+    Number(result.usage.costUsd) > maxCostUsd
+  ) {
+    budgetStopped = "max-cost";
+  }
 
   let verified = null;
   let verifyNote = null;
@@ -544,7 +937,7 @@ async function executeTaskRun(request) {
   let verifyResults = [];
   let attempt = 0;
 
-  if (verifyCommands.length > 0) {
+  if (!timedOut && verifyCommands.length > 0) {
     while (attempt <= verifyAttempts) {
       const iterationResults = [];
       let firstFailure = null;
@@ -592,16 +985,41 @@ async function executeTaskRun(request) {
         break;
       }
 
-      result = await runHeadlessAgent(runCwd, {
-        prompt: buildBoundedVerifyFixPrompt(firstFailure.command, firstFailure.output),
-        resumeSessionId: result.threadId,
-        model: request.model,
-        effort: request.effort,
-        alwaysApprove: true,
-        cwd: runCwd,
-        outputFormat: "streaming-json",
-        onProgress: request.onProgress
-      });
+      // Post-hoc cost stop: do not start another model turn once over budget.
+      if (budgetStopped === "max-cost") {
+        verified = false;
+        verifyNote = "stopped by max-cost budget before verify re-invoke";
+        break;
+      }
+
+      const fixAgent = await runHeadlessAgentWithDurationBudget(
+        runCwd,
+        {
+          prompt: buildBoundedVerifyFixPrompt(firstFailure.command, firstFailure.output),
+          resumeSessionId: result.threadId,
+          model: request.model,
+          effort: request.effort,
+          alwaysApprove: true,
+          maxTurns,
+          cwd: runCwd,
+          outputFormat: "streaming-json",
+          onProgress: request.onProgress
+        },
+        maxDurationSeconds
+      );
+      result = fixAgent.result;
+      if (fixAgent.timedOut) {
+        timedOut = true;
+        break;
+      }
+      if (
+        maxCostUsd != null &&
+        result.usage?.costUsd != null &&
+        Number.isFinite(Number(result.usage.costUsd)) &&
+        Number(result.usage.costUsd) > maxCostUsd
+      ) {
+        budgetStopped = "max-cost";
+      }
       attempt += 1;
     }
   }
@@ -621,18 +1039,24 @@ async function executeTaskRun(request) {
   }
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
-  const failureMessage = result.status === 0 ? "" : result.stderr || "";
-  const rendered = renderTaskResult(
-    {
-      rawOutput,
-      failureMessage
-    },
-    {
-      title: taskMetadata.title,
-      jobId: request.jobId ?? null,
-      write
-    }
-  );
+  const failureMessage = timedOut
+    ? `Run timed out after ${maxDurationSeconds}s (--max-duration).`
+    : result.status === 0
+      ? ""
+      : result.stderr || "";
+  const rendered = timedOut
+    ? `${failureMessage}\n${rawOutput ? `\n${rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`}` : ""}`
+    : renderTaskResult(
+        {
+          rawOutput,
+          failureMessage
+        },
+        {
+          title: taskMetadata.title,
+          jobId: request.jobId ?? null,
+          write
+        }
+      );
 
   const verify = {
     commands: verifyCommands,
@@ -641,32 +1065,49 @@ async function executeTaskRun(request) {
     results: verifyResults
   };
 
+  const budget = {
+    maxDurationSeconds,
+    maxTurns,
+    maxCostUsd,
+    timedOut,
+    budgetStopped
+  };
+
+  const exitStatus = timedOut ? 1 : result.status;
+
   const payload = {
-    status: result.status,
+    status: exitStatus,
     threadId: result.threadId,
     usage: result.usage ?? null,
-    stopReason: result.stopReason ?? null,
+    stopReason: timedOut ? "max-duration" : (result.stopReason ?? null),
     rawOutput,
     verified,
     worktree,
     grokVersion,
-    verify
+    verify,
+    budget,
+    timedOut
   };
 
   return {
-    exitStatus: result.status,
+    exitStatus,
+    timedOut,
+    budget,
     threadId: result.threadId,
     turnId: null,
     payload,
     rendered,
-    summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
+    summary: timedOut
+      ? failureMessage
+      : firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
     jobTitle: taskMetadata.title,
     jobClass: "task",
     write,
     verified,
     worktree,
     grokVersion,
-    verify
+    verify,
+    usage: result.usage ?? null
   };
 }
 
@@ -738,7 +1179,10 @@ function buildTaskRequest({
   jobId,
   isolate = false,
   verifyCommands = [],
-  verifyAttempts = 2
+  verifyAttempts = 2,
+  maxDurationSeconds = null,
+  maxTurns = null,
+  maxCostUsd = null
 }) {
   return {
     cwd,
@@ -750,7 +1194,10 @@ function buildTaskRequest({
     jobId,
     isolate,
     verifyCommands,
-    verifyAttempts
+    verifyAttempts,
+    maxDurationSeconds,
+    maxTurns,
+    maxCostUsd
   };
 }
 
@@ -930,7 +1377,17 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file", "verify", "verify-attempts"],
+    valueOptions: [
+      "model",
+      "effort",
+      "cwd",
+      "prompt-file",
+      "verify",
+      "verify-attempts",
+      "max-duration",
+      "max-turns",
+      "max-cost"
+    ],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "isolate", "no-isolate"],
     aliasMap: {
       m: "model"
@@ -952,6 +1409,9 @@ async function handleTask(argv) {
   const isolate = resolveIsolateOption(options, write);
   const verifyCommands = normalizeVerifyCommands(options.verify);
   const verifyAttempts = resolveVerifyAttempts(options["verify-attempts"]);
+  const maxDurationSeconds = resolveMaxDurationSeconds(options["max-duration"]);
+  const maxTurns = resolveMaxTurns(options["max-turns"]);
+  const maxCostUsd = resolveMaxCostUsd(options["max-cost"]);
   const taskMetadata = buildTaskRunMetadata({
     prompt,
     resumeLast
@@ -974,7 +1434,10 @@ async function handleTask(argv) {
         jobId: job.id,
         isolate,
         verifyCommands,
-        verifyAttempts
+        verifyAttempts,
+        maxDurationSeconds,
+        maxTurns,
+        maxCostUsd
       })
     };
     const { payload } = enqueueBackgroundJob(cwd, job, request);
@@ -997,6 +1460,9 @@ async function handleTask(argv) {
         isolate,
         verifyCommands,
         verifyAttempts,
+        maxDurationSeconds,
+        maxTurns,
+        maxCostUsd,
         onProgress: progress
       }),
     { json: options.json }
@@ -1362,6 +1828,12 @@ async function main() {
   switch (subcommand) {
     case "check":
       await handleCheck(argv);
+      break;
+    case "doctor":
+      await handleDoctor(argv);
+      break;
+    case "prune":
+      await handlePrune(argv);
       break;
     case "review":
       await handleReview(argv);

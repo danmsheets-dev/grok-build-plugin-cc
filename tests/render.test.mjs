@@ -58,7 +58,7 @@ test("renderStoredJobResult prefers rendered output for structured review jobs",
   assert.match(output, /Resume in Grok: grok -r thr_123/);
 });
 
-import { formatUsageLine, renderJobStatusReport } from "../plugins/grok-build/scripts/lib/render.mjs";
+import { formatUsageLine, formatUsageTotals, renderJobStatusReport } from "../plugins/grok-build/scripts/lib/render.mjs";
 
 test("formatUsageLine renders tokens, turns and cost", () => {
   assert.equal(
@@ -94,6 +94,36 @@ test("formatUsageLine returns null without usage", () => {
   assert.equal(formatUsageLine(null), null);
 });
 
+test("formatUsageTotals sums usage across jobs", () => {
+  assert.equal(
+    formatUsageTotals([
+      {
+        usage: {
+          inputTokens: 100,
+          cachedInputTokens: 10,
+          outputTokens: 20,
+          costUsd: 0.01
+        }
+      },
+      {
+        usage: {
+          inputTokens: 50,
+          cachedInputTokens: 5,
+          outputTokens: 15,
+          costUsd: 0.005
+        }
+      }
+    ]),
+    "Session totals: 2 runs - 150 in (15 cached) / 35 out - $0.0150"
+  );
+});
+
+test("formatUsageTotals returns null when no job has usage", () => {
+  assert.equal(formatUsageTotals([{ id: "a" }, { id: "b", usage: null }]), null);
+  assert.equal(formatUsageTotals([]), null);
+  assert.equal(formatUsageTotals(null), null);
+});
+
 test("run status shows last activity for an active run", () => {
   const output = renderJobStatusReport({
     id: "run-1",
@@ -104,4 +134,20 @@ test("run status shows last activity for an active run", () => {
     lastEventAge: "8s ago"
   });
   assert.match(output, /Last activity: 8s ago/);
+});
+
+test("an abandoned run is displayed as abandoned, not running", () => {
+  // Regression: enrichJob computed liveness but the renderer read job.status, so
+  // a dead run still displayed as running — the exact failure this was built to fix.
+  const output = renderJobStatusReport({
+    id: "run-dead",
+    status: "running",
+    displayStatus: "abandoned",
+    abandoned: true,
+    kindLabel: "delegate",
+    title: "Grok Build Delegate"
+  });
+  assert.match(output, /abandoned/i);
+  assert.doesNotMatch(output, /run-dead \| running/);
+  assert.match(output, /prune --apply/);
 });

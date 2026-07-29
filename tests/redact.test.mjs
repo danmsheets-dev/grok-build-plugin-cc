@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 import test from "node:test";
 
 import { redactSecrets, redactSecretsDeep } from "../plugins/grok-build/scripts/lib/redact.mjs";
+import { appendLogLine } from "../plugins/grok-build/scripts/lib/tracked-jobs.mjs";
+import { makeTempDir } from "./helpers.mjs";
 
 const xaiSecret = "xai-abcdefghijklmnopqrstuvwxyz123456";
 const nvidiaSecret = "nvapi-abcdefghijklmnopqrstuvwxyz123456";
@@ -104,4 +108,14 @@ test("bare keyword assignments are redacted, not just prefixed ones", () => {
 test("a quote elsewhere on the line does not corrupt the redaction", () => {
   const output = redactSecrets('Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456" trailing');
   assert.match(output, /Bearer \[redacted\]" trailing/);
+});
+
+test("appendLogLine redacts secrets before writing to disk", () => {
+  const dir = makeTempDir();
+  const file = path.join(dir, "run.log");
+  const secret = "xai-abcdefghijklmnopqrstuvwxyz123456";
+  appendLogLine(file, `key is ${secret}`);
+  const written = fs.readFileSync(file, "utf8");
+  assert.ok(written.includes("[redacted]"), `expected redacted marker, got: ${written}`);
+  assert.ok(!written.includes(secret), `raw secret leaked to log: ${written}`);
 });

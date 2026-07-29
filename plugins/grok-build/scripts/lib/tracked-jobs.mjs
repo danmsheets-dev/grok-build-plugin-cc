@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
+import { redactSecrets } from "./redact.mjs";
 import {
   claimJobTerminal,
   isTerminalJobStatus,
@@ -53,14 +54,14 @@ export function appendLogLine(logFile, message) {
   if (!logFile || !normalized) {
     return;
   }
-  fs.appendFileSync(logFile, `[${nowIso()}] ${normalized}\n`, "utf8");
+  fs.appendFileSync(logFile, `[${nowIso()}] ${redactSecrets(normalized)}\n`, "utf8");
 }
 
 export function appendLogBlock(logFile, title, body) {
   if (!logFile || !body) {
     return;
   }
-  fs.appendFileSync(logFile, `\n[${nowIso()}] ${title}\n${String(body).trimEnd()}\n`, "utf8");
+  fs.appendFileSync(logFile, `\n[${nowIso()}] ${title}\n${redactSecrets(String(body).trimEnd())}\n`, "utf8");
 }
 
 export function createJobLogFile(workspaceRoot, jobId, title) {
@@ -270,8 +271,11 @@ export async function runTrackedJob(job, runner, options = {}) {
     const execution = await runner();
     // A run that finished but whose verify never passed is terminal, and is not
     // success. Only an explicitly unverified execution downgrades a zero exit.
-    const completionStatus =
-      execution.exitStatus === 0
+    // timed-out is its own terminal status so duration caps are not reported as
+    // ordinary failures.
+    const completionStatus = execution.timedOut
+      ? "timed-out"
+      : execution.exitStatus === 0
         ? (execution.verified === false ? "completed-unverified" : "completed")
         : "failed";
     const claim = claimJobTerminal(job.workspaceRoot, job.id, completionStatus, {
@@ -283,6 +287,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       grokVersion: execution.grokVersion ?? null,
       verify: execution.verify ?? null,
       worktree: execution.worktree ?? job.worktree ?? null,
+      budget: execution.budget ?? null,
       rendered: execution.rendered,
       bridgePid,
       agentPid: null,

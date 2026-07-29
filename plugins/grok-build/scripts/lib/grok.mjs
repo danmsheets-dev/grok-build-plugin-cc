@@ -193,6 +193,9 @@ function buildHeadlessArgs(prompt, options = {}) {
   } else {
     args.push("--output-format", "streaming-json");
   }
+  if (options.maxTurns != null && Number.isFinite(Number(options.maxTurns)) && Number(options.maxTurns) >= 1) {
+    args.push("--max-turns", String(options.maxTurns));
+  }
   if (options.jsonSchema) {
     const schemaText =
       typeof options.jsonSchema === "string" ? options.jsonSchema : JSON.stringify(options.jsonSchema);
