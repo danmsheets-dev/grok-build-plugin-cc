@@ -1,6 +1,9 @@
+import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
+
+import { resolveExecutable } from "../plugins/grok-build/scripts/lib/which.mjs";
 
 import { buildEnv, installFakeGrok } from "./fake-grok-fixture.mjs";
 import { makeTempDir, run } from "./helpers.mjs";
@@ -237,4 +240,36 @@ test("runHeadlessAgent still returns plain output verbatim when asked", async ()
   assert.equal(result.status, 0);
   assert.equal(result.finalMessage, "Handled the requested task.");
   assert.equal(result.usage, null);
+});
+
+test("no test ever resolves grok to a binary outside its own bin dir", () => {
+  // Guard against the 0.3.0 money leak: runHeadlessAgent spawned `grok` with no
+  // PATH resolution, so Windows CreateProcess skipped the extensionless fake
+  // fixture and ran the real grok.exe — billing the user on every npm test.
+  const dir = makeTempDir();
+  const binDir = path.join(dir, "bin");
+  installFakeGrok(binDir);
+
+  const resolved = resolveExecutable("grok", buildEnv(binDir), "win32");
+  assert.ok(
+    resolved.startsWith(binDir),
+    `grok must resolve inside the test bin dir, got: ${resolved}`
+  );
+});
+
+test("a headless run with the fake on PATH never touches the real CLI", async () => {
+  const dir = makeTempDir();
+  const binDir = path.join(dir, "bin");
+  installFakeGrok(binDir);
+  const logPath = path.join(dir, "invocations.log");
+
+  const result = await runHeadlessAgent(dir, {
+    prompt: "do the task",
+    binary: path.join(binDir, "grok"),
+    env: buildEnv(binDir, { FAKE_GROK_LOG: logPath })
+  });
+
+  assert.equal(result.status, 0);
+  // The fake logs every invocation. If the real CLI had run, this file would be absent.
+  assert.ok(fs.existsSync(logPath), "the fake grok must be the binary that ran");
 });

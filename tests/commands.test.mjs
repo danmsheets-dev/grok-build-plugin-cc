@@ -17,7 +17,10 @@ test("command set is complete and does not expose continue", () => {
     "check.md",
     "critique.md",
     "delegate.md",
+    "doctor.md",
     "import.md",
+    "land.md",
+    "prune.md",
     "review.md",
     "runs.md",
     "show.md",
@@ -155,8 +158,21 @@ test("the delegate runtime skill states the same rule", () => {
 test("the plugin README states the isolation guarantee plainly", () => {
   const readme = fs.readFileSync(path.join(PLUGIN_ROOT, "README.md"), "utf8");
   assert.match(readme, /## What isolation does and does not guarantee/);
-  assert.match(readme, /edits your working tree directly/i);
   assert.match(readme, /GROK_HOME|HOME/, "the HOME requirement must be documented");
+
+  // The section must state the limits, not just the win. These are the four ways
+  // isolation can still surprise someone, and each cost real reasoning to establish.
+  assert.match(readme, /--no-isolate/, "the opt-out must be documented");
+  assert.match(readme, /not a sandbox/i, "must not imply filesystem isolation");
+  assert.match(readme, /linked, not copied/i, "linked dirs write through to the real repo");
+  assert.match(readme, /only copy of unlanded work/i, "prune can destroy unlanded work");
+});
+
+test("the README documents verification honestly", () => {
+  const readme = fs.readFileSync(path.join(PLUGIN_ROOT, "README.md"), "utf8");
+  assert.match(readme, /completed-unverified/, "the unverified terminal status must be stated");
+  assert.match(readme, /by the bridge/i, "must say the bridge runs verify, not the agent");
+  assert.match(readme, /[Pp]ost-hoc/, "--max-cost must be described as post-hoc, not a hard cap");
 });
 
 test("every command file is documented in the plugin README", () => {
