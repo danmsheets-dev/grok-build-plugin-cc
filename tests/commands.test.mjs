@@ -124,11 +124,21 @@ test("plugin surfaces use /grok-build names and grok binary, not codex", () => {
 
 test("runtime skill only forwards run once", () => {
   const runtimeSkill = read("skills/grok-delegate-runtime/SKILL.md");
-  assert.match(runtimeSkill, /grok-bridge\.mjs" run "<raw arguments>"/);
+  assert.match(runtimeSkill, /grok-bridge\.mjs" run --prompt-file/);
   assert.match(runtimeSkill, /Use `run` for every delegate request/i);
   assert.match(runtimeSkill, /run --resume-last/i);
   assert.match(runtimeSkill, /Do not call `check`, `review`, `critique`, `runs`, `show`, or `stop`/);
   assert.match(runtimeSkill, /natural-language task text/);
+  // Shell-injection safety: task text must not be interpolated into a quoted shell string.
+  assert.match(runtimeSkill, /--prompt-file/i);
+  assert.match(runtimeSkill, /Never build the Bash command by directly embedding the task text/i);
+
+  const agent = read("agents/grok-delegate.md");
+  assert.match(agent, /--prompt-file/i);
+  assert.match(agent, /Never interpolate the task text into a hand-built shell string/i);
+
+  const delegate = read("commands/delegate.md");
+  assert.match(delegate, /--prompt-file/i);
 
   const resultHandling = read("skills/grok-run-output/SKILL.md");
   assert.match(resultHandling, /do not turn a failed or incomplete Grok run into a Claude-side implementation attempt/i);

@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { redactSecrets } from "./redact.mjs";
+import { redactSecrets, redactSecretsDeep } from "./redact.mjs";
 import {
   claimJobTerminal,
   isTerminalJobStatus,
@@ -12,6 +12,34 @@ import {
   upsertJob,
   writeJobFile
 } from "./state.mjs";
+
+/**
+ * Redact text-bearing terminal fields before they hit disk or --json stdout.
+ * Structural control fields (ids, status, phase, timestamps, pids, paths) stay
+ * literal; only result/payload/summary/rendered/verify/error text is scrubbed.
+ */
+function redactTerminalClaimPatch(patch = {}) {
+  const next = { ...patch };
+  if (next.result !== undefined) {
+    next.result = redactSecretsDeep(next.result);
+  }
+  if (next.partialResult !== undefined) {
+    next.partialResult = redactSecretsDeep(next.partialResult);
+  }
+  if (next.verify !== undefined) {
+    next.verify = redactSecretsDeep(next.verify);
+  }
+  if (typeof next.summary === "string") {
+    next.summary = redactSecrets(next.summary);
+  }
+  if (typeof next.rendered === "string") {
+    next.rendered = redactSecrets(next.rendered);
+  }
+  if (typeof next.errorMessage === "string") {
+    next.errorMessage = redactSecrets(next.errorMessage);
+  }
+  return next;
+}
 
 export const SESSION_ID_ENV = "GROK_CC_SESSION_ID";
 
@@ -278,64 +306,96 @@ export async function runTrackedJob(job, runner, options = {}) {
       : execution.exitStatus === 0
         ? (execution.verified === false ? "completed-unverified" : "completed")
         : "failed";
-    const claim = claimJobTerminal(job.workspaceRoot, job.id, completionStatus, {
-      threadId: execution.threadId ?? null,
-      turnId: execution.turnId ?? null,
-      summary: execution.summary,
-      result: execution.payload,
-      usage: execution.usage ?? null,
-      grokVersion: execution.grokVersion ?? null,
-      verify: execution.verify ?? null,
-      worktree: execution.worktree ?? job.worktree ?? null,
-      budget: execution.budget ?? null,
-      rendered: execution.rendered,
-      bridgePid,
-      agentPid: null,
-      pid: null,
-      phase: completionStatus === "completed" ? "done" : completionStatus,
-      logFile: options.logFile ?? job.logFile ?? null
-    });
+    // Redact once, centrally, before anything text-bearing reaches disk or the
+    // --json CLI path (which serializes the same payload we return here).
+    const redactedPayload = redactSecretsDeep(execution.payload);
+    const redactedSummary =
+      typeof execution.summary === "string" ? redactSecrets(execution.summary) : execution.summary;
+    const redactedRendered =
+      typeof execution.rendered === "string" ? redactSecrets(execution.rendered) : execution.rendered;
+    const redactedVerify =
+      execution.verify === undefined ? undefined : redactSecretsDeep(execution.verify);
+    const redactedExecution = {
+      ...execution,
+      payload: redactedPayload,
+      summary: redactedSummary,
+      rendered: redactedRendered,
+      ...(redactedVerify !== undefined ? { verify: redactedVerify } : {})
+    };
 
-    if (!claim.claimed && claim.status === "cancelled") {
-      claimJobTerminal(job.workspaceRoot, job.id, "cancelled", {
-        threadId: execution.threadId ?? claim.job?.threadId ?? null,
-        turnId: execution.turnId ?? claim.job?.turnId ?? null,
-        summary: claim.job?.summary ?? execution.summary,
-        result: claim.job?.result ?? execution.payload,
-        rendered: claim.job?.rendered ?? execution.rendered,
-        partialResult: execution.payload,
-        bridgePid: null,
+    const claim = claimJobTerminal(
+      job.workspaceRoot,
+      job.id,
+      completionStatus,
+      redactTerminalClaimPatch({
+        threadId: execution.threadId ?? null,
+        turnId: execution.turnId ?? null,
+        summary: redactedSummary,
+        result: redactedPayload,
+        usage: execution.usage ?? null,
+        grokVersion: execution.grokVersion ?? null,
+        verify: redactedVerify ?? null,
+        worktree: execution.worktree ?? job.worktree ?? null,
+        budget: execution.budget ?? null,
+        rendered: redactedRendered,
+        bridgePid,
         agentPid: null,
         pid: null,
+        phase: completionStatus === "completed" ? "done" : completionStatus,
         logFile: options.logFile ?? job.logFile ?? null
-      });
-      appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output (after cancel)", execution.rendered);
+      })
+    );
+
+    if (!claim.claimed && claim.status === "cancelled") {
+      claimJobTerminal(
+        job.workspaceRoot,
+        job.id,
+        "cancelled",
+        redactTerminalClaimPatch({
+          threadId: execution.threadId ?? claim.job?.threadId ?? null,
+          turnId: execution.turnId ?? claim.job?.turnId ?? null,
+          summary: claim.job?.summary ?? redactedSummary,
+          result: claim.job?.result ?? redactedPayload,
+          rendered: claim.job?.rendered ?? redactedRendered,
+          partialResult: redactedPayload,
+          bridgePid: null,
+          agentPid: null,
+          pid: null,
+          logFile: options.logFile ?? job.logFile ?? null
+        })
+      );
+      appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output (after cancel)", redactedRendered);
       return {
-        ...execution,
+        ...redactedExecution,
         cancelled: true
       };
     }
 
     if (!claim.claimed && claim.reason === "missing") {
-      appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output (run missing)", execution.rendered);
+      appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output (run missing)", redactedRendered);
       return {
-        ...execution,
+        ...redactedExecution,
         pruned: true
       };
     }
 
-    appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
-    return execution;
+    appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", redactedRendered);
+    return redactedExecution;
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    const claim = claimJobTerminal(job.workspaceRoot, job.id, "failed", {
-      errorMessage,
-      bridgePid: null,
-      agentPid: null,
-      pid: null,
-      phase: "failed",
-      logFile: options.logFile ?? job.logFile ?? null
-    });
+    const claim = claimJobTerminal(
+      job.workspaceRoot,
+      job.id,
+      "failed",
+      redactTerminalClaimPatch({
+        errorMessage,
+        bridgePid: null,
+        agentPid: null,
+        pid: null,
+        phase: "failed",
+        logFile: options.logFile ?? job.logFile ?? null
+      })
+    );
 
     if (!claim.claimed && claim.status === "cancelled") {
       throw error;

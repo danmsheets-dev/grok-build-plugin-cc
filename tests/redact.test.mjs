@@ -4,7 +4,16 @@ import path from "node:path";
 import test from "node:test";
 
 import { redactSecrets, redactSecretsDeep } from "../plugins/grok-build/scripts/lib/redact.mjs";
-import { appendLogLine } from "../plugins/grok-build/scripts/lib/tracked-jobs.mjs";
+import {
+  appendLogLine,
+  runTrackedJob
+} from "../plugins/grok-build/scripts/lib/tracked-jobs.mjs";
+import {
+  readJobFile,
+  resolveJobFile,
+  upsertJob,
+  writeJobFile
+} from "../plugins/grok-build/scripts/lib/state.mjs";
 import { makeTempDir } from "./helpers.mjs";
 
 const xaiSecret = "xai-abcdefghijklmnopqrstuvwxyz123456";
@@ -118,4 +127,92 @@ test("appendLogLine redacts secrets before writing to disk", () => {
   const written = fs.readFileSync(file, "utf8");
   assert.ok(written.includes("[redacted]"), `expected redacted marker, got: ${written}`);
   assert.ok(!written.includes(secret), `raw secret leaked to log: ${written}`);
+});
+
+test("JSON-style quoted keys are redacted", () => {
+  const secret = "sk-abcdefghijklmnopqrstuvwxyz123456";
+  const input = `{"apiKey": "${secret}"}`;
+  const output = redactSecrets(input);
+  assert.ok(output.includes("[redacted]"), `expected redacted marker, got: ${output}`);
+  assert.ok(!output.includes(secret), `raw secret leaked: ${output}`);
+  assert.ok(output.includes('"apiKey"'), `key name should survive: ${output}`);
+  assert.ok(output.startsWith("{") && output.endsWith("}"), `JSON braces should survive: ${output}`);
+});
+
+test("JSON quoted keys without sk- prefix are redacted by assignment pattern", () => {
+  const secret = "abcdefghijklmnop";
+  const input = `{"api_key":"${secret}"}`;
+  const output = redactSecrets(input);
+  assert.ok(output.includes("[redacted]"), `expected redacted marker, got: ${output}`);
+  assert.ok(!output.includes(secret), `raw secret leaked: ${output}`);
+  assert.ok(output.includes('"api_key"'), `key name should survive: ${output}`);
+});
+
+test("Python KeyError diagnostics are not corrupted", () => {
+  // Regression: KeyError used to match the assignment pattern because "key" is a
+  // prefix of KeyError, turning KeyError: 'password' into KeyError: '[redacted]'.
+  const cases = [
+    "KeyError: 'password'",
+    'KeyError: "secret_token"',
+    "raise KeyError('password')",
+    'raise KeyError("secret_token")',
+    `Traceback (most recent call last):\n  File "app.py", line 42, in get_user\n    raise KeyError("password")\nKeyError: 'password'`
+  ];
+  for (const input of cases) {
+    const output = redactSecrets(input);
+    assert.strictEqual(output, input, `diagnostic corrupted:\n  in:  ${input}\n  out: ${output}`);
+  }
+});
+
+test("runTrackedJob redacts secrets in result before writing the job file", async () => {
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = makeTempDir();
+  try {
+    const workspace = makeTempDir();
+    const jobId = "job-redact-result";
+    const secret = "xai-abcdefghijklmnopqrstuvwxyz123456";
+    const running = {
+      id: jobId,
+      status: "queued",
+      phase: "queued",
+      title: "Redact result",
+      kind: "run",
+      workspaceRoot: workspace
+    };
+    writeJobFile(workspace, jobId, running);
+    upsertJob(workspace, running);
+
+    const execution = await runTrackedJob(
+      { ...running, workspaceRoot: workspace },
+      async () => ({
+        exitStatus: 0,
+        threadId: "thread-1",
+        turnId: "turn-1",
+        summary: `done with ${secret}`,
+        payload: { status: "completed", rawOutput: `output has ${secret}`, summary: secret },
+        rendered: `rendered ${secret}\n`,
+        verify: { output: `verify saw ${secret}` }
+      }),
+      { startHeartbeatImpl: () => () => {} }
+    );
+
+    assert.ok(!JSON.stringify(execution.payload).includes(secret), "returned payload leaked secret");
+    assert.ok(!String(execution.summary).includes(secret), "returned summary leaked secret");
+    assert.ok(!String(execution.rendered).includes(secret), "returned rendered leaked secret");
+    assert.ok(JSON.stringify(execution.payload).includes("[redacted]"), "returned payload not redacted");
+
+    const stored = readJobFile(resolveJobFile(workspace, jobId));
+    assert.equal(stored.id, jobId, "job id must stay literal");
+    assert.equal(stored.status, "completed", "status must stay literal");
+    assert.equal(stored.threadId, "thread-1", "threadId must stay literal");
+    const disk = JSON.stringify(stored);
+    assert.ok(!disk.includes(secret), `raw secret leaked to job JSON: ${disk}`);
+    assert.ok(disk.includes("[redacted]"), `expected redacted marker on disk: ${disk}`);
+  } finally {
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
 });

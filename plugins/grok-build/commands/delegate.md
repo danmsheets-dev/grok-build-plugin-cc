@@ -40,6 +40,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" run-resume-candidate --json
 Operating rules:
 
 - The subagent is a thin forwarder only. It should use one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" run ...` and return that command's stdout as-is.
+- The subagent must NOT embed the raw task text inside a double-quoted shell string. Task text may contain backticks or `$(...)` (including when quoted from a file, issue, or PR) and would execute if re-parsed by the shell. Prefer writing the task to a temp file and passing `--prompt-file` (the bridge supports this), or piping on stdin. Never hand-build `run "…task…"`.
 - Return the Grok bridge stdout verbatim to the user.
 - Do not paraphrase, summarize, rewrite, or add commentary before or after it.
 - Do not ask the subagent to inspect files, monitor progress, poll `/grok-build:runs`, fetch `/grok-build:show`, call `/grok-build:stop`, summarize output, or do follow-up work of its own.

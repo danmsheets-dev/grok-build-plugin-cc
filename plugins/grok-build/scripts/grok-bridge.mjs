@@ -53,6 +53,7 @@ import {
   upsertJob,
   writeJobFile
 } from "./lib/state.mjs";
+import { redactSecretsDeep } from "./lib/redact.mjs";
 import {
   appendLogLine,
   createJobLogFile,
@@ -254,10 +255,13 @@ function resolveIsolateOption(options, write) {
 }
 
 function buildBoundedVerifyFixPrompt(command, output) {
+  // Verify stdout/stderr can echo real secrets (env dumps, config prints). Scrub
+  // before embedding in the next model prompt so a leaked key is not re-sent.
+  const safeOutput = redactSecretsDeep(output == null ? "" : String(output));
   return (
     `The verify command \`${command}\` failed. Fix the cause, then re-run only that exact command until it passes. ` +
     `Do not investigate unrelated failures, do not run the full test suite, and do not change any test to make it pass.\n\n` +
-    `Output:\n${output}`
+    `Output:\n${safeOutput}`
   );
 }
 

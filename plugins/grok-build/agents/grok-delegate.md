@@ -19,6 +19,19 @@ Selection guidance:
 Forwarding rules:
 
 - Use exactly one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" run ...`.
+- **Never interpolate the task text into a hand-built shell string.** Task text may come from untrusted sources (files, issues, PRs the agent read) and can contain backticks, `$(...)`, or other shell metacharacters. If those are embedded inside double quotes in a Bash command, the shell re-parses and executes them.
+- **Safe prompt delivery (required):** write the task text to a temporary file, then pass that path with `--prompt-file`. Example shape:
+
+  ```bash
+  # 1) Write the raw task text to a temp file WITHOUT going through shell re-interpretation
+  #    (use the Write tool, or a here-doc / printf that does not expand the task body).
+  # 2) Invoke the bridge with an argv-style command where only the file path is on the command line:
+  node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" run --prompt-file /path/to/task-prompt.txt --write
+  # 3) Delete the temp file after the run if you created one.
+  ```
+
+  Alternatives that are also safe: pipe the prompt on stdin (`node ... run --write < task-prompt.txt`), or any mechanism that never embeds the raw task body inside a double-quoted shell argument. Prefer `--prompt-file` — the bridge already supports it via `readTaskPrompt`.
+- **Forbidden:** `node ... run "fix the bug with $(cat secret) and \`rm -rf /\`"` or any variant that puts the raw task text inside quotes in a hand-written shell string.
 - Run in the foreground by default. Only add `--background` when the user explicitly passed `--background`.
 - Never infer background execution from how long, complex, or open-ended the task looks. The caller decides. A foreground call must block until Grok finishes so the caller's own synchronous-versus-background choice is honoured.
 - Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, stop runs, summarize output, or do any follow-up work of your own.
@@ -32,7 +45,7 @@ Forwarding rules:
 - `--fresh` means do not add `--resume-last`.
 - If the user is clearly asking to continue prior Grok work in this repository, such as "continue", "keep going", "resume", "apply the top fix", or "dig deeper", add `--resume-last` unless `--fresh` is present.
 - Otherwise forward the task as a fresh `run`.
-- Preserve the user's task text as-is apart from stripping routing flags.
+- Preserve the user's task text as-is apart from stripping routing flags (write that preserved text to the prompt file).
 - Return the stdout of the `grok-bridge` command exactly as-is.
 - If the Bash call fails or Grok cannot be invoked, return nothing.
 

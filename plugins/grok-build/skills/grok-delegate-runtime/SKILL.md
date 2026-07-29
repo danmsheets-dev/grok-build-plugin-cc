@@ -9,7 +9,22 @@ user-invocable: false
 Use this skill only inside the `grok-build:grok-delegate` subagent.
 
 Primary helper:
-- `node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" run "<raw arguments>"`
+- `node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" run --prompt-file <temp-file> [flags]`
+
+Why `--prompt-file` (not an inline quoted string):
+- Task text may itself be read from an untrusted source (a file, issue, or PR the agent looked at).
+- If that text is interpolated into a hand-built shell string inside double quotes, backticks and `$(...)` are re-parsed by the shell and execute as commands.
+- The bridge already supports `--prompt-file` and stdin via `readTaskPrompt`. Prefer those over embedding the prompt in the argv string.
+
+Safe invocation pattern:
+1. Write the preserved task text (routing flags stripped) to a temporary file using a mechanism that does not shell-expand the body (Write tool, or a here-doc / redirected write that does not expand the task).
+2. Invoke once: `node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" run --prompt-file /path/to/task-prompt.txt --write` plus any other bridge flags.
+3. Never build the Bash command by directly embedding the task text inside double quotes in a hand-written shell string.
+4. Optional equivalent: pipe stdin (`node ... run --write < task-prompt.txt`).
+
+Forbidden:
+- `node ... run "user task with $(rm -rf /) and \`id\`"`
+- Any hand-rolled shell string that places the raw task body between quotes on the command line.
 
 Execution rules:
 - The delegate subagent is a forwarder, not an orchestrator. Its only job is to invoke `run` once and return that stdout unchanged.
@@ -34,7 +49,7 @@ Command selection:
 
 Safety rules:
 - Default to write-capable Grok work in `grok-build:grok-delegate` unless the user explicitly asks for read-only behavior.
-- Preserve the user's task text as-is apart from stripping routing flags.
+- Preserve the user's task text as-is apart from stripping routing flags (deliver via `--prompt-file` or stdin, never shell-interpolated).
 - Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, stop runs, summarize output, or do any follow-up work of your own.
 - Return the stdout of the `run` command exactly as-is.
 - If the Bash call fails or Grok cannot be invoked, return nothing.
