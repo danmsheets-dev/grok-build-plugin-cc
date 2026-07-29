@@ -103,8 +103,58 @@ export function createWorktree({ cwd, runId, baseRef = "HEAD", dataDir, env }) {
  * @param {string} [options.branchName]
  * @param {boolean} [options.deleteBranch]
  */
+/**
+ * Remove every symlink/junction inside a worktree, WITHOUT descending into one.
+ *
+ * Confirmed empirically: `git worktree remove --force` on Windows follows a
+ * junction it encounters while deleting the tree and destroys the CONTENTS of
+ * whatever it points at. lib/provision.mjs links node_modules/.venv/target etc.
+ * straight from the user's real repository, so tearing down a worktree that
+ * still contains those links wiped the real directories in a reproduction
+ * (empty node_modules/ survived; node_modules/pkg/marker.txt inside it did not).
+ *
+ * The only safe order is: unlink every reparse point first, so by the time git
+ * (or the fs.rmSync fallback below) walks the tree, there is nothing left to
+ * follow through. This must run before ANY removal path, not only the fallback.
+ */
+function unlinkReparsePointsSync(root) {
+  let entries;
+  try {
+    entries = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  for (const entry of entries) {
+    const entryPath = path.join(root, entry.name);
+    if (entry.isSymbolicLink()) {
+      // Covers POSIX symlinks and Windows junctions (Node reports junctions as
+      // symbolic links via lstat/Dirent). rmdir removes a Windows junction or a
+      // directory-targeted symlink without touching its target; unlink handles
+      // a file-targeted symlink. Never rmSync/recursive here — that is exactly
+      // the operation this function exists to protect against.
+      try {
+        fs.rmdirSync(entryPath);
+      } catch {
+        try {
+          fs.unlinkSync(entryPath);
+        } catch {
+          // Leaving an un-removable link is safer than risking a recursive
+          // delete following it later; the outer removal may then fail loudly
+          // instead of silently destroying the link target.
+        }
+      }
+      continue;
+    }
+    if (entry.isDirectory()) {
+      unlinkReparsePointsSync(entryPath);
+    }
+  }
+}
+
 export function removeWorktree({ repoRoot, worktreePath, branchName, deleteBranch = true }) {
   if (worktreePath && fs.existsSync(worktreePath)) {
+    unlinkReparsePointsSync(worktreePath);
     const result = git(repoRoot, ["worktree", "remove", "--force", worktreePath]);
     if (result.status !== 0) {
       try {

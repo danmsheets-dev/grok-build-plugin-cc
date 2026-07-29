@@ -191,3 +191,49 @@ test("commitWorktreeChanges excludes build artifacts in a linked worktree", () =
     branchName: created.branchName
   });
 });
+
+test("removing a worktree never destroys a junction/symlink's real target", () => {
+  // Regression for a confirmed data-destroying defect: git worktree remove --force
+  // followed a Windows junction while deleting the worktree tree and wiped the
+  // CONTENTS of the real directory it pointed at (the empty directory itself
+  // survived; the file inside it did not). Reproduced against un-patched code
+  // before this fix. Every real-world isolated run links node_modules/.venv/
+  // target this way, so this is not an edge case — it is the normal path.
+  const cwd = makeTempDir();
+  seedRepo(cwd);
+
+  const realDepDir = path.join(cwd, "node_modules", "pkg");
+  fs.mkdirSync(realDepDir, { recursive: true });
+  const markerFile = path.join(realDepDir, "marker.txt");
+  fs.writeFileSync(markerFile, "REAL DEPENDENCY - MUST SURVIVE\n", "utf8");
+
+  const dataDir = makeTempDir();
+  const created = createWorktree({ cwd, runId: "junction-safety", dataDir });
+
+  const linkedPath = path.join(created.worktreePath, "node_modules");
+  const kind = process.platform === "win32" ? "junction" : "dir";
+  fs.symlinkSync(path.join(cwd, "node_modules"), linkedPath, kind);
+  assert.equal(
+    fs.existsSync(path.join(linkedPath, "pkg", "marker.txt")),
+    true,
+    "the link must actually expose the real file before the real test begins"
+  );
+
+  removeWorktree({
+    repoRoot: created.repoRoot,
+    worktreePath: created.worktreePath,
+    branchName: created.branchName,
+    deleteBranch: true
+  });
+
+  assert.equal(
+    fs.existsSync(markerFile),
+    true,
+    "the real repo's file must survive worktree teardown"
+  );
+  assert.equal(
+    fs.readFileSync(markerFile, "utf8"),
+    "REAL DEPENDENCY - MUST SURVIVE\n",
+    "content must be byte-identical, not merely present"
+  );
+});
