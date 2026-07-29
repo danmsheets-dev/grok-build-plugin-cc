@@ -151,3 +151,22 @@ test("the delegate runtime skill states the same rule", () => {
   assert.match(skill, /only add `--background` when the user explicitly passed/i);
   assert.doesNotMatch(skill, /Prefer bridge `--background` for long work/i);
 });
+
+test("the plugin README states the isolation guarantee plainly", () => {
+  const readme = fs.readFileSync(path.join(PLUGIN_ROOT, "README.md"), "utf8");
+  assert.match(readme, /## What isolation does and does not guarantee/);
+  assert.match(readme, /edits your working tree directly/i);
+  assert.match(readme, /GROK_HOME|HOME/, "the HOME requirement must be documented");
+});
+
+test("every command file is documented in the plugin README", () => {
+  const readme = fs.readFileSync(path.join(PLUGIN_ROOT, "README.md"), "utf8");
+  const commands = fs
+    .readdirSync(path.join(PLUGIN_ROOT, "commands"))
+    .filter((name) => name.endsWith(".md"))
+    .map((name) => path.basename(name, ".md"));
+
+  for (const command of commands) {
+    assert.match(readme, new RegExp(`/grok-build:${command}\\b`), `README is missing /grok-build:${command}`);
+  }
+});

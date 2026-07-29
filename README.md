@@ -2,6 +2,8 @@
 
 Bridge [Grok Build](https://x.ai) into Claude Code for review, critique, delegation, and session import.
 
+Plugin documentation, including the isolation guarantees, lives in [`plugins/grok-build/README.md`](plugins/grok-build/README.md).
+
 This repository is a Claude Code marketplace plugin that shells out to the real `grok` CLI. Run status, results, and stop are owned by the plugin (PID + log files). There is no app-server broker.
 
 ## Requirements
