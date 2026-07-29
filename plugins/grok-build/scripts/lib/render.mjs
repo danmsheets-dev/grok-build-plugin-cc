@@ -121,6 +121,30 @@ function appendActiveJobsTable(lines, jobs) {
   }
 }
 
+function formatTokenCount(value) {
+  return Number(value ?? 0).toLocaleString("en-US");
+}
+
+export function formatUsageLine(usage) {
+  if (!usage || typeof usage !== "object") {
+    return null;
+  }
+  const cached = Number(usage.cachedInputTokens ?? 0);
+  const inputPart = cached > 0
+    ? `${formatTokenCount(usage.inputTokens)} in (${formatTokenCount(cached)} cached)`
+    : `${formatTokenCount(usage.inputTokens)} in`;
+
+  const parts = [`Tokens: ${inputPart} / ${formatTokenCount(usage.outputTokens)} out`];
+  if (Number.isFinite(Number(usage.numTurns)) && Number(usage.numTurns) > 0) {
+    const turns = Number(usage.numTurns);
+    parts.push(`${turns} ${turns === 1 ? "turn" : "turns"}`);
+  }
+  if (usage.costUsd != null && Number.isFinite(Number(usage.costUsd))) {
+    parts.push(`$${Number(usage.costUsd).toFixed(4)}`);
+  }
+  return parts.join(" · ");
+}
+
 function pushJobDetails(lines, job, options = {}) {
   lines.push(`- ${formatJobLine(job)}`);
   if (job.summary) {
@@ -128,6 +152,13 @@ function pushJobDetails(lines, job, options = {}) {
   }
   if (job.phase) {
     lines.push(`  Phase: ${job.phase}`);
+  }
+  if (job.lastEventAge && (job.status === "queued" || job.status === "running")) {
+    lines.push(`  Last activity: ${job.lastEventAge}`);
+  }
+  const usageLine = formatUsageLine(job.usage);
+  if (usageLine) {
+    lines.push(`  ${usageLine}`);
   }
   if (options.showElapsed && job.elapsed) {
     lines.push(`  Elapsed: ${job.elapsed}`);
@@ -424,6 +455,11 @@ export function renderStoredJobResult(job, storedJob) {
 
   if (job.summary) {
     lines.push(`Summary: ${job.summary}`);
+  }
+
+  const storedUsageLine = formatUsageLine(storedJob?.usage ?? job.usage);
+  if (storedUsageLine) {
+    lines.push(storedUsageLine);
   }
 
   if (job.errorMessage) {

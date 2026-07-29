@@ -138,3 +138,37 @@ test("loadState returns default state when the file is missing", () => {
   assert.deepEqual(state.jobs, []);
   assert.deepEqual(state.config, {});
 });
+
+import { enrichJob, formatRelativeAge } from "../plugins/grok-build/scripts/lib/job-control.mjs";
+
+test("formatRelativeAge renders seconds and minutes", () => {
+  const now = Date.parse("2026-07-29T12:00:00.000Z");
+  assert.equal(formatRelativeAge("2026-07-29T11:59:52.000Z", now), "8s ago");
+  assert.equal(formatRelativeAge("2026-07-29T11:56:40.000Z", now), "3m 20s ago");
+  assert.equal(formatRelativeAge(null, now), null);
+  assert.equal(formatRelativeAge("not a date", now), null);
+});
+
+test("enrichJob exposes idleSeconds for an active run", () => {
+  const now = Date.now();
+  const enriched = enrichJob({
+    id: "run-1",
+    status: "running",
+    kind: "task",
+    jobClass: "task",
+    startedAt: new Date(now - 60000).toISOString(),
+    lastEventAt: new Date(now - 5000).toISOString()
+  });
+  assert.ok(enriched.idleSeconds >= 4 && enriched.idleSeconds <= 7, `got ${enriched.idleSeconds}`);
+});
+
+test("enrichJob leaves idleSeconds null for a finished run", () => {
+  const enriched = enrichJob({
+    id: "run-2",
+    status: "completed",
+    kind: "task",
+    jobClass: "task",
+    lastEventAt: new Date().toISOString()
+  });
+  assert.equal(enriched.idleSeconds, null);
+});

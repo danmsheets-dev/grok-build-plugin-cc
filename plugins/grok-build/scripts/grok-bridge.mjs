@@ -469,6 +469,8 @@ async function executeTaskRun(request) {
   const payload = {
     status: result.status,
     threadId: result.threadId,
+    usage: result.usage ?? null,
+    stopReason: result.stopReason ?? null,
     rawOutput
   };
 

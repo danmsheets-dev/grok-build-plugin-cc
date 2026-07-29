@@ -105,6 +105,28 @@ function formatElapsedDuration(startValue, endValue = null) {
   return `${seconds}s`;
 }
 
+export function formatRelativeAge(isoValue, now = Date.now()) {
+  const parsed = Date.parse(isoValue ?? "");
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+  const totalSeconds = Math.max(0, Math.round((now - parsed) / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes > 0 ? `${minutes}m ${seconds}s ago` : `${seconds}s ago`;
+}
+
+function computeIdleSeconds(job, now = Date.now()) {
+  if (job.status !== "queued" && job.status !== "running") {
+    return null;
+  }
+  const parsed = Date.parse(job.lastEventAt ?? "");
+  if (!Number.isFinite(parsed)) {
+    return null;
+  }
+  return Math.max(0, Math.round((now - parsed) / 1000));
+}
+
 function looksLikeVerificationCommand(line) {
   return /\b(test|tests|lint|build|typecheck|type-check|check|verify|validate|pytest|jest|vitest|cargo test|npm test|pnpm test|yarn test|go test|mvn test|gradle test|tsc|eslint|ruff)\b/i.test(
     line
@@ -179,7 +201,9 @@ export function enrichJob(job, options = {}) {
     duration:
       job.status === "completed" || job.status === "failed" || job.status === "cancelled"
         ? formatElapsedDuration(job.startedAt ?? job.createdAt, job.completedAt ?? job.updatedAt)
-        : null
+        : null,
+    idleSeconds: computeIdleSeconds(job),
+    lastEventAge: formatRelativeAge(job.lastEventAt)
   };
 
   return {

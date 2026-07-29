@@ -30,7 +30,8 @@ function normalizeProgressEvent(value) {
       agentPid,
       stderrMessage: value.stderrMessage == null ? null : String(value.stderrMessage).trim(),
       logTitle: typeof value.logTitle === "string" && value.logTitle.trim() ? value.logTitle.trim() : null,
-      logBody: value.logBody == null ? null : String(value.logBody).trimEnd()
+      logBody: value.logBody == null ? null : String(value.logBody).trimEnd(),
+      usage: value.usage && typeof value.usage === "object" ? value.usage : null
     };
   }
 
@@ -42,7 +43,8 @@ function normalizeProgressEvent(value) {
     agentPid: null,
     stderrMessage: String(value ?? "").trim(),
     logTitle: null,
-    logBody: null
+    logBody: null,
+    usage: null
   };
 }
 
@@ -115,10 +117,16 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       changed = true;
     }
 
+    if (normalized.usage) {
+      patch.usage = normalized.usage;
+      changed = true;
+    }
+
     if (!changed) {
       return;
     }
 
+    patch.lastEventAt = nowIso();
     patchJobIfActive(workspaceRoot, jobId, patch);
   };
 }
@@ -235,6 +243,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       turnId: execution.turnId ?? null,
       summary: execution.summary,
       result: execution.payload,
+      usage: execution.usage ?? null,
       rendered: execution.rendered,
       bridgePid,
       agentPid: null,
