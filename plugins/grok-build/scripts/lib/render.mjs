@@ -507,6 +507,14 @@ function buildTaskStatusLines(meta = {}) {
 
   if (meta.worktree?.path) {
     lines.push(`Worktree: ${meta.worktree.path} (branch ${meta.worktree.branch ?? "unknown"})`);
+    if (meta.worktree.commitError) {
+      // The run itself succeeded; only the staging/commit step failed. Say so
+      // explicitly and point at the directory, because the branch does NOT
+      // contain the work and /grok-build:land would therefore land nothing.
+      lines.push(
+        `Worktree: could not commit agent changes (${meta.worktree.commitError}) - work is still on disk at ${meta.worktree.path}`
+      );
+    }
     if (meta.jobId) {
       lines.push(`Review and land with: /grok-build:land ${meta.jobId}`);
     }

@@ -328,6 +328,42 @@ test("renderTaskResult surfaces the worktree and a land hint", () => {
   assert.match(output, /\/grok-build:land run-abc123/);
 });
 
+test("renderTaskResult explains a failed worktree commit and points at the directory", () => {
+  // commitWorktreeChanges used to throw here, and tracked-jobs flattens a
+  // thrown error to an errorMessage - losing rawOutput, threadId, usage and
+  // verify.results for a run that had actually completed. The run now finishes
+  // and says what went wrong, because the branch does NOT contain the work and
+  // /grok-build:land would therefore land nothing.
+  const output = renderTaskResult(
+    { rawOutput: "Did the work." },
+    {
+      title: "Grok Build Delegate",
+      jobId: "run-commitfail",
+      worktree: {
+        path: "/tmp/wt/run-commitfail",
+        branch: "grok-build/run-commitfail",
+        commitError: "git add failed (exit=128): fatal: pathspec magic is not supported by this git"
+      }
+    }
+  );
+  assert.match(output, /could not commit agent changes/);
+  assert.match(output, /pathspec magic is not supported/);
+  assert.match(output, /work is still on disk at \/tmp\/wt\/run-commitfail/);
+  assert.match(output, /Did the work\./, "the completed run's own output must survive");
+});
+
+test("renderTaskResult stays quiet about the commit when there was no commit error", () => {
+  const output = renderTaskResult(
+    { rawOutput: "Did the work." },
+    {
+      title: "Grok Build Delegate",
+      jobId: "run-ok",
+      worktree: { path: "/tmp/wt/run-ok", branch: "grok-build/run-ok", commitError: null }
+    }
+  );
+  assert.doesNotMatch(output, /could not commit/);
+});
+
 test("renderTaskResult surfaces a budget stop", () => {
   const output = renderTaskResult(
     { rawOutput: "Partial work done." },

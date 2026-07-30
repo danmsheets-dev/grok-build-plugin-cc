@@ -4,13 +4,92 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  artifactExcludePathspecs,
   commitWorktreeChanges,
   createWorktree,
   removeWorktree,
   resolveWorktreePath
 } from "../plugins/grok-build/scripts/lib/worktree.mjs";
 import { planWorktreeLinks, provisionWorktree } from "../plugins/grok-build/scripts/lib/provision.mjs";
-import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
+import { initGitRepo, makeTempDir, run, writeExecutable } from "./helpers.mjs";
+
+/** The link kind provisionWorktree would really use on this platform. */
+const LINK_KIND = process.platform === "win32" ? "junction" : "dir";
+
+function committedNames(cwd, ref = "HEAD") {
+  const show = run("git", ["show", "--name-only", "--pretty=format:", ref], { cwd });
+  assert.equal(show.status, 0, show.stderr || show.stdout);
+  return show.stdout
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function writeFileIn(root, relativePath, body) {
+  const target = path.join(root, relativePath);
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.writeFileSync(target, body, "utf8");
+  return target;
+}
+
+/**
+ * A `git` on PATH that forwards to the real git, except that it rejects the
+ * artifact-filtered `git add` outright.
+ *
+ * That branch cannot be provoked with real git — the whole point of the
+ * pathspec form is that modern git accepts it — but it is exactly the branch
+ * that used to fall back to a bare `add -A` and stage the user's real
+ * `.venv`/`.godot` through the provisioned junctions.
+ */
+function installGitShim(binDir) {
+  fs.mkdirSync(binDir, { recursive: true });
+  const scriptPath = path.join(binDir, "git");
+  const source = `#!/usr/bin/env node
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+
+const argv = process.argv.slice(2);
+const shimDir = ${JSON.stringify(binDir)};
+
+if (argv[0] === "add" && argv.some((arg) => arg.startsWith(":(exclude"))) {
+  process.stderr.write("fatal: pathspec magic is not supported by this git\\n");
+  process.exit(128);
+}
+
+// Everything else is the real git, found by dropping this shim from PATH.
+// Rebuilt key by key rather than spread: on Windows the real key is "Path",
+// so a spread plus a "PATH" override would hand the child BOTH.
+const env = {};
+for (const [key, value] of Object.entries(process.env)) {
+  if (key.toUpperCase() !== "PATH") {
+    env[key] = value;
+  }
+}
+env.PATH = String(process.env.PATH ?? "")
+  .split(path.delimiter)
+  .filter((entry) => entry && path.resolve(entry) !== path.resolve(shimDir))
+  .join(path.delimiter);
+
+const result = spawnSync("git", argv, { env, stdio: "inherit", windowsHide: true });
+process.exit(result.status ?? 1);
+`;
+  writeExecutable(scriptPath, source);
+  return scriptPath;
+}
+
+function withPathPrefix(binDir, fn) {
+  const previous = process.env.PATH;
+  process.env.PATH = `${binDir}${path.delimiter}${previous ?? ""}`;
+  try {
+    return fn();
+  } finally {
+    if (previous == null) {
+      delete process.env.PATH;
+    } else {
+      process.env.PATH = previous;
+    }
+  }
+}
 
 function seedRepo(cwd) {
   initGitRepo(cwd);
@@ -316,4 +395,276 @@ test("a Godot import cache is linked in, excluded from commits, and survives tea
   });
 
   assert.equal(fs.existsSync(markerFile), true, "the real import cache must survive worktree teardown");
+});
+
+test("artifactExcludePathspecs emits both the bare and the recursive form for a directory", () => {
+  const specs = artifactExcludePathspecs();
+
+  // The recursive form alone requires a path component AFTER the directory
+  // name, so it cannot match an index entry whose path is exactly ".godot" -
+  // which is what git records on POSIX, where the provisioned cache is a
+  // symlink blob rather than a junction.
+  assert.ok(specs.includes(":(exclude,glob)**/.godot"));
+  assert.ok(specs.includes(":(exclude,glob)**/.godot/**"));
+  assert.ok(specs.includes(":(exclude,glob)**/.import"));
+  assert.ok(specs.includes(":(exclude,glob)**/.import/**"));
+
+  // A file pattern is not a directory and must not sprout a phantom subtree.
+  assert.deepEqual(
+    specs.filter((spec) => spec.includes("tsbuildinfo")),
+    [":(exclude,glob)**/*.tsbuildinfo"]
+  );
+
+  // Locked in both directions: Godot's per-asset sidecars are SOURCE. Widening
+  // ".import/" to "*.import" or adding "*.uid" silently breaks every uid://
+  // reference in every .tscn/.tres in the project.
+  assert.ok(
+    specs.every((spec) => !spec.includes("*.import") && !spec.includes("*.uid")),
+    "sidecar globs must never appear in the exclude list"
+  );
+
+  // Blender save backups and crashed-save leftovers, but never *.blend itself.
+  assert.ok(specs.includes(":(exclude,glob)**/*.blend[0-9]"));
+  assert.ok(specs.includes(":(exclude,glob)**/*.blend[0-9][0-9]"));
+  assert.ok(specs.includes(":(exclude,glob)**/*.blend@"));
+  assert.ok(
+    specs.every((spec) => spec !== ":(exclude,glob)**/*.blend"),
+    "the scene file is the source of a Blender project"
+  );
+
+  // Machine-local credentials, and Godot 3's C# output directory.
+  assert.ok(specs.includes(":(exclude,glob)**/export_credentials.cfg"));
+  assert.ok(specs.includes(":(exclude,glob)**/.mono"));
+  assert.ok(specs.includes(":(exclude,glob)**/.mono/**"));
+  assert.ok(
+    specs.every((spec) => !spec.includes("export_presets.cfg")),
+    "export_presets.cfg is ordinary tracked project source"
+  );
+});
+
+test("a provisioned .godot link is never staged, as a directory or as a symlink blob", () => {
+  // Precondition that makes this guard non-vacuous: .godot is neither tracked
+  // nor gitignored in the fixture repo. Do NOT "simplify" this by adding a
+  // .gitignore - git would then skip the path for reasons that have nothing to
+  // do with the pathspec list under test, and the guard would pass forever.
+  //
+  // On win32 the link is a junction and git sees a directory, so the recursive
+  // exclude was enough. On POSIX provisionWorktree calls symlinkSync(from, to,
+  // "dir") and git stages a mode-120000 blob at path ".godot" whose CONTENT is
+  // the absolute path of the user's real cache - which land then squash-merges
+  // into their repository.
+  const cwd = makeTempDir("grok-wt-linkspec-");
+  const dataDir = makeTempDir("grok-wt-linkspec-data-");
+  seedRepo(cwd);
+
+  fs.mkdirSync(path.join(cwd, ".godot", "imported"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, ".godot", "imported", "blob.ctex"), "cache\n", "utf8");
+
+  const created = createWorktree({ cwd, runId: "linkspec-1", dataDir });
+  fs.symlinkSync(path.join(cwd, ".godot"), path.join(created.worktreePath, ".godot"), LINK_KIND);
+  fs.writeFileSync(path.join(created.worktreePath, "src.txt"), "fix\n", "utf8");
+
+  const committed = commitWorktreeChanges(created.worktreePath, "linked cache nearby");
+  assert.equal(committed.committed, true);
+  assert.equal(committed.error, undefined);
+
+  const names = committedNames(created.worktreePath);
+  assert.ok(names.includes("src.txt"));
+  assert.ok(
+    !names.some((name) => name === ".godot" || name.startsWith(".godot/")),
+    `nothing named .godot may be committed, got: ${names.join(", ")}`
+  );
+
+  removeWorktree({
+    repoRoot: created.repoRoot,
+    worktreePath: created.worktreePath,
+    branchName: created.branchName
+  });
+});
+
+test("Godot sidecars are committed as source while the import caches are not", () => {
+  const cwd = makeTempDir("grok-wt-sidecar-");
+  const dataDir = makeTempDir("grok-wt-sidecar-data-");
+  seedRepo(cwd);
+
+  const created = createWorktree({ cwd, runId: "sidecar-1", dataDir });
+  const wt = created.worktreePath;
+
+  writeFileIn(wt, "assets/icon.png", "PNG\n");
+  writeFileIn(wt, "assets/icon.png.import", '[remap]\nuid="uid://abc123"\n');
+  writeFileIn(wt, "scripts/player.gd", "extends Node\n");
+  writeFileIn(wt, "scripts/player.gd.uid", "uid://def456\n");
+  writeFileIn(wt, ".import/cache/blob.md5", "deadbeef\n");
+  writeFileIn(wt, ".godot/imported/blob.ctex", "cache\n");
+
+  const committed = commitWorktreeChanges(wt, "godot sidecar matrix");
+  assert.equal(committed.committed, true);
+
+  const names = committedNames(wt);
+  // The sidecars carry the uid:// every ext_resource in the project resolves
+  // through; Godot 4.4 regenerates a missing .uid with a NEW random uid, so
+  // losing them is not self-healing.
+  assert.ok(names.includes("assets/icon.png.import"), names.join(", "));
+  assert.ok(names.includes("scripts/player.gd.uid"), names.join(", "));
+  assert.ok(names.includes("assets/icon.png"));
+  assert.ok(names.includes("scripts/player.gd"));
+  assert.ok(!names.some((name) => name.startsWith(".import/")), names.join(", "));
+  assert.ok(!names.some((name) => name.startsWith(".godot/")), names.join(", "));
+
+  removeWorktree({
+    repoRoot: created.repoRoot,
+    worktreePath: created.worktreePath,
+    branchName: created.branchName
+  });
+});
+
+test("Blender save backups are excluded but the .blend scene itself is committed", () => {
+  const cwd = makeTempDir("grok-wt-blend-");
+  const dataDir = makeTempDir("grok-wt-blend-data-");
+  seedRepo(cwd);
+
+  const created = createWorktree({ cwd, runId: "blend-1", dataDir });
+  const wt = created.worktreePath;
+
+  writeFileIn(wt, "scene.blend", "BLENDER\n");
+  writeFileIn(wt, "scene.blend1", "prev\n");
+  writeFileIn(wt, "scene.blend2", "prev-prev\n");
+  // Save Versions goes to 32, so a two-digit backup is a normal state.
+  writeFileIn(wt, "scene.blend17", "older\n");
+  writeFileIn(wt, "addon.py", "import bpy\n");
+
+  const committed = commitWorktreeChanges(wt, "blender backups nearby");
+  assert.equal(committed.committed, true);
+
+  const names = committedNames(wt);
+  assert.ok(names.includes("addon.py"));
+  assert.ok(names.includes("scene.blend"), "the scene file is source, not an artifact");
+  assert.ok(
+    names.every((name) => !/\.blend\d/.test(name)),
+    `no numbered backup may be committed, got: ${names.join(", ")}`
+  );
+
+  removeWorktree({
+    repoRoot: created.repoRoot,
+    worktreePath: created.worktreePath,
+    branchName: created.branchName
+  });
+});
+
+test("machine-local Godot credentials never reach a commit", () => {
+  const cwd = makeTempDir("grok-wt-creds-");
+  const dataDir = makeTempDir("grok-wt-creds-data-");
+  seedRepo(cwd);
+
+  const created = createWorktree({ cwd, runId: "creds-1", dataDir });
+  const wt = created.worktreePath;
+
+  // Godot 4.2+ moved keystore passwords and notarization credentials out of
+  // export_presets.cfg into this machine-local sibling; a headless
+  // --export-release run can generate one inside the worktree.
+  writeFileIn(wt, "export_credentials.cfg", "[preset.0]\nkeystore/release_password=\"hunter2\"\n");
+  writeFileIn(wt, ".mono/metadata.cfg", "mono build output\n");
+  writeFileIn(wt, "scenes/main.tscn", "[gd_scene]\n");
+
+  const committed = commitWorktreeChanges(wt, "credentials nearby");
+  assert.equal(committed.committed, true);
+
+  const names = committedNames(wt);
+  assert.ok(names.includes("scenes/main.tscn"));
+  assert.ok(!names.includes("export_credentials.cfg"), names.join(", "));
+  assert.ok(!names.some((name) => name.startsWith(".mono/")), names.join(", "));
+
+  removeWorktree({
+    repoRoot: created.repoRoot,
+    worktreePath: created.worktreePath,
+    branchName: created.branchName
+  });
+});
+
+test("provisioned links are excluded by observation, not by name", () => {
+  // .venv, venv and vendor are linked into every worktree by provision.mjs but
+  // are deliberately absent from GENERATED_ARTIFACT_PATTERNS (Go projects
+  // commit vendor/ on purpose). Without the symlink-derived excludes, the
+  // pathspec add walked straight through the junction and staged the user's
+  // entire real .venv on every isolated Python run.
+  const cwd = makeTempDir("grok-wt-linkobs-");
+  const dataDir = makeTempDir("grok-wt-linkobs-data-");
+  seedRepo(cwd);
+
+  fs.mkdirSync(path.join(cwd, ".venv", "Lib"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, ".venv", "Lib", "marker.txt"), "REAL VENV\n", "utf8");
+
+  const created = createWorktree({ cwd, runId: "linkobs-1", dataDir });
+  fs.symlinkSync(path.join(cwd, ".venv"), path.join(created.worktreePath, ".venv"), LINK_KIND);
+  assert.equal(
+    fs.existsSync(path.join(created.worktreePath, ".venv", "Lib", "marker.txt")),
+    true,
+    "the link must actually expose the real tree before the real test begins"
+  );
+  fs.writeFileSync(path.join(created.worktreePath, "src.txt"), "fix\n", "utf8");
+
+  const committed = commitWorktreeChanges(created.worktreePath, "linked venv nearby");
+  assert.equal(committed.committed, true);
+
+  const names = committedNames(created.worktreePath);
+  assert.ok(names.includes("src.txt"));
+  assert.ok(
+    !names.some((name) => name === ".venv" || name.startsWith(".venv/")),
+    `nothing from the linked venv may be committed, got: ${names.join(", ")}`
+  );
+
+  removeWorktree({
+    repoRoot: created.repoRoot,
+    worktreePath: created.worktreePath,
+    branchName: created.branchName
+  });
+});
+
+test("a rejected artifact-filtered add reports an error instead of staging everything", () => {
+  // The old fallback was an unguarded `git add -A`, which stages precisely the
+  // caches and linked-in real directories the pathspec list exists to keep
+  // out - and land then squash-merges them into the user's repository. There
+  // is no older-git retry available either: `:!` is just shorthand for
+  // `:(exclude)` and needs the same pathspec magic.
+  const cwd = makeTempDir("grok-wt-addfail-");
+  const dataDir = makeTempDir("grok-wt-addfail-data-");
+  const binDir = makeTempDir("grok-wt-addfail-bin-");
+  seedRepo(cwd);
+
+  fs.mkdirSync(path.join(cwd, ".godot", "imported"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, ".godot", "imported", "blob.ctex"), "cache\n", "utf8");
+  fs.mkdirSync(path.join(cwd, ".venv", "Lib"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, ".venv", "Lib", "marker.txt"), "REAL VENV\n", "utf8");
+
+  const created = createWorktree({ cwd, runId: "addfail-1", dataDir });
+  fs.symlinkSync(path.join(cwd, ".godot"), path.join(created.worktreePath, ".godot"), LINK_KIND);
+  fs.symlinkSync(path.join(cwd, ".venv"), path.join(created.worktreePath, ".venv"), LINK_KIND);
+  fs.writeFileSync(path.join(created.worktreePath, "src.txt"), "fix\n", "utf8");
+
+  const headBefore = run("git", ["rev-parse", "HEAD"], { cwd: created.worktreePath }).stdout.trim();
+
+  installGitShim(binDir);
+  let result;
+  withPathPrefix(binDir, () => {
+    assert.doesNotThrow(() => {
+      result = commitWorktreeChanges(created.worktreePath, "add is going to fail");
+    }, "a failed commit must never discard an otherwise complete run");
+  });
+
+  assert.equal(result.committed, false);
+  assert.equal(typeof result.error, "string");
+  assert.match(result.error, /git add failed/);
+  assert.equal(result.sha, headBefore, "HEAD must not have moved");
+
+  // Nothing anywhere in the branch's history mentions the linked directories.
+  const log = run("git", ["log", "--name-only", "--pretty=format:"], { cwd: created.worktreePath });
+  assert.equal(log.status, 0, log.stderr);
+  assert.doesNotMatch(log.stdout, /\.godot/);
+  assert.doesNotMatch(log.stdout, /\.venv/);
+
+  removeWorktree({
+    repoRoot: created.repoRoot,
+    worktreePath: created.worktreePath,
+    branchName: created.branchName
+  });
 });

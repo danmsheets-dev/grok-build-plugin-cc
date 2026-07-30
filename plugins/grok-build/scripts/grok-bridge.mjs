@@ -88,6 +88,7 @@ import {
 } from "./lib/verify.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import {
+  artifactExcludePathspecs,
   commitWorktreeChanges,
   createWorktree,
   removeWorktree
@@ -1803,7 +1804,12 @@ async function executeTaskRun(request) {
       path: created.worktreePath,
       branch: created.branchName,
       baseSha: created.baseSha,
-      sha: committed.sha
+      sha: committed.sha,
+      // commitWorktreeChanges no longer throws on a git-level failure, because
+      // throwing here discarded an otherwise complete run: tracked-jobs flattens
+      // a thrown error to an errorMessage, losing rawOutput/threadId/usage/
+      // verify.results. Carry the reason instead and let the run finish.
+      commitError: committed.error ?? null
     };
   }
 
@@ -2400,6 +2406,26 @@ function porcelainDirtyPaths(statusOutput) {
 }
 
 /**
+ * Which dirty paths the artifact-filtered dirty gate chose to overlook.
+ *
+ * Reported so a land that proceeds over a visibly dirty `git status` says why,
+ * rather than looking like the gate silently stopped working. Costs one extra
+ * git call, so callers only reach it once the filtered status came back clean.
+ *
+ * @param {string} repoRoot
+ * @param {string[]} filteredDirtyFiles - paths the filtered status still flagged
+ * @returns {string[]}
+ */
+function describeIgnoredDirtyArtifacts(repoRoot, filteredDirtyFiles) {
+  const unfiltered = git(repoRoot, ["status", "--porcelain"]);
+  if (unfiltered.status !== 0) {
+    return [];
+  }
+  const kept = new Set(filteredDirtyFiles);
+  return porcelainDirtyPaths(unfiltered.stdout).filter((entry) => !kept.has(entry));
+}
+
+/**
  * Clear a job's worktree field after it has been successfully landed or
  * discarded. Reuses the existing "no worktree to land" guard at the top of
  * handleLand: without this, a second `land` call against the same job id
@@ -2491,7 +2517,17 @@ async function handleLand(argv) {
     return;
   }
 
-  const dirty = git(repoRoot, ["status", "--porcelain"]);
+  // The dirty gate has to consult the same artifact list as the commit path.
+  // A Godot repo that does not gitignore `.godot/` is permanently `?? .godot/`
+  // — and this plugin's own provisioning junction is one of the reasons it
+  // gets there — so a bare `git status --porcelain` made land impossible
+  // forever in the plugin's primary ecosystem.
+  let dirty = git(repoRoot, ["status", "--porcelain", "--", ".", ...artifactExcludePathspecs()]);
+  if (dirty.status !== 0) {
+    // Mirror the worktree.mjs fallback: an ancient git that rejects pathspec
+    // magic should degrade to the old behaviour, not hard-fail land.
+    dirty = git(repoRoot, ["status", "--porcelain"]);
+  }
   if (dirty.status !== 0) {
     throw new Error(
       `Unable to inspect working tree before land: ${(dirty.stderr || dirty.stdout || "").trim()}`
@@ -2504,6 +2540,10 @@ async function handleLand(argv) {
       `Refusing to land into a dirty working tree. Commit or stash first. Dirty files: ${named}`
     );
   }
+
+  // Only worth a second git call once the filtered result came back clean:
+  // this is the line that tells the user land proceeded despite visible dirt.
+  const ignoredDirtyArtifacts = describeIgnoredDirtyArtifacts(repoRoot, dirtyFiles);
 
   gitChecked(repoRoot, ["merge", "--squash", branchName]);
 
@@ -2520,10 +2560,14 @@ async function handleLand(argv) {
     jobId: job.id,
     action: "apply",
     worktree,
-    diffStat
+    diffStat,
+    ignoredDirtyArtifacts
   };
   const text =
     (diffStat ? `${diffStat}\n\n` : "") +
+    (ignoredDirtyArtifacts.length > 0
+      ? `Ignored ${ignoredDirtyArtifacts.length} dirty generated artifact path(s) in the dirty-tree check: ${ignoredDirtyArtifacts.slice(0, 5).join(", ")}\n\n`
+      : "") +
     `Landed ${job.id} onto ${currentBranch}. Changes are staged; review with git diff --cached and commit when ready.\n`;
   outputCommandResult(payload, text, options.json);
 }

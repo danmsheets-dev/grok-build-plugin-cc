@@ -353,6 +353,114 @@ test("land --preview errors on a stale branch ref instead of silently claiming n
   }
 });
 
+test("an untracked Godot import cache does not block land", () => {
+  // A Godot repo that does not gitignore .godot/ is permanently `?? .godot/`,
+  // and this plugin's own provisioning junction is one of the reasons it gets
+  // there - so a bare `git status --porcelain` gate made land impossible
+  // forever in the plugin's primary ecosystem.
+  const repo = makeTempDir("grok-land-artifact-");
+  const binDir = makeTempDir("grok-land-artifact-bin-");
+  const pluginDataDir = makeTempDir("grok-land-artifact-data-");
+  installFakeGrok(binDir);
+  seedRepo(repo);
+
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  try {
+    const jobId = generateJobId("run");
+    const created = createWorktree({ cwd: repo, runId: jobId, dataDir: pluginDataDir });
+    fs.writeFileSync(path.join(created.worktreePath, "landed.txt"), "landed body\n");
+    run("git", ["add", "landed.txt"], { cwd: created.worktreePath });
+    run("git", ["commit", "-m", "agent change"], { cwd: created.worktreePath });
+
+    seedFinishedJob(repo, pluginDataDir, {
+      id: jobId,
+      worktree: {
+        path: created.worktreePath,
+        branch: created.branchName,
+        baseSha: created.baseSha
+      }
+    });
+
+    // Neither tracked nor gitignored - the state a real Godot checkout is in.
+    fs.mkdirSync(path.join(repo, ".godot", "imported"), { recursive: true });
+    fs.writeFileSync(path.join(repo, ".godot", "imported", "x.ctex"), "cache\n");
+    const bareStatus = run("git", ["status", "--porcelain"], { cwd: repo });
+    assert.match(bareStatus.stdout, /\.godot/, "the fixture must actually look dirty to plain git");
+
+    const result = run("node", [SCRIPT, "land", jobId, "--json"], {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir)
+    });
+
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const payload = JSON.parse(result.stdout);
+    assert.equal(payload.action, "apply");
+    assert.ok(
+      payload.ignoredDirtyArtifacts.some((entry) => entry.includes(".godot")),
+      `the overlooked artifact must be reported, got: ${JSON.stringify(payload.ignoredDirtyArtifacts)}`
+    );
+
+    const staged = run("git", ["diff", "--cached", "--name-only"], { cwd: repo });
+    assert.match(staged.stdout, /landed\.txt/);
+  } finally {
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
+});
+
+test("real untracked source still blocks land after the artifact filter", () => {
+  // The discriminator for the test above: the filter must narrow the gate to
+  // generated artifacts, not disable it.
+  const repo = makeTempDir("grok-land-realdirt-");
+  const binDir = makeTempDir("grok-land-realdirt-bin-");
+  const pluginDataDir = makeTempDir("grok-land-realdirt-data-");
+  installFakeGrok(binDir);
+  seedRepo(repo);
+
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  try {
+    const jobId = generateJobId("run");
+    const created = createWorktree({ cwd: repo, runId: jobId, dataDir: pluginDataDir });
+    fs.writeFileSync(path.join(created.worktreePath, "landed.txt"), "landed body\n");
+    run("git", ["add", "landed.txt"], { cwd: created.worktreePath });
+    run("git", ["commit", "-m", "agent change"], { cwd: created.worktreePath });
+
+    seedFinishedJob(repo, pluginDataDir, {
+      id: jobId,
+      worktree: {
+        path: created.worktreePath,
+        branch: created.branchName,
+        baseSha: created.baseSha
+      }
+    });
+
+    fs.mkdirSync(path.join(repo, "src"), { recursive: true });
+    fs.writeFileSync(path.join(repo, "src", "real_change.gd"), "extends Node\n");
+
+    const result = run("node", [SCRIPT, "land", jobId], {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir)
+    });
+
+    assert.notEqual(result.status, 0, result.stdout);
+    const combined = `${result.stderr}\n${result.stdout}`;
+    assert.match(combined, /Refusing to land into a dirty working tree/);
+    assert.match(combined, /real_change\.gd|src\//);
+    assert.equal(fs.existsSync(created.worktreePath), true);
+  } finally {
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
+});
+
 test("landing a job twice gives a clean error on the second call, not a raw git error", () => {
   // Regression found by a second-round audit: land never cleared the job's
   // worktree field after a successful apply or discard, so a second
