@@ -30,12 +30,14 @@ import {
   getGrokAuthStatus,
   getGrokAvailability,
   listGrokModels,
+  normalizePathForPermissionRule,
   parseStructuredOutput,
   readOutputSchema,
   resolveGrokBinary,
   runHeadlessAgent,
   runImport,
-  schemaInstructionsFromPath
+  schemaInstructionsFromPath,
+  worktreeContainsSegment
 } from "./lib/grok.mjs";
 import {
   buildSingleJobSnapshot,
@@ -2923,7 +2925,23 @@ async function executeTaskRun(request) {
   // deny beats always-approve and covers the shell too.
   const permissionOptions = buildHeadlessPermissionOptions(write);
   if (created && write) {
-    const denyPlan = buildWorkspaceRootDenyRules(workspaceRoot, created.worktreePath);
+    // The segment-anchored deny rule is what closes a `../` traversal into the
+    // main checkout, but it must not fire when the repository's own directory
+    // name also occurs inside the worktree — `**/src/**` on a repo called `src`
+    // would deny the run's writable root.
+    const rootSegment = normalizePathForPermissionRule(workspaceRoot).split("/").filter(Boolean).at(-1) ?? "";
+    const segmentSafe = rootSegment
+      ? !worktreeContainsSegment(created.worktreePath, rootSegment)
+      : false;
+    const denyPlan = buildWorkspaceRootDenyRules(workspaceRoot, created.worktreePath, {
+      segmentSafe
+    });
+    if (!denyPlan.skipped && !denyPlan.segmentRuleApplied && rootSegment) {
+      request.onProgress?.({
+        message: `Isolation: path-segment deny rule omitted ("${rootSegment}" also occurs inside the worktree); a "../" traversal into the main checkout would only be caught after the run.`,
+        phase: "starting"
+      });
+    }
     if (denyPlan.skipped) {
       request.onProgress?.({
         message: `Warning: isolation deny rules skipped (${denyPlan.reason}); worktree sits inside the main checkout path.`,

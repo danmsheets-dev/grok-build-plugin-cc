@@ -10,7 +10,8 @@ import {
   cliSupportsConfine,
   confineFeatureEnabled,
   normalizePathForPermissionRule,
-  pathIsInsideOrEqual
+  pathIsInsideOrEqual,
+  worktreeContainsSegment
 } from "../plugins/grok-build/scripts/lib/grok.mjs";
 import {
   classifyJobLiveness,
@@ -581,4 +582,73 @@ test("classifyJobLiveness marks dead active jobs abandoned", () => {
   );
   assert.equal(liveness.abandoned, true);
   assert.equal(liveness.alive, false);
+});
+
+// --- Segment-anchored deny rules: the `../` traversal escape ---
+//
+// Reproduced against hyper 0.2.114-r5 on Windows and confirmed with `ls`:
+// `<worktree>/../Main Repo/x.txt` WROTE into the protected checkout, because a
+// deny glob is matched against the model's literal path string with no
+// canonicalisation. The segment-anchored rule closes that specific form; the
+// 8.3 short-name form (`MAINRE~1`) is NOT closable by any glob and needs the
+// Hyper-side canonicalisation fix, which is why the breach detector stays.
+
+test("segment-anchored deny rules are added when the repo name is safe", () => {
+  const plan = buildWorkspaceRootDenyRules("C:/work/Main Repo", "C:/tmp/gb/w/abc123", {
+    segmentSafe: true
+  });
+  assert.equal(plan.skipped, false);
+  assert.equal(plan.segmentRuleApplied, true);
+  for (const tool of ["Edit", "Write", "NotebookEdit"]) {
+    assert.ok(plan.rules.includes(`${tool}(C:/work/Main Repo/**)`), `absolute ${tool}`);
+    assert.ok(plan.rules.includes(`${tool}(**/Main Repo/**)`), `segment ${tool}`);
+  }
+});
+
+test("segment-anchored deny rules are omitted when the name occurs in the worktree", () => {
+  // A repository called `src` would otherwise deny <worktree>/src/** and break
+  // the run's own writable root.
+  const plan = buildWorkspaceRootDenyRules("C:/work/src", "C:/tmp/gb/w/abc123", {
+    segmentSafe: false
+  });
+  assert.equal(plan.segmentRuleApplied, false);
+  assert.equal(plan.rules.length, 3);
+  assert.ok(plan.rules.every((rule) => !rule.includes("**/src/**")));
+});
+
+test("segment-anchored rules are skipped for a drive root or a one-character name", () => {
+  assert.equal(
+    buildWorkspaceRootDenyRules("C:", "C:/tmp/wt", { segmentSafe: true }).segmentRuleApplied,
+    false
+  );
+  assert.equal(
+    buildWorkspaceRootDenyRules("C:/work/x", "C:/tmp/wt", { segmentSafe: true }).segmentRuleApplied,
+    false
+  );
+});
+
+test("worktreeContainsSegment reports a collision, and fails closed on a git error", () => {
+  const calls = [];
+  const hit = worktreeContainsSegment("C:/tmp/wt", "src", {
+    gitImpl: (bin, args, options) => {
+      calls.push({ bin, args, cwd: options?.cwd });
+      return { status: 0, stdout: "src/main.rs\u0000", stderr: "", error: null };
+    }
+  });
+  assert.equal(hit, true);
+  assert.equal(calls[0].bin, "git");
+  assert.deepEqual(calls[0].args, ["ls-files", "-z", "--", "src/*", "**/src/*"]);
+  assert.equal(calls[0].cwd, "C:/tmp/wt");
+
+  const clean = worktreeContainsSegment("C:/tmp/wt", "Main Repo", {
+    gitImpl: () => ({ status: 0, stdout: "", stderr: "", error: null })
+  });
+  assert.equal(clean, false);
+
+  // A git failure must NOT be read as "no collision" - omitting the rule is the
+  // safe direction, so the collision answer is true.
+  const failed = worktreeContainsSegment("C:/tmp/wt", "Main Repo", {
+    gitImpl: () => ({ status: 128, stdout: "", stderr: "not a repository", error: null })
+  });
+  assert.equal(failed, true);
 });

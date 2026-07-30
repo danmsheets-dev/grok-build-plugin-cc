@@ -601,31 +601,97 @@ export function pathIsInsideOrEqual(outer, inner) {
  * when the worktree sits inside `workspaceRoot` — that would self-deny the
  * only writable root. Callers should log a warning in that case.
  *
+ * TWO rule shapes, because one is not enough. Hyper matches a deny glob against
+ * the path string the model supplied, WITHOUT canonicalising it, so an absolute
+ * rule alone is evadable. Both evasions below were reproduced against
+ * hyper 0.2.114-r5 on Windows and confirmed on disk, not from the agent's own
+ * account of what happened:
+ *
+ *   `<worktree>/../Main Repo/x.txt`  -> WROTE into the main checkout.
+ *   `<parent>/MAINRE~1/x.txt`        -> WROTE into the main checkout (8.3 short
+ *                                       name; `fsutil 8dot3name` is enabled on a
+ *                                       default Windows install).
+ *
+ * The segment-anchored form (`**\/<basename>/**`) closes the `..` traversal,
+ * because the literal string still contains the directory name. It cannot close
+ * the short-name evasion — every ancestor has a short form — and no glob can.
+ * That needs canonicalisation inside Hyper (`--confine`), which is why the
+ * post-run breach detector remains the backstop rather than an afterthought.
+ *
+ * The segment rule is only safe when that name cannot also appear INSIDE the
+ * worktree: a repository called `src` would otherwise deny `<worktree>/src/**`
+ * and break the run outright. `segmentSafe` is the caller's answer to that
+ * question (see worktreeContainsSegment); absent, the rule is left out.
+ *
  * @param {string} workspaceRoot
  * @param {string} [worktreePath]
- * @returns {{ rules: string[], skipped: boolean, reason: string|null }}
+ * @param {{ segmentSafe?: boolean }} [options]
+ * @returns {{ rules: string[], skipped: boolean, reason: string|null, segmentRuleApplied: boolean }}
  */
-export function buildWorkspaceRootDenyRules(workspaceRoot, worktreePath = null) {
+export function buildWorkspaceRootDenyRules(workspaceRoot, worktreePath = null, options = {}) {
   const root = normalizePathForPermissionRule(workspaceRoot);
   if (!root) {
-    return { rules: [], skipped: true, reason: "empty-workspace-root" };
+    return { rules: [], skipped: true, reason: "empty-workspace-root", segmentRuleApplied: false };
   }
   if (worktreePath && pathIsInsideOrEqual(root, worktreePath)) {
     return {
       rules: [],
       skipped: true,
-      reason: "worktree-inside-workspace-root"
+      reason: "worktree-inside-workspace-root",
+      segmentRuleApplied: false
     };
   }
-  return {
-    rules: [
-      `Edit(${root}/**)`,
-      `Write(${root}/**)`,
-      `NotebookEdit(${root}/**)`
-    ],
-    skipped: false,
-    reason: null
-  };
+
+  const rules = [`Edit(${root}/**)`, `Write(${root}/**)`, `NotebookEdit(${root}/**)`];
+
+  // Last path segment, e.g. "Main Repo" from "C:/…/isotest/Main Repo".
+  const segment = root.split("/").filter(Boolean).at(-1) ?? "";
+  // A drive root ("C:") has no meaningful segment, and a one-character name is
+  // too likely to collide with something inside the tree.
+  const segmentUsable = segment.length > 1 && !segment.endsWith(":");
+  const segmentRuleApplied = segmentUsable && options.segmentSafe === true;
+  if (segmentRuleApplied) {
+    rules.push(
+      `Edit(**/${segment}/**)`,
+      `Write(**/${segment}/**)`,
+      `NotebookEdit(**/${segment}/**)`
+    );
+  }
+
+  return { rules, skipped: false, reason: null, segmentRuleApplied };
+}
+
+/**
+ * Does any tracked path in the worktree contain `segment` as a directory
+ * component? Answers whether a `**\/<segment>/**` deny rule would also deny the
+ * run's own writable root.
+ *
+ * `git ls-files` with the pathspecs does the filtering, so the output is empty
+ * (not "every file in the repo") in the safe case — this stays cheap on a large
+ * checkout. A git failure returns false: refusing to add the extra rule is the
+ * safe direction, since the absolute rules still apply and the breach detector
+ * still runs.
+ *
+ * @param {string} worktreePath
+ * @param {string} segment
+ * @param {{ gitImpl?: typeof runCommand }} [options]
+ * @returns {boolean}
+ */
+export function worktreeContainsSegment(worktreePath, segment, options = {}) {
+  const name = String(segment ?? "").trim();
+  if (!worktreePath || !name) {
+    return false;
+  }
+  const runner = options.gitImpl ?? runCommand;
+  const result = runner(
+    "git",
+    ["ls-files", "-z", "--", `${name}/*`, `**/${name}/*`],
+    { cwd: worktreePath }
+  );
+  if (result.error || result.status !== 0) {
+    return true;
+  }
+  return Boolean(String(result.stdout ?? "").trim());
 }
 
 // Per-process cache: probing `--help` once is enough. Tests inject a fresh
