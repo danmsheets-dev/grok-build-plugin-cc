@@ -40,8 +40,12 @@ import {
   resolveResultJob,
   sortJobsNewestFirst
 } from "./lib/job-control.mjs";
-import { defaultVerifyCommands, detectPrimaryEcosystem } from "./lib/ecosystem.mjs";
-import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
+import {
+  defaultVerifyCommands,
+  detectEcosystems,
+  detectPrimaryEcosystem
+} from "./lib/ecosystem.mjs";
+import { binaryAvailable, runCommand, terminateProcessTree } from "./lib/process.mjs";
 import {
   describeVerifySource,
   loadWorkspaceProjectConfig,
@@ -979,7 +983,382 @@ function buildProjectConfigCheck(workspaceRoot) {
   };
 }
 
-function buildDoctorReport(cwd) {
+/**
+ * Budget for one engine probe.
+ *
+ * Godot and Blender start in well under a second when they start at all; the
+ * cap is here for when they do not. A GUI-subsystem build can pop a window and
+ * sit there, and a network-mounted install can stall indefinitely - doctor is
+ * run interactively, so a wedged probe would hang the entire report and the
+ * user would get no output at all rather than one warn line.
+ */
+const DOCTOR_PROBE_TIMEOUT_MS = 20_000;
+
+/**
+ * Per-engine probe shapes.
+ *
+ * `headlessArgs` is a function of the descriptor because Godot 3 predates
+ * `--headless` (added in 4.0) and rejects it as an unknown option; `--no-window`
+ * is its equivalent. An unparsed config_version takes the Godot 4 branch, which
+ * is the same choice `defaultVerifyCommands` makes.
+ */
+const DOCTOR_ENGINE_TOOLS = Object.freeze({
+  godot: Object.freeze({
+    envVar: "GROK_BUILD_GODOT_BIN",
+    versionArgs: Object.freeze(["--version"]),
+    headlessArgs: (descriptor) =>
+      descriptor?.major === 3 ? ["--no-window", "--version"] : ["--headless", "--version"],
+    headlessFix:
+      "This build cannot run headless. Godot 3 uses `--no-window` rather than `--headless`; an editor-only or GUI-only build has neither. Point `tools.godot` in .grok-build.json (or GROK_BUILD_GODOT_BIN) at a build that starts without a display."
+  }),
+  blender: Object.freeze({
+    envVar: "GROK_BUILD_BLENDER_BIN",
+    versionArgs: Object.freeze(["--version"]),
+    // -b plus a trivial expression is the cheapest thing that proves the build
+    // can start without a display AND run Python, which is what every Blender
+    // verify command depends on. --python-exit-code turns an import failure
+    // into a non-zero exit; without it Blender exits 0 and says nothing.
+    headlessArgs: () => [
+      "--background",
+      "--factory-startup",
+      "--python-exit-code",
+      "1",
+      "--python-expr",
+      "import bpy"
+    ],
+    headlessFix:
+      "This build cannot run background Python. A `bpy`-less build (or one missing its Python runtime) cannot run any Blender verify command. Point `tools.blender` in .grok-build.json (or GROK_BUILD_BLENDER_BIN) at a full Blender install."
+  })
+});
+
+/** Only these two get toolchain checks; node/python/rust have none to run. */
+const DOCTOR_ENGINE_IDS = Object.freeze(["godot", "blender"]);
+
+/** `Godot 4.3`, `Godot 4`, or `unknown version` - never a wrong number. */
+function describeGodotVersion(descriptor) {
+  if (!Number.isInteger(descriptor?.major)) {
+    return "unknown version";
+  }
+  return Number.isInteger(descriptor.minor)
+    ? `Godot ${descriptor.major}.${descriptor.minor}`
+    : `Godot ${descriptor.major}`;
+}
+
+/**
+ * The gitignore probe for one engine: a path that CANNOT be in the index, plus
+ * the pattern a user would add to fix it.
+ *
+ * The probe path matters. `git check-ignore` reports a tracked path as
+ * not-ignored no matter what .gitignore says, so probing `.godot` itself in a
+ * repo that has (wrongly) committed it would produce a warn whose fix does not
+ * help. A `__grok_probe` leaf can never be tracked, so the answer is purely
+ * about the ignore rules. Forward slashes throughout: that is the only
+ * separator gitignore syntax knows, on every platform.
+ */
+function gitignoreProbesFor(descriptor) {
+  if (descriptor.id === "godot") {
+    // Probe the cache directory this project actually uses. Warning a Godot 4
+    // project about an unignored `.import/` it will never create is noise.
+    return descriptor.cacheDir === ".import"
+      ? [{ path: ".import/__grok_probe", pattern: ".import/" }]
+      : [{ path: ".godot/imported/__grok_probe", pattern: ".godot/" }];
+  }
+  if (descriptor.id === "blender") {
+    // Blender writes <scene>.blend1, .blend2, ... next to every saved scene.
+    return [{ path: "__grok_probe.blend1", pattern: "*.blend[0-9]" }];
+  }
+  return [];
+}
+
+/**
+ * Are the engine's generated files ignored?
+ *
+ * `git check-ignore -q <path>` exits 0 when the path is ignored, 1 when it is
+ * not, and 128 on an error (not a repository, unreadable .gitignore, no git).
+ * 128 is a SKIP, not a warn: doctor learned nothing, and reporting "your
+ * gitignore is wrong" on the strength of a failed measurement is worse than
+ * saying nothing.
+ */
+function buildGitignoreHygieneCheck(root, descriptors, gitImpl) {
+  const probes = descriptors.flatMap(gitignoreProbesFor);
+  if (probes.length === 0) {
+    return null;
+  }
+
+  const missing = [];
+  let measured = 0;
+  for (const probe of probes) {
+    const result = gitImpl(root, ["check-ignore", "-q", "--", probe.path], {
+      timeout: DOCTOR_PROBE_TIMEOUT_MS
+    });
+    if (result.error || (result.status !== 0 && result.status !== 1)) {
+      continue;
+    }
+    measured += 1;
+    if (result.status === 1) {
+      missing.push(probe);
+    }
+  }
+
+  if (measured === 0) {
+    return {
+      name: "gitignore hygiene",
+      status: "skipped",
+      detail: "git check-ignore could not answer here",
+      fix: null
+    };
+  }
+
+  if (missing.length === 0) {
+    return {
+      name: "gitignore hygiene",
+      status: "ok",
+      detail: `${probes.map((probe) => probe.pattern).join(", ")} ignored`,
+      fix: null
+    };
+  }
+
+  const patterns = missing.map((probe) => probe.pattern);
+  return {
+    name: "gitignore hygiene",
+    status: "warn",
+    detail: `${patterns.join(", ")} is not ignored`,
+    // Never written for the user: commands/doctor.md forbids doctor from
+    // modifying the repository, and a .gitignore is a file the user's team
+    // reviews.
+    fix: `Add ${patterns.join(" and ")} to .gitignore. Godot regenerates its import cache continuously, so an unignored cache leaves the tree permanently dirty - and \`land\` refuses to merge into a dirty tree.`
+  };
+}
+
+/**
+ * git-lfs: declared but not installed.
+ *
+ * A repository whose .gitattributes routes `*.blend` or `*.png` through
+ * `filter=lfs` needs the clean filter configured locally, or `git add` commits
+ * the raw multi-hundred-megabyte asset instead of a pointer - into a worktree
+ * this plugin then squash-merges. Nothing downstream can undo that.
+ *
+ * Emitted only when LFS is actually declared: a repo that does not use it has
+ * nothing to say, and an extra green line in every Godot report is noise.
+ * The diff-rewriting half of LFS support is deliberately not checked - a
+ * pointer diff is self-describing.
+ */
+function buildGitLfsCheck(root, gitImpl, readFileImpl) {
+  const listed = gitImpl(root, ["ls-files", "-z", "--", "*.gitattributes"], {
+    timeout: DOCTOR_PROBE_TIMEOUT_MS
+  });
+  if (listed.error || listed.status !== 0) {
+    return null;
+  }
+
+  const declaring = [];
+  for (const relative of String(listed.stdout ?? "").split("\0").filter(Boolean)) {
+    let contents = "";
+    try {
+      contents = String(readFileImpl(path.join(root, relative), "utf8"));
+    } catch {
+      // Tracked but not on disk (a sparse checkout, or deleted and not yet
+      // committed). Nothing to read, nothing to claim.
+      continue;
+    }
+    if (/filter\s*=\s*lfs/i.test(contents)) {
+      declaring.push(relative);
+    }
+  }
+
+  if (declaring.length === 0) {
+    return null;
+  }
+
+  const clean = gitImpl(root, ["config", "--get", "filter.lfs.clean"], {
+    timeout: DOCTOR_PROBE_TIMEOUT_MS
+  });
+  const configured = !clean.error && clean.status === 0 && String(clean.stdout ?? "").trim() !== "";
+  if (configured) {
+    return {
+      name: "git-lfs",
+      status: "ok",
+      detail: `${declaring.join(", ")} declares filter=lfs, and the clean filter is configured`,
+      fix: null
+    };
+  }
+
+  return {
+    name: "git-lfs",
+    status: "warn",
+    detail: `${declaring.join(", ")} declares filter=lfs but filter.lfs.clean is unset`,
+    fix: "Install git-lfs and run `git lfs install` in this repository. Without the clean filter, committing a tracked asset stores the whole binary in the repository instead of a pointer."
+  };
+}
+
+/**
+ * Toolchain checks for the detected engine ecosystems.
+ *
+ * Returns an EMPTY list when neither Godot nor Blender is detected, so a plain
+ * Node or Rust repo's doctor output is byte-identical to what it was before
+ * these checks existed.
+ *
+ * Nothing here is ever a `fail`. A missing engine binary is legitimate: the
+ * user may verify through an absolute path this code cannot see, through a
+ * `bpy` pip module, or not at all.
+ */
+function buildEcosystemChecks(root, options = {}) {
+  const detect = options.detectEcosystemsImpl ?? detectEcosystems;
+  const probe = options.binaryAvailableImpl ?? binaryAvailable;
+  const runProbe = options.runCommandImpl ?? runCommand;
+  const gitImpl = options.gitImpl ?? git;
+  const readFileImpl = options.readFileImpl ?? fs.readFileSync;
+  const platform = options.platform ?? process.platform;
+
+  let detected = [];
+  try {
+    detected = detect(root);
+  } catch {
+    // detectEcosystems is documented never to throw, but doctor must survive
+    // it doing so anyway: a report that crashes tells the user nothing.
+    detected = [];
+  }
+  const engines = detected.filter((descriptor) => DOCTOR_ENGINE_IDS.includes(descriptor?.id));
+  if (engines.length === 0) {
+    return [];
+  }
+
+  const checks = [];
+
+  // What was detected, and - just as important - the limits of the detection,
+  // so the ABSENCE of these lines is not read as "this is not a Godot project".
+  const summary = engines
+    .map((descriptor) =>
+      descriptor.id === "godot"
+        ? `godot (${describeGodotVersion(descriptor)}, config_version ${descriptor.configVersion ?? "unknown"})`
+        : `blender (detected by ${descriptor.detectedBy})`
+    )
+    .join("; ");
+  checks.push({
+    name: "ecosystem",
+    status: "ok",
+    detail: `${summary} - detection reads the repository root and one directory below it only, so a nested project is not detected`,
+    fix: null
+  });
+
+  // tools.* is an executable key, so loadWorkspaceProjectConfig has already
+  // withheld it unless the file is trusted. Reading it here means doctor
+  // probes the binary a run would ACTUALLY use, not a different one.
+  const projectConfig = loadWorkspaceProjectConfig(root);
+
+  for (const descriptor of engines) {
+    const tool = DOCTOR_ENGINE_TOOLS[descriptor.id];
+    // descriptor.exeHint is the RAW hint (GROK_BUILD_*_BIN, then the generic
+    // var, then the bare name). resolveEcosystemBinary is deliberately not
+    // used: it returns a shell-quoted, command-string-ready token, and a
+    // quoted token handed to runCommand becomes a filename with quotes in it.
+    const binary = String(projectConfig.config.tools?.[descriptor.id] ?? descriptor.exeHint ?? "");
+    const availability = probe(binary, [...tool.versionArgs], {
+      cwd: root,
+      timeout: DOCTOR_PROBE_TIMEOUT_MS
+    });
+
+    checks.push({
+      name: `${descriptor.id} binary`,
+      status: availability.available ? "ok" : "warn",
+      detail: `${binary}: ${availability.detail}`,
+      fix: availability.available
+        ? null
+        : `Install ${descriptor.id}, or point \`tools.${descriptor.id}\` in ${PROJECT_CONFIG_FILENAME} (or ${tool.envVar}) at the executable. This is only a warning: a verify command that names an absolute path, or one that does not need the binary at all, still works.`
+    });
+
+    if (!availability.available) {
+      // Everything below needs a working binary. Reporting "cannot run
+      // headless" about something that is not installed would be three
+      // warnings for one problem.
+      checks.push({
+        name: `${descriptor.id} headless`,
+        status: "skipped",
+        detail: `${binary} is not available`,
+        fix: null
+      });
+      continue;
+    }
+
+    const headless = probe(binary, tool.headlessArgs(descriptor), {
+      cwd: root,
+      timeout: DOCTOR_PROBE_TIMEOUT_MS
+    });
+    checks.push({
+      name: `${descriptor.id} headless`,
+      status: headless.available ? "ok" : "warn",
+      detail: headless.available ? "starts without a display" : headless.detail,
+      fix: headless.available ? null : tool.headlessFix
+    });
+
+    if (descriptor.id === "godot") {
+      checks.push(buildGodotConsoleOutputCheck(binary, root, runProbe, platform));
+    }
+  }
+
+  const gitignore = buildGitignoreHygieneCheck(root, engines, gitImpl);
+  if (gitignore) {
+    checks.push(gitignore);
+  }
+
+  const lfs = buildGitLfsCheck(root, gitImpl, readFileImpl);
+  if (lfs) {
+    checks.push(lfs);
+  }
+
+  return checks;
+}
+
+/**
+ * Does this Godot build write anything to a captured pipe at all?
+ *
+ * On Windows the official download ships a GUI-subsystem
+ * `Godot_v4.x-stable_win64.exe` next to a `Godot_v4.x-stable_win64_console.exe`.
+ * Only the second has a console attached, so only the second writes to a pipe.
+ * The first exits 0 with both streams empty, which silently defeats every
+ * output-pattern check: a verify run that cannot see `SCRIPT ERROR:` reports a
+ * broken project as verified, and failure attribution collapses to
+ * "incomparable" because there is no output to build a signature from.
+ *
+ * Detected EMPIRICALLY, never by filename - a user may have renamed either
+ * build, and a launcher script or a Flatpak/Steam wrapper can swallow output on
+ * any platform. `runCommand` is called directly rather than reading
+ * `binaryAvailable`'s `detail`, because that helper substitutes the literal
+ * string "ok" when both streams are empty, so an empty detail never occurs.
+ */
+function buildGodotConsoleOutputCheck(binary, root, runProbe, platform) {
+  const result = runProbe(binary, ["--version"], {
+    cwd: root,
+    timeout: DOCTOR_PROBE_TIMEOUT_MS
+  });
+  const silent =
+    !result.error &&
+    result.status === 0 &&
+    !String(result.stdout ?? "").trim() &&
+    !String(result.stderr ?? "").trim();
+
+  if (!silent) {
+    return {
+      name: "godot console output",
+      status: "ok",
+      detail: "writes to a captured pipe",
+      fix: null
+    };
+  }
+
+  const remedy =
+    platform === "win32"
+      ? "Use the console build - `Godot_v4.x-stable_win64_console.exe`, which ships in the same archive - and point `tools.godot` in .grok-build.json (or GROK_BUILD_GODOT_BIN) at it."
+      : "Point `tools.godot` in .grok-build.json (or GROK_BUILD_GODOT_BIN) at the real executable rather than a launcher script that swallows its output.";
+  return {
+    name: "godot console output",
+    status: "warn",
+    detail: `${binary} exits 0 but writes nothing to stdout or stderr`,
+    fix: `${remedy} Until then, verification can only read the exit code, and Godot exits 0 on a GDScript parse error.`
+  };
+}
+
+function buildDoctorReport(cwd, options = {}) {
   const checks = [];
 
   checks.push({
@@ -1048,6 +1427,10 @@ function buildDoctorReport(cwd) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
 
   checks.push(buildProjectConfigCheck(workspaceRoot));
+
+  // Emits nothing at all when neither Godot nor Blender is detected, so a
+  // plain Node repo's report is unchanged.
+  checks.push(...buildEcosystemChecks(workspaceRoot, options));
 
   const jobs = listJobs(workspaceRoot);
   const abandoned = jobs.filter((job) => classifyJobLiveness(job).abandoned);
@@ -2121,6 +2504,11 @@ async function executeTaskRun(request) {
           // notice).
           outputFailure: outcome.failureSource === "output-pattern",
           matchedLines: outcome.matchedLines ?? [],
+          // A non-zero exit with two empty streams. Recorded, never merged
+          // into `output` - see runVerifyCommand. Without it a silent Godot
+          // build produces a run record in which the only evidence is an
+          // absence, which nobody reading the JSON afterwards can interpret.
+          ...(outcome.noOutput ? { noOutput: true, advisory: outcome.advisory } : {}),
           failureSource: null,
           output: outcome.output,
           signature: summary.signature
@@ -3665,6 +4053,7 @@ if (isMain) {
 export {
   buildBoundedVerifyFixPrompt,
   buildDoctorReport,
+  buildEcosystemChecks,
   main,
   normalizeDoctorCheck,
   readStoredJobWithRetry,

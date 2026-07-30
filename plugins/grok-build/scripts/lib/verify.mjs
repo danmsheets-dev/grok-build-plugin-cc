@@ -297,6 +297,19 @@ export async function runVerifyCommand(command, cwd, options = {}) {
   const outputFailures =
     status === 0 ? detectOutputFailures(`${stdout}\n${stderr}`, options.outputFailurePatterns) : [];
 
+  // A command that failed and said nothing about it. On Windows this is the
+  // signature of a GUI-subsystem Godot build: it has no console attached, so
+  // it writes to no pipe at all, and every failure it reports is invisible.
+  // The same shape occurs for a launcher script that swallows output.
+  //
+  // Carried as its own field rather than spliced into `output`, deliberately:
+  // `output` feeds summarizeFailures (where an advisory sentence would become
+  // a fake failure signature) and is pasted VERBATIM into the verify-fix
+  // prompt, where it would read as an instruction to the agent on every silent
+  // failure. Doctor is where a user is told to install the console build; this
+  // field is only how a run RECORDS that it hit the condition.
+  const noOutput = status !== 0 && !stdout.trim() && !stderr.trim();
+
   const parts = [`exit_code: ${status}`];
   if (stdout) {
     parts.push(`stdout:\n${stdout}`);
@@ -310,6 +323,12 @@ export async function runVerifyCommand(command, cwd, options = {}) {
 
   return {
     ok: status === 0 && outputFailures.length === 0,
+    ...(noOutput
+      ? {
+          noOutput: true,
+          advisory: `The command exited ${status} and wrote nothing to stdout or stderr, so there is no diagnostic to read. On Windows a GUI-subsystem Godot build (Godot_v4.x-stable_win64.exe) has no console attached and writes to no pipe; the _console.exe build in the same archive does. Run \`doctor\` for the full check.`
+        }
+      : {}),
     exitCode: status,
     timedOut: false,
     commandNotFound,

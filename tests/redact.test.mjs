@@ -164,6 +164,62 @@ test("Python KeyError diagnostics are not corrupted", () => {
   }
 });
 
+test("Godot export secrets with punctuation are redacted", () => {
+  // The narrow value class [A-Za-z0-9._/+-] let every one of these through
+  // BYTE-IDENTICAL: a quoted value stops at its closing quote, so there is no
+  // reason to restrict what may sit between the quotes, and `!`, `@`, `&` and
+  // spaces are exactly what a real keystore password contains.
+  const secrets = {
+    "keystore/release_password": "P@ssw0rd!2024",
+    "keystore/debug_password": "Tr0ub4dor&3",
+    "notarization/apple_id_password": "abcd-efgh-ijkl-mnop",
+    "codesign/password": "a b!c@d#e"
+  };
+  const block = Object.entries(secrets)
+    .map(([key, value]) => `${key}="${value}"`)
+    .join("\n");
+
+  const output = redactSecrets(block);
+  for (const [key, value] of Object.entries(secrets)) {
+    assert.ok(!output.includes(value), `${key} leaked its value: ${output}`);
+    assert.ok(output.includes(`${key}="[redacted]"`), `${key} lost its shape: ${output}`);
+  }
+});
+
+test("a Godot keystore PATH is not mistaken for a keystore password", () => {
+  // The rejected Godot-shaped rule matched any keystore/<word> key, which
+  // would have redacted the path the developer needs to see in order to fix a
+  // broken export - and a path to a keystore is not itself a credential.
+  const line = 'keystore/release="res://android/release.keystore"';
+  assert.strictEqual(redactSecrets(line), line);
+});
+
+test("passwd and credential spellings are redacted too", () => {
+  for (const key of ["DB_PASSWD", "aws_credential", "service/credential"]) {
+    const output = redactSecrets(`${key}="s0me v@lue!"`);
+    assert.match(output, /\[redacted\]/, `${key} not redacted: ${output}`);
+    assert.doesNotMatch(output, /s0me v@lue!/, `${key} leaked: ${output}`);
+  }
+});
+
+test("a JSON secret with punctuation is redacted like the bare form", () => {
+  // The two rules have to agree: whether a secret survives must not depend on
+  // whether the tool that printed it used INI or JSON syntax.
+  const secret = "P@ssw0rd!2024";
+  const output = redactSecrets(`{"release_password": "${secret}"}`);
+  assert.ok(!output.includes(secret), `raw secret leaked: ${output}`);
+  assert.ok(output.includes('"release_password"'), `key name should survive: ${output}`);
+  assert.ok(output.startsWith("{") && output.endsWith("}"), `JSON braces should survive: ${output}`);
+});
+
+test("an unquoted secret still stops at the value, not at the end of the sentence", () => {
+  // Non-regression for the half deliberately NOT widened: with no closing
+  // quote the character class is the only terminator, so broadening it would
+  // redact the explanation along with the token.
+  const output = redactSecrets("token: abcdefghijklmnop was rejected by the server");
+  assert.match(output, /token: \[redacted\] was rejected by the server/);
+});
+
 test("runTrackedJob redacts secrets in result before writing the job file", async () => {
   const previous = process.env.CLAUDE_PLUGIN_DATA;
   process.env.CLAUDE_PLUGIN_DATA = makeTempDir();
