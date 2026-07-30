@@ -1,11 +1,10 @@
 import process from "node:process";
 
-import { runCommand } from "./process.mjs";
+import { resolveMaxOutputBytes, runCommandAsync } from "./process.mjs";
 
 const DEFAULT_FLOOR_MS = 120_000;
 const DEFAULT_CAP_MS = 900_000;
 const DEFAULT_MULTIPLIER = 4;
-const MAX_BUFFER = 5 * 1024 * 1024;
 
 // A verify command that cannot even be started is an infrastructure fault, not
 // a code failure - but the exit code cannot tell us that. Every command is
@@ -27,25 +26,32 @@ const NOT_RUNNABLE = [
  * Run a verify command string without shell:true so paths with spaces stay intact.
  * On win32 uses ComSpec/cmd.exe with /d /s /c; elsewhere /bin/sh -c.
  *
+ * Async because the runner underneath is: a blocking spawnSync froze the job
+ * heartbeat for the whole length of the command (a 15-minute Godot import made
+ * a healthy run look dead), and killing only the direct child left the engine
+ * process orphaned behind its shell. See runCommandAsync.
+ *
  * @param {string} command
  * @param {string} cwd
  * @param {{
  *   env?: NodeJS.ProcessEnv,
  *   timeoutMs?: number,
- *   runCommandImpl?: typeof runCommand,
+ *   maxOutputBytes?: number,
+ *   runCommandImpl?: typeof runCommandAsync,
  *   platform?: string
  * }} [options]
- * @returns {{
+ * @returns {Promise<{
  *   ok: boolean,
  *   exitCode: number|null,
  *   timedOut: boolean,
  *   bufferExceeded?: boolean,
  *   commandNotFound?: boolean,
+ *   elidedBytes?: number,
  *   output: string
- * }}
+ * }>}
  */
-export function runVerifyCommand(command, cwd, options = {}) {
-  const run = options.runCommandImpl ?? runCommand;
+export async function runVerifyCommand(command, cwd, options = {}) {
+  const run = options.runCommandImpl ?? runCommandAsync;
   const platform = options.platform ?? process.platform;
   const shell = platform === "win32" ? process.env.ComSpec || "cmd.exe" : "/bin/sh";
 
@@ -59,11 +65,16 @@ export function runVerifyCommand(command, cwd, options = {}) {
   const shellArgs =
     platform === "win32" ? ["/d", "/s", "/c", `"${command}"`] : ["-c", command];
 
-  const result = run(shell, shellArgs, {
+  // Resolved per call, never as a module constant: the old fixed 5 MB was not
+  // something a user could move, and it is echoed in the overflow message
+  // below so the number a run reports is the number it actually used.
+  const maxOutputBytes = resolveMaxOutputBytes(options.maxOutputBytes, options.env);
+
+  const result = await run(shell, shellArgs, {
     cwd,
     env: options.env,
     timeout: options.timeoutMs,
-    maxBuffer: MAX_BUFFER,
+    maxOutputBytes,
     windowsVerbatimArguments: platform === "win32" ? true : undefined
   });
 
@@ -78,18 +89,20 @@ export function runVerifyCommand(command, cwd, options = {}) {
   }
 
   if (result.error?.code === "ENOBUFS") {
-    // Node kills the process once its output exceeds maxBuffer, so there is
-    // no exit code to report - the command may well have been about to pass.
-    // Reporting a bare generic failure here sent the agent hunting for a
-    // code bug that does not exist; the real cause is output volume, and the
-    // fix is to make the command quieter, not to "fix" anything in the repo.
+    // Legacy path. The async runner reads every byte and elides the middle, so
+    // it never reports ENOBUFS at all - overflow has stopped being a failure
+    // mode. Kept because a caller may still inject the synchronous runCommand
+    // (whose maxBuffer IS a cliff: libuv kills the process the moment the
+    // limit is crossed, so there is no exit code and the command may well have
+    // been about to pass), and because reporting a bare generic failure here
+    // used to send the agent hunting for a code bug that does not exist.
     return {
       ok: false,
       exitCode: null,
       timedOut: false,
       bufferExceeded: true,
       commandNotFound: false,
-      output: `command output exceeded the ${MAX_BUFFER} byte limit and was killed before it could finish. This is not a code failure - the command produced too much stdout/stderr to capture. Re-run it with a quieter or more targeted flag (e.g. a specific test file, --silent, or piping through a summary) rather than changing any source file.`
+      output: `command output exceeded the ${maxOutputBytes} byte limit and was killed before it could finish. This is not a code failure - the command produced too much stdout/stderr to capture. Re-run it with a quieter or more targeted flag (e.g. a specific test file, --silent, or piping through a summary) rather than changing any source file.`
     };
   }
 
@@ -132,6 +145,11 @@ export function runVerifyCommand(command, cwd, options = {}) {
     exitCode: status,
     timedOut: false,
     commandNotFound,
+    // How much of the middle the ring dropped, so a truncated capture is a
+    // number in the run record rather than something only a reader of the
+    // elision marker would notice. Zero for any command that stayed under the
+    // budget, which is nearly all of them.
+    elidedBytes: Number(result.elidedBytes) || 0,
     output: parts.join("\n")
   };
 }
@@ -140,14 +158,15 @@ export function runVerifyCommand(command, cwd, options = {}) {
  * Measure what each verify command already reports BEFORE the agent runs, so a
  * suite that was red on arrival is never blamed on the run.
  *
- * Extracted from the bridge so it can be exercised without spawning anything,
- * and declared async even though runVerifyCommand is currently synchronous:
- * the async runner lands next and this way its arrival is a one-line change
- * here instead of a rewrite of every caller.
+ * Extracted from the bridge so it can be exercised without spawning anything.
  *
  * @param {string[]} commands
  * @param {string} cwd
- * @param {{ runVerifyCommandImpl?: typeof runVerifyCommand, timeoutMs?: number }} [options]
+ * @param {{
+ *   runVerifyCommandImpl?: typeof runVerifyCommand,
+ *   timeoutMs?: number,
+ *   maxOutputBytes?: number
+ * }} [options]
  * @returns {Promise<{
  *   command: string,
  *   ok: boolean,
@@ -165,7 +184,13 @@ export async function probeBaselines(commands, cwd, options = {}) {
 
   for (const command of commands ?? []) {
     const started = Date.now();
-    const probe = await runVerifyCommandImpl(command, cwd, { timeoutMs: options.timeoutMs });
+    // The output budget has to match the post-agent pass. A baseline captured
+    // under a tighter bound records a shorter signature, and every failure the
+    // fuller capture then finds looks new.
+    const probe = await runVerifyCommandImpl(command, cwd, {
+      timeoutMs: options.timeoutMs,
+      maxOutputBytes: options.maxOutputBytes
+    });
     const ms = Date.now() - started;
     const summary = summarizeFailures(probe?.output);
     baselines.push({
@@ -377,6 +402,44 @@ export function compareFailureSignatures(current, baseline, options = {}) {
     remainingCount,
     baselineCount: base.length
   };
+}
+
+/**
+ * Parse a `--verify-timeout` / `--baseline-timeout` value (whole seconds, as a
+ * user types them) into milliseconds. Mirrors the bridge's
+ * resolveMaxDurationSeconds contract exactly: finite and > 0, else null, so an
+ * unusable value falls through to the next source in the precedence chain
+ * rather than silently becoming zero.
+ *
+ * @param {unknown} rawSeconds
+ * @returns {number|null}
+ */
+export function resolveVerifyTimeoutMs(rawSeconds) {
+  if (rawSeconds == null || rawSeconds === "") {
+    return null;
+  }
+  const parsed = Number(rawSeconds);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    return Math.round(parsed * 1000);
+  }
+  return null;
+}
+
+/**
+ * Parse a `--verify-max-buffer` value (megabytes) into bytes.
+ *
+ * @param {unknown} rawMegabytes
+ * @returns {number|null}
+ */
+export function resolveVerifyMaxBufferBytes(rawMegabytes) {
+  if (rawMegabytes == null || rawMegabytes === "") {
+    return null;
+  }
+  const parsed = Number(rawMegabytes);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    return Math.round(parsed * 1024 * 1024);
+  }
+  return null;
 }
 
 /**

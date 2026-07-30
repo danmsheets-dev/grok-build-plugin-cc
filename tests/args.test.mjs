@@ -122,3 +122,31 @@ test("splitRawArgumentString closes a quote whose content ends in a backslash wi
   const tokens = splitRawArgumentString('--cwd "C:\\repo\\"');
   assert.deepEqual(tokens, ["--cwd", "C:\\repo\\"]);
 });
+
+test("the run command's real option table accepts the verify timing flags", async () => {
+  // Parsed through the EXACT array handleTask uses, not a copy: a flag that is
+  // documented but missing from that table is silently swallowed as a
+  // positional and folded into the agent's prompt, which is how a value flag
+  // fails least visibly.
+  const { TASK_VALUE_OPTIONS } = await import(
+    "../plugins/grok-build/scripts/grok-bridge.mjs"
+  );
+
+  const result = parseArgs(
+    [
+      "--verify-timeout",
+      "1800",
+      "--baseline-timeout",
+      "1200",
+      "--verify-max-buffer",
+      "32",
+      "fix the importer"
+    ],
+    { valueOptions: [...TASK_VALUE_OPTIONS], repeatableOptions: ["verify"] }
+  );
+
+  assert.equal(result.options["verify-timeout"], "1800");
+  assert.equal(result.options["baseline-timeout"], "1200");
+  assert.equal(result.options["verify-max-buffer"], "32");
+  assert.deepEqual(result.positionals, ["fix the importer"]);
+});

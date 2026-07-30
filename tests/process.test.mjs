@@ -6,7 +6,12 @@ import assert from "node:assert/strict";
 
 import { makeTempDir } from "./helpers.mjs";
 import { resolveExecutable } from "../plugins/grok-build/scripts/lib/which.mjs";
-import { runCommand, terminateProcessTree } from "../plugins/grok-build/scripts/lib/process.mjs";
+import {
+  resolveMaxOutputBytes,
+  runCommand,
+  runCommandAsync,
+  terminateProcessTree
+} from "../plugins/grok-build/scripts/lib/process.mjs";
 
 test("terminateProcessTree uses taskkill on Windows", () => {
   let captured = null;
@@ -203,4 +208,103 @@ test("runCommand can actually invoke a resolved .cmd file end to end on Windows"
 
   assert.equal(result.status, 0, result.error?.message ?? result.stderr);
   assert.equal(result.stdout.trim(), "ARGS:" + JSON.stringify(args));
+});
+
+test("runCommandAsync reports a real exit code without blocking the event loop", async () => {
+  let ticks = 0;
+  const ticker = setInterval(() => {
+    ticks += 1;
+  }, 20);
+  try {
+    const result = await runCommandAsync(process.execPath, [
+      "-e",
+      "setTimeout(()=>{process.stdout.write('done');process.exit(3)}, 400)"
+    ]);
+    assert.equal(result.status, 3);
+    assert.equal(result.stdout, "done");
+    assert.equal(result.error, null);
+  } finally {
+    clearInterval(ticker);
+  }
+  // spawnSync scored exactly 0 here: nothing on the loop could run while a
+  // verify command was in flight, which is why the job heartbeat died.
+  assert.ok(ticks > 3, `expected the event loop to keep running, got ${ticks} ticks`);
+});
+
+test("runCommandAsync bounds output with a head+tail ring instead of an ENOBUFS cliff", async () => {
+  const result = await runCommandAsync(
+    process.execPath,
+    ["-e", "for(let i=0;i<40000;i++){console.log(i+' '+'y'.repeat(200))}"],
+    { maxOutputBytes: 64 * 1024 }
+  );
+
+  assert.equal(result.status, 0, "the command must still report its real exit code");
+  assert.equal(result.error, null, "overflow is no longer an error condition");
+  assert.ok(result.elidedBytes > 0);
+  assert.ok(result.stdout.length < 96 * 1024, `unbounded capture: ${result.stdout.length} bytes`);
+  assert.match(result.stdout, /^0 y{200}/);
+  assert.ok(result.stdout.includes(`39999 ${"y".repeat(200)}`), "expected the tail to survive");
+  assert.match(result.stdout, /\.\.\.\[elided \d+ bytes of output\]\.\.\./);
+});
+
+test("runCommandAsync scales the ring down with a small budget", async () => {
+  // A caller that asks for 4 KB must get roughly 4 KB, not the 320 KB the
+  // fixed head/tail sizes would keep.
+  const result = await runCommandAsync(
+    process.execPath,
+    ["-e", "for(let i=0;i<2000;i++){console.log(i+' '+'z'.repeat(100))}"],
+    { maxOutputBytes: 4096 }
+  );
+
+  assert.equal(result.status, 0);
+  assert.ok(result.stdout.length < 8192, `expected ~4KB, got ${result.stdout.length} bytes`);
+  assert.ok(result.elidedBytes > 0);
+});
+
+test("runCommandAsync kills the tree on timeout and reports ETIMEDOUT", async () => {
+  // Hermetic: terminateProcessTree is injected, so nothing is actually killed
+  // by taskkill here - the contract under test is that the runner reaches for
+  // the TREE (while the shell is still alive) rather than for Node's own
+  // spawn timeout, which signals only the direct child.
+  let killedPid = null;
+  const result = await runCommandAsync(
+    process.execPath,
+    ["-e", "setTimeout(()=>{}, 5000)"],
+    {
+      timeout: 300,
+      terminateProcessTreeImpl(pid, options) {
+        killedPid = pid;
+        assert.ok(options.platform, "the platform has to reach terminateProcessTree");
+        // Stand in for what taskkill /T or kill(-pid) would do to the tree.
+        process.kill(pid, "SIGKILL");
+        return { attempted: true, delivered: true, method: "test" };
+      }
+    }
+  );
+
+  assert.equal(result.timedOut, true);
+  assert.equal(result.error?.code, "ETIMEDOUT");
+  assert.ok(Number.isFinite(killedPid), "the tree kill never ran");
+});
+
+test("runCommandAsync surfaces a missing binary as ENOENT rather than hanging", async () => {
+  const result = await runCommandAsync("grok-build-nonexistent-binary-xyz", ["--version"]);
+  assert.equal(result.status, null);
+  assert.equal(/** @type {NodeJS.ErrnoException} */ (result.error)?.code, "ENOENT");
+});
+
+test("runCommandAsync closes stdin so a command that reads it cannot hang", async () => {
+  const result = await runCommandAsync(process.execPath, [
+    "-e",
+    "process.stdin.on('end',()=>{process.stdout.write('eof');process.exit(0)});process.stdin.resume()"
+  ]);
+  assert.equal(result.status, 0);
+  assert.equal(result.stdout, "eof");
+});
+
+test("resolveMaxOutputBytes prefers the caller, then the env, then the 32MB default", () => {
+  assert.equal(resolveMaxOutputBytes(1024, {}), 1024);
+  assert.equal(resolveMaxOutputBytes(null, { GROK_VERIFY_MAX_OUTPUT_BYTES: "2048" }), 2048);
+  assert.equal(resolveMaxOutputBytes("0", { GROK_VERIFY_MAX_OUTPUT_BYTES: "2048" }), 2048);
+  assert.equal(resolveMaxOutputBytes(undefined, { GROK_VERIFY_MAX_OUTPUT_BYTES: "junk" }), 32 * 1024 * 1024);
 });

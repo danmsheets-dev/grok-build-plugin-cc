@@ -10,6 +10,7 @@ import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import {
   generateJobId,
   listJobs,
+  resolveJobFile,
   resolveStateDir,
   upsertJob,
   writeJobFile
@@ -733,4 +734,106 @@ test("run-resume-candidate reports available after a completed run with thread i
   const payload = JSON.parse(candidate.stdout);
   assert.equal(payload.available, true);
   assert.ok(payload.candidate?.threadId);
+});
+
+test("--verify-timeout reaches the stored request under --background", () => {
+  // The background branch builds its own request object, so a value threaded
+  // only through the foreground path would silently do nothing here - and
+  // --background is exactly the mode a long Godot/Blender import runs in, i.e.
+  // the one the flag exists for.
+  const repo = makeTempDir("grok-verify-timeout-bg-");
+  const binDir = makeTempDir("grok-verify-timeout-bg-bin-");
+  const pluginDataDir = makeTempDir("grok-verify-timeout-bg-data-");
+  installFakeGrok(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run(
+    "node",
+    [
+      SCRIPT,
+      "run",
+      "--json",
+      "--background",
+      "--verify-timeout",
+      "1800",
+      "--baseline-timeout",
+      "1200",
+      "--verify-max-buffer",
+      "8",
+      "do something long"
+    ],
+    {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir)
+    }
+  );
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const launch = JSON.parse(result.stdout);
+  assert.ok(launch.jobId, "a background launch must report its job id");
+
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  try {
+    const record = JSON.parse(fs.readFileSync(resolveJobFile(repo, launch.jobId), "utf8"));
+    assert.equal(record.request.verifyTiming.timeoutMs, 1_800_000);
+    assert.equal(record.request.verifyTiming.baselineTimeoutMs, 1_200_000);
+    assert.equal(record.request.verifyTiming.maxOutputBytes, 8 * 1024 * 1024);
+    assert.equal(record.request.verifyTiming.sources.timeoutMs, "cli");
+  } finally {
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
+});
+
+test("an explicit --verify-timeout is what each verify command actually gets", () => {
+  // Not just plumbed into the request: read back out of it, applied per
+  // command in place of the derived baseline*4, and recorded so the run can
+  // later answer "what budget did this get, and who chose it?".
+  const repo = makeTempDir("grok-verify-timeout-fg-");
+  const binDir = makeTempDir("grok-verify-timeout-fg-bin-");
+  const pluginDataDir = makeTempDir("grok-verify-timeout-fg-data-");
+  installFakeGrok(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run(
+    "node",
+    [
+      SCRIPT,
+      "run",
+      "--json",
+      "--verify",
+      "node -e process.exit(0)",
+      "--verify-timeout",
+      "1800",
+      "--verify-max-buffer",
+      "2",
+      "do something"
+    ],
+    {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir)
+    }
+  );
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.verified, true);
+  assert.equal(payload.verify.timeouts.verifyTimeoutMs, 1_800_000);
+  assert.equal(payload.verify.timeouts.maxOutputBytes, 2 * 1024 * 1024);
+  assert.equal(payload.verify.timeouts.source, "explicit");
+  // Never lowered: the baseline probe is the one measurement the whole
+  // attribution story rests on.
+  assert.ok(payload.verify.timeouts.baselineTimeoutMs >= 900000);
+  assert.equal(payload.verify.results[0].timeoutMs, 1_800_000);
+  assert.equal(payload.verify.results[0].timeoutSource, "explicit");
 });

@@ -1,36 +1,48 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import path from "node:path";
 import test from "node:test";
 
+import { makeTempDir } from "./helpers.mjs";
+import { startHeartbeat } from "../plugins/grok-build/scripts/lib/tracked-jobs.mjs";
 import {
   classifyVerifyFailure,
   compareFailureSignatures,
   deriveVerifyTimeoutMs,
   normalizeFailureText,
   probeBaselines,
+  resolveVerifyMaxBufferBytes,
+  resolveVerifyTimeoutMs,
   runVerifyCommand,
   summarizeFailures
 } from "../plugins/grok-build/scripts/lib/verify.mjs";
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
 
 // On win32, cmd /d /s /c receives the whole command as one arg. Nested double
 // quotes in `node -e "..."` are mangled by CreateProcess quoting, so use
 // space-free -e scripts (single quotes are JS string delimiters, not shell).
 
-test("runVerifyCommand succeeds with a trivial node -e command", () => {
-  const result = runVerifyCommand("node -e process.exit(0)", process.cwd());
+test("runVerifyCommand succeeds with a trivial node -e command", async () => {
+  const result = await runVerifyCommand("node -e process.exit(0)", process.cwd());
   assert.equal(result.ok, true);
   assert.equal(result.exitCode, 0);
   assert.equal(result.timedOut, false);
 });
 
-test("runVerifyCommand reports non-zero exit", () => {
-  const result = runVerifyCommand("node -e process.exit(7)", process.cwd());
+test("runVerifyCommand reports non-zero exit", async () => {
+  const result = await runVerifyCommand("node -e process.exit(7)", process.cwd());
   assert.equal(result.ok, false);
   assert.equal(result.exitCode, 7);
   assert.equal(result.timedOut, false);
 });
 
-test("runVerifyCommand builds exit_code/stdout/stderr output shape", () => {
-  const result = runVerifyCommand(
+test("runVerifyCommand builds exit_code/stdout/stderr output shape", async () => {
+  const result = await runVerifyCommand(
     "node -e process.stdout.write('out-line');process.stderr.write('err-line');process.exit(1)",
     process.cwd()
   );
@@ -41,8 +53,8 @@ test("runVerifyCommand builds exit_code/stdout/stderr output shape", () => {
   assert.match(result.output, /stderr:\nerr-line/);
 });
 
-test("runVerifyCommand uses (no output) when stdout and stderr are empty", () => {
-  const result = runVerifyCommand("node -e process.exit(0)", process.cwd());
+test("runVerifyCommand uses (no output) when stdout and stderr are empty", async () => {
+  const result = await runVerifyCommand("node -e process.exit(0)", process.cwd());
   assert.equal(result.ok, true);
   assert.match(result.output, /exit_code: 0/);
   assert.match(result.output, /\(no output\)/);
@@ -140,21 +152,21 @@ test("deriveVerifyTimeoutMs returns floor for invalid baselines and scales/clamp
   assert.equal(deriveVerifyTimeoutMs(1_000_000), 900_000);
 });
 
-test("runVerifyCommand does not corrupt a command containing double quotes", () => {
+test("runVerifyCommand does not corrupt a command containing double quotes", async () => {
   // Regression: passing the command string as a plain argv element to cmd.exe
   // /d /s /c let Node apply its own escaping on top of the command's own
   // quotes, corrupting anything with an embedded double quote. Reproduced
   // directly before the fix: the process below received a truncated,
   // syntactically invalid script instead of the real one-liner.
-  const result = runVerifyCommand(`node -e "console.log('hello world')"`, process.cwd(), {
+  const result = await runVerifyCommand(`node -e "console.log('hello world')"`, process.cwd(), {
     timeoutMs: 10000
   });
   assert.equal(result.ok, true, `expected success, got: ${result.output}`);
   assert.match(result.output, /hello world/);
 });
 
-test("runVerifyCommand still reports a real failure inside a quoted command", () => {
-  const result = runVerifyCommand(`node -e "process.exit(1)"`, process.cwd(), {
+test("runVerifyCommand still reports a real failure inside a quoted command", async () => {
+  const result = await runVerifyCommand(`node -e "process.exit(1)"`, process.cwd(), {
     timeoutMs: 10000
   });
   assert.equal(result.ok, false);
@@ -162,13 +174,13 @@ test("runVerifyCommand still reports a real failure inside a quoted command", ()
   assert.doesNotMatch(result.output, /SyntaxError|Unterminated/);
 });
 
-test("runVerifyCommand actually enforces its timeout on a hung command", () => {
+test("runVerifyCommand actually enforces its timeout on a hung command", async () => {
   // Regression: the timeout option never reached spawnSync at all. A 300ms
   // budget let a 4-second command run to completion with timedOut:false -
   // any hung cargo test / pytest / npm test / Godot headless check would
   // have wedged the bridge worker forever.
   const start = Date.now();
-  const result = runVerifyCommand(`node -e "setTimeout(()=>{}, 4000)"`, process.cwd(), {
+  const result = await runVerifyCommand(`node -e "setTimeout(()=>{}, 4000)"`, process.cwd(), {
     timeoutMs: 300
   });
   const elapsed = Date.now() - start;
@@ -252,26 +264,63 @@ test("classifyVerifyFailure blames unextractable output when the baseline actual
   assert.equal(result.blamed, true);
 });
 
-test("runVerifyCommand labels an output-buffer overflow distinctly, not as a generic failure", () => {
-  // Regression: exceeding maxBuffer kills the process with no exit code, so
-  // there is no way to know whether the command was about to pass. A bare
-  // "Failed to run command" message sent the agent hunting for a code bug
-  // that never existed - the real cause is output volume.
-  const result = runVerifyCommand(
-    `node -e "for(let i=0;i<200000;i++){console.log('x'.repeat(100))}"`,
+test("runVerifyCommand keeps the head and tail of a 20MB firehose and still reports its exit code", async () => {
+  // Fixture change, deliberate (backlog item 6): this used to be the
+  // maxBuffer-overflow case, and it asserted bufferExceeded:true on this exact
+  // producer. With the head+tail ring there is no cliff left to hit - every
+  // byte is read, the middle is dropped, and the command's REAL exit code
+  // survives. That is the whole point: a command one line from passing used to
+  // be killed and reported as an infrastructure failure. The old classifier
+  // assertions live on in the two classifyVerifyFailure cases below and in the
+  // legacy-ENOBUFS case above, so nothing about the attribution story is lost.
+  const result = await runVerifyCommand(
+    `node -e "for(let i=0;i<200000;i++){console.log(i+' '+'x'.repeat(100))}"`,
     process.cwd(),
-    { timeoutMs: 15000 }
+    { timeoutMs: 60000, maxOutputBytes: 1024 * 1024 }
   );
+
+  assert.equal(result.ok, true, `expected the real exit code, got: ${result.output.slice(0, 400)}`);
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.timedOut, false);
+  assert.notEqual(result.bufferExceeded, true, "overflow is no longer a failure mode");
+  assert.ok(
+    result.output.length < 512 * 1024,
+    `expected a bounded capture, got ${result.output.length} bytes`
+  );
+  assert.ok(result.elidedBytes > 0, "expected the middle of the stream to be elided");
+  assert.match(result.output, /\.\.\.\[elided \d+ bytes of output\]\.\.\./);
+  assert.ok(result.output.includes(`\n0 ${"x".repeat(100)}`), "expected the first emitted line");
+  assert.ok(
+    result.output.includes(`199999 ${"x".repeat(100)}`),
+    "expected the last emitted line"
+  );
+});
+
+test("runVerifyCommand still labels a legacy maxBuffer overflow distinctly, not as a generic failure", async () => {
+  // The async runner cannot produce ENOBUFS, but an injected synchronous
+  // runCommand still can - and the message has to name the resolved limit and
+  // say plainly that this is not a code failure, or the agent goes hunting for
+  // a bug that does not exist. Hermetic: nothing is spawned.
+  const result = await runVerifyCommand("noisy-suite --verbose", process.cwd(), {
+    maxOutputBytes: 4096,
+    runCommandImpl: async () => ({
+      command: "sh",
+      args: [],
+      status: null,
+      signal: "SIGTERM",
+      stdout: "",
+      stderr: "",
+      error: Object.assign(new Error("stdout maxBuffer length exceeded"), { code: "ENOBUFS" })
+    })
+  });
+
   assert.equal(result.ok, false);
   assert.equal(result.bufferExceeded, true);
   assert.equal(result.timedOut, false);
-  assert.match(result.output, /exceeded the .* byte limit/);
+  assert.match(result.output, /exceeded the 4096 byte limit/);
   assert.doesNotMatch(result.output, /^Failed to run command/);
   assert.notEqual(result.commandNotFound, true, "an overflow is not a missing command");
 
-  // Extends this case rather than paying for a second 200k-line spawn: the
-  // flag has to survive all the way into the attribution decision, or the
-  // run still ends up blaming the agent for output volume.
   const classified = classifyVerifyFailure(
     { signature: [], rawCount: 0 },
     { ok: true, signature: [], rawCount: 0, timedOut: false },
@@ -282,22 +331,22 @@ test("runVerifyCommand labels an output-buffer overflow distinctly, not as a gen
   assert.equal(classified.infrastructure, true);
 });
 
-test("runVerifyCommand flags a command that cannot be started at all", () => {
+test("runVerifyCommand flags a command that cannot be started at all", async () => {
   // Regression: an unrunnable verify command looked like a plain non-zero
   // exit and was blamed on the agent. It cannot be detected from the exit
   // code - cmd.exe reports 1, not 9009, because the command is wrapped in
   // `cmd /d /s /c` - so assert on the flag, never on the code.
-  const result = runVerifyCommand("grok-build-nonexistent-binary-xyz --headless", process.cwd(), {
+  const result = await runVerifyCommand("grok-build-nonexistent-binary-xyz --headless", process.cwd(), {
     timeoutMs: 10000
   });
   assert.equal(result.ok, false);
   assert.equal(result.commandNotFound, true, `unexpected output: ${result.output}`);
 });
 
-test("runVerifyCommand does not mistake a compiler 'not found' diagnostic for a missing command", () => {
+test("runVerifyCommand does not mistake a compiler 'not found' diagnostic for a missing command", async () => {
   // The NOT_RUNNABLE patterns are anchored precisely so that ordinary tool
   // output mentioning "not found" mid-line stays a real code failure.
-  const result = runVerifyCommand(
+  const result = await runVerifyCommand(
     `node -e "console.log('error TS2307: Cannot find module x, command not found in registry');process.exit(2)"`,
     process.cwd(),
     { timeoutMs: 10000 }
@@ -307,11 +356,11 @@ test("runVerifyCommand does not mistake a compiler 'not found' diagnostic for a 
   assert.notEqual(result.commandNotFound, true);
 });
 
-test("runVerifyCommand does not flag a PASSING command that merely prints the not-recognized message", () => {
+test("runVerifyCommand does not flag a PASSING command that merely prints the not-recognized message", async () => {
   // A test suite asserting on cmd.exe's own wording, or a build that recovered
   // from a missing optional tool, still exits 0 - and nothing that failed to
   // start can exit 0, so the flag must stay off.
-  const result = runVerifyCommand(
+  const result = await runVerifyCommand(
     `node -e "console.log([String.fromCharCode(39),'nope',String.fromCharCode(39)].join('')+' is not recognized as an internal or external command')"`,
     process.cwd(),
     { timeoutMs: 10000 }
@@ -480,4 +529,133 @@ test("probeBaselines returns an empty list for an empty command list", () => {
   }).then((baselines) => {
     assert.deepEqual(baselines, []);
   });
+});
+
+test("a verify timeout kills the whole process tree, not just the shell", async () => {
+  // Regression: the timeout killed only the direct child, which is the
+  // `cmd /d /s /c` (or `/bin/sh -c`) wrapper - never the godot.exe /
+  // blender.exe underneath it. The engine kept running, kept the import lock,
+  // and kept burning the machine long after the run reported a timeout.
+  // Hermetic: node spawns node, no engine binary anywhere.
+  const dir = makeTempDir("grok-verify-orphan-");
+  const marker = path.join(dir, "grandchild.log");
+
+  fs.writeFileSync(
+    path.join(dir, "grandchild.mjs"),
+    [
+      "import fs from 'node:fs';",
+      `const marker = ${JSON.stringify(marker)};`,
+      // No escape sequences anywhere in these two fixtures: they are written
+      // out as source text, and an escape that survives one layer but not the
+      // other produces a syntax error the spawn silently swallows.
+      "setInterval(() => { fs.appendFileSync(marker, 'tick'); }, 100);",
+      // Self-destruct, so a regression in the tree kill cannot leave a
+      // permanent orphan behind on whatever machine ran the suite.
+      "setTimeout(() => process.exit(0), 10000);",
+      ""
+    ].join("\n")
+  );
+  fs.writeFileSync(
+    path.join(dir, "parent.mjs"),
+    [
+      "import { spawn } from 'node:child_process';",
+      "import path from 'node:path';",
+      "import { fileURLToPath } from 'node:url';",
+      "const here = path.dirname(fileURLToPath(import.meta.url));",
+      // stdio:'ignore' so the grandchild holds no pipe of ours: it has to be
+      // killed on its own merits, not merely stop being observed.
+      "spawn(process.execPath, [path.join(here, 'grandchild.mjs')], { detached: false, stdio: 'ignore' });",
+      "setTimeout(() => {}, 60000);",
+      ""
+    ].join("\n")
+  );
+
+  const started = Date.now();
+  const result = await runVerifyCommand(`node "${path.join(dir, "parent.mjs")}"`, dir, {
+    // 1500ms rather than the tighter budget this could use: on Windows the
+    // shell, the parent, and the grandchild are three process launches, and a
+    // loaded box must still reach the grandchild before the kill lands or the
+    // test proves nothing.
+    timeoutMs: 1500
+  });
+  assert.equal(result.timedOut, true);
+  assert.ok(
+    Date.now() - started < 8000,
+    "expected the timeout to be enforced near its budget, not to wait out the 60s parent"
+  );
+
+  await sleep(400);
+  const first = fs.existsSync(marker) ? fs.statSync(marker).size : 0;
+  assert.ok(first > 0, "the grandchild never wrote anything, so this test proves nothing");
+  await sleep(800);
+  const second = fs.statSync(marker).size;
+  // Deliberately no terminateProcessTree cleanup in a finally: the test never
+  // learns the grandchild's pid, which is precisely why the runner has to.
+  assert.equal(second, first, `the grandchild outlived its shell (${first} -> ${second} bytes)`);
+});
+
+test("the verify runner keeps a job heartbeat beating while a command runs", async () => {
+  // Regression: spawnSync blocked the event loop for the whole command, so
+  // startHeartbeat's interval could not fire - up to 900s x 4 attempts of
+  // total silence, during which /grok-build:runs showed a working run as
+  // having had no activity, i.e. dead. Exactly one beat used to land: the
+  // synchronous one startHeartbeat fires before its interval.
+  let beats = 0;
+  const stop = startHeartbeat(makeTempDir("grok-verify-heartbeat-"), "run-heartbeat", {
+    intervalMs: 50,
+    patchImpl: () => {
+      beats += 1;
+    }
+  });
+
+  try {
+    const result = await runVerifyCommand(`node -e "setTimeout(()=>{}, 1500)"`, process.cwd(), {
+      timeoutMs: 30000
+    });
+    assert.equal(result.ok, true, result.output);
+  } finally {
+    stop();
+  }
+
+  // Lenient on purpose: 1500ms at 50ms intervals is ~30 beats, and 5 is low
+  // enough that a loaded Windows box cannot flake while still being five times
+  // what the blocking runner could manage.
+  assert.ok(beats >= 5, `expected the heartbeat to keep firing during verify, got ${beats}`);
+});
+
+test("resolveVerifyTimeoutMs converts whole seconds and rejects anything unusable", () => {
+  // Unusable resolves to null rather than 0 so the value falls through to the
+  // next source in the precedence chain instead of overriding it with a
+  // timeout that would fire instantly.
+  assert.equal(resolveVerifyTimeoutMs("1800"), 1_800_000);
+  assert.equal(resolveVerifyTimeoutMs(2400), 2_400_000);
+  assert.equal(resolveVerifyTimeoutMs(""), null);
+  assert.equal(resolveVerifyTimeoutMs(null), null);
+  assert.equal(resolveVerifyTimeoutMs(undefined), null);
+  assert.equal(resolveVerifyTimeoutMs("-5"), null);
+  assert.equal(resolveVerifyTimeoutMs("0"), null);
+  assert.equal(resolveVerifyTimeoutMs("abc"), null);
+});
+
+test("resolveVerifyMaxBufferBytes converts megabytes and rejects anything unusable", () => {
+  assert.equal(resolveVerifyMaxBufferBytes("32"), 32 * 1024 * 1024);
+  assert.equal(resolveVerifyMaxBufferBytes(0.5), 512 * 1024);
+  assert.equal(resolveVerifyMaxBufferBytes(""), null);
+  assert.equal(resolveVerifyMaxBufferBytes(null), null);
+  assert.equal(resolveVerifyMaxBufferBytes("-1"), null);
+  assert.equal(resolveVerifyMaxBufferBytes("lots"), null);
+});
+
+test("deriveVerifyTimeoutMs honours an explicit cap and multiplier", () => {
+  // The cap is what --verify-timeout / verifyTimeoutMs exists to move: 15
+  // minutes is well under a cold Godot import on a large project.
+  assert.equal(deriveVerifyTimeoutMs(1_000_000, { capMs: 2_400_000 }), 2_400_000);
+  // ...and the default is untouched by the plumbing.
+  assert.equal(deriveVerifyTimeoutMs(600_000), 900_000);
+  // A raised cap is rarely the binding constraint on its own; the multiplier
+  // is what decides whether a 60s baseline gets 4 minutes or 10.
+  assert.equal(deriveVerifyTimeoutMs(60_000, { multiplier: 10 }), 600_000);
+  // A cap below the floor degrades to the floor rather than producing a
+  // timeout shorter than the minimum.
+  assert.equal(deriveVerifyTimeoutMs(500_000, { capMs: 1000 }), 120_000);
 });

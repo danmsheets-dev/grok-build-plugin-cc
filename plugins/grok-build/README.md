@@ -45,6 +45,12 @@ so a run cannot claim success without it having passed.
   (default 2).
 - A run whose verification never passes is reported **`completed-unverified`**, never as
   success.
+- A command that outlives its budget has its **whole process tree** killed, not just the
+  shell wrapping it — an orphaned `godot.exe` would otherwise keep the import lock. Raise the
+  budget with `--verify-timeout <seconds>` or `verifyTimeoutMs` in `.grok-build.json`.
+- A command that prints more than the output budget is **not** a failure: the first 64 KB and
+  the last 256 KB are kept, the middle is replaced by an `...[elided N bytes of output]...`
+  marker, and the command's real exit code is what counts.
 
 ### Where the verify plan comes from
 
@@ -106,6 +112,9 @@ clone cannot ship its own trust record, and any later edit to the file withdraws
 | `--verify <cmd>` | Command that must pass before the run counts as done (repeatable) |
 | `--verify-attempts <n>` | Fix-and-recheck cycles allowed (default 2) |
 | `--no-verify` | Run nothing, even when a config or ecosystem plan exists |
+| `--verify-timeout <seconds>` | Budget for each verify command. Used verbatim; without it the budget is derived from the measured baseline (4x, floored at 120s, capped at 900s) |
+| `--baseline-timeout <seconds>` | Budget for the pre-run baseline probe. Only ever raises the 900s default |
+| `--verify-max-buffer <megabytes>` | How much verify output to keep. Output over the budget is not an error: the head and tail are kept and the middle is elided |
 | `--no-isolate` | Edit the working tree directly instead of using a worktree |
 | `--max-duration <seconds>` | Stop the run after a wall-clock limit |
 | `--max-turns <n>` | Cap agent turns (passed through to the CLI) |

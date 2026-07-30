@@ -79,6 +79,8 @@ import {
   classifyVerifyFailure,
   deriveVerifyTimeoutMs,
   probeBaselines,
+  resolveVerifyMaxBufferBytes,
+  resolveVerifyTimeoutMs,
   runVerifyCommand,
   summarizeFailures
 } from "./lib/verify.mjs";
@@ -209,6 +211,16 @@ function cliSettingsFromTaskOptions(options = {}) {
     verify: options.verify === undefined ? undefined : normalizeVerifyCommands(options.verify),
     noVerify: Boolean(options["no-verify"]),
     verifyAttempts: options["verify-attempts"],
+    // The three CLI flags are typed in the units a human thinks in (seconds,
+    // megabytes) while the config keys they share a precedence chain with are
+    // stored in the units the runner uses. Converting here - rather than
+    // anywhere downstream - is what lets resolveRunSettings compare a CLI
+    // value against a config value at all, and an unusable value resolves to
+    // null so it falls through to the config instead of overriding it with
+    // nonsense.
+    verifyTimeoutMs: resolveVerifyTimeoutMs(options["verify-timeout"]),
+    baselineTimeoutMs: resolveVerifyTimeoutMs(options["baseline-timeout"]),
+    verifyMaxOutputBytes: resolveVerifyMaxBufferBytes(options["verify-max-buffer"]),
     maxDurationSeconds: options["max-duration"],
     maxTurns: options["max-turns"],
     maxCostUsd: options["max-cost"],
@@ -233,11 +245,17 @@ function buildVerifyPlanPayload({ projectConfig, ecosystem, settings }) {
     commands: settings.verify,
     source: settings.sources.verify,
     disabled: Boolean(settings.verifyDisabled),
-    // The no-baseline floor, which is what the first command of a run gets
-    // when the probe has nothing to say about it. Item 7 makes the floor,
-    // cap, and multiplier themselves resolvable; until then reporting the
-    // derived value is the honest number rather than the config's wish.
-    timeoutSeconds: Math.round(deriveVerifyTimeoutMs(null) / 1000),
+    // An explicit --verify-timeout / config verifyTimeoutMs is used verbatim;
+    // otherwise this is the no-baseline floor, which is what a command gets
+    // when the probe has nothing to say about it. The two are reported
+    // distinctly because "we will allow 40 minutes because you asked" and "we
+    // will allow 2 minutes until we have measured something" are different
+    // answers to the same question.
+    timeoutSeconds: Math.round(
+      (settings.verifyTimeoutMs ??
+        deriveVerifyTimeoutMs(null, { multiplier: settings.verifyTimeoutMultiplier })) / 1000
+    ),
+    timeoutSource: settings.verifyTimeoutMs != null ? (settings.sources.verifyTimeoutMs ?? "explicit") : "derived",
     trusted: projectConfig.present ? projectConfig.trusted : null,
     config: {
       present: projectConfig.present,
@@ -270,6 +288,59 @@ const VERIFY_INFRASTRUCTURE_NOTES = {
 function describeVerifyInfrastructureStop(entry) {
   const detail = VERIFY_INFRASTRUCTURE_NOTES[entry.attribution] ?? entry.attribution;
   return `${detail} (${entry.command})`;
+}
+
+/**
+ * The resolved verify timing budget, as it travels through a task request.
+ *
+ * Re-validated on the way out of the request rather than trusted, because a
+ * background run reads it back from a JSON file another process wrote: a
+ * corrupted or hand-edited record must degrade to the derived defaults, not
+ * hand a NaN to setTimeout (which fires immediately and would kill every
+ * verify command the instant it started).
+ *
+ * @param {unknown} raw
+ */
+function normalizeVerifyTiming(raw) {
+  const positive = (value) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  };
+  return {
+    timeoutMs: positive(raw?.timeoutMs),
+    multiplier: positive(raw?.multiplier),
+    baselineTimeoutMs: positive(raw?.baselineTimeoutMs),
+    maxOutputBytes: positive(raw?.maxOutputBytes),
+    sources: raw?.sources && typeof raw.sources === "object" ? raw.sources : {}
+  };
+}
+
+/**
+ * The per-attempt timeout for one verify command.
+ *
+ * An explicit budget is an explicit branch rather than a floor===cap trick, so
+ * the run record can say whether the number came from the user or from the
+ * measured baseline - and so an explicit value is honoured verbatim, above the
+ * 15-minute derived cap (raising that cap is the entire point of the flag) and
+ * below the 2-minute derived floor if that is genuinely what was asked for.
+ *
+ * @param {{ ms?: number }|undefined|null} baselineEntry
+ * @param {ReturnType<typeof normalizeVerifyTiming>} timing
+ * @returns {{ timeoutMs: number, source: "explicit"|"derived" }}
+ */
+function resolveVerifyAttemptTimeout(baselineEntry, timing) {
+  if (timing.timeoutMs != null) {
+    return { timeoutMs: timing.timeoutMs, source: "explicit" };
+  }
+  // No hardcoded fallback duration here: deriveVerifyTimeoutMs already returns
+  // its floor for a null/unmeasured baseline, and duplicating that number in
+  // the bridge is how the two drifted apart in the first place.
+  const baselineMs =
+    baselineEntry && Number.isFinite(baselineEntry.ms) ? baselineEntry.ms : null;
+  return {
+    timeoutMs: deriveVerifyTimeoutMs(baselineMs, { multiplier: timing.multiplier ?? undefined }),
+    source: "derived"
+  };
 }
 
 function resolveMaxDurationSeconds(raw) {
@@ -819,7 +890,15 @@ function renderVerifyPlan(payload) {
   } else if (payload.commands.length === 0) {
     lines.push("No verify commands resolved; a run would not verify anything.");
   } else {
-    lines.push(`Timeout per command (no baseline): ${payload.timeoutSeconds}s`, "", "Commands:");
+    // describeVerifySource is deliberately not reused here: its "cli" label is
+    // the string "--verify", which is the wrong flag to name for a timeout.
+    const timeoutOrigin =
+      payload.timeoutSource === "config"
+        ? ` (set by ${PROJECT_CONFIG_FILENAME})`
+        : payload.timeoutSource === "derived"
+          ? " (no baseline)"
+          : " (set by --verify-timeout)";
+    lines.push(`Timeout per command${timeoutOrigin}: ${payload.timeoutSeconds}s`, "", "Commands:");
     for (const command of payload.commands) {
       lines.push(`  ${command}`);
     }
@@ -847,7 +926,10 @@ function renderVerifyPlan(payload) {
  */
 async function handleVerifyPlan(argv) {
   const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "verify"],
+    // --verify-timeout is accepted here too so the reported timeoutSeconds can
+    // answer "what would THIS command line do", not just "what does the
+    // project default to".
+    valueOptions: ["cwd", "verify", "verify-timeout"],
     repeatableOptions: ["verify"],
     booleanOptions: ["json", "no-verify"]
   });
@@ -1306,6 +1388,12 @@ async function executeTaskRun(request) {
   // command list of its own). Purely descriptive - the plan is already baked
   // into verifyCommands by the time it gets here.
   const verifyPlan = request.verifyPlan ?? null;
+  // Resolved by handleTask from --verify-timeout / --baseline-timeout /
+  // --verify-max-buffer and the project config. Threaded through BOTH request
+  // shapes on purpose: a value that reached only the foreground path would
+  // silently do nothing under --background, which is exactly the long import
+  // the flags exist for.
+  const verifyTiming = normalizeVerifyTiming(request.verifyTiming);
   const maxDurationSeconds = resolveMaxDurationSeconds(request.maxDurationSeconds);
   const maxTurns = resolveMaxTurns(request.maxTurns);
   const maxCostUsd = resolveMaxCostUsd(request.maxCostUsd);
@@ -1350,6 +1438,14 @@ async function executeTaskRun(request) {
   // pass) and is reported in the run's status block rather than hidden.
   const shouldProbeBaselines =
     verifyCommands.length > 0 && !(write === false && verifyAttempts === 0);
+  // Only ever raised, never lowered: the generous default below is the floor
+  // for the one measurement the whole attribution story rests on, and a user
+  // who asked for more time for their engine's cold import meant the probe
+  // too.
+  const baselineTimeoutMs = Math.max(
+    BASELINE_PROBE_TIMEOUT_MS,
+    verifyTiming.baselineTimeoutMs ?? 0
+  );
   if (shouldProbeBaselines) {
     const probeStarted = Date.now();
     // A generous cap, not the derived per-attempt timeout: this is the ONLY
@@ -1361,7 +1457,11 @@ async function executeTaskRun(request) {
     // its real, pre-existing failures then looked "new" once the agent's
     // run finished, blaming it for something it never touched.
     baselines = await probeBaselines(verifyCommands, runCwd, {
-      timeoutMs: BASELINE_PROBE_TIMEOUT_MS
+      timeoutMs: baselineTimeoutMs,
+      // Must match what the post-agent pass gets: a baseline captured under a
+      // tighter output budget records a shorter signature, and every failure
+      // the fuller capture then finds looks new.
+      maxOutputBytes: verifyTiming.maxOutputBytes ?? undefined
     });
     baselineProbeMs = Date.now() - probeStarted;
   }
@@ -1429,16 +1529,26 @@ async function executeTaskRun(request) {
 
       for (const command of verifyCommands) {
         const baselineEntry = baselines.find((entry) => entry.command === command);
-        const baselineMs =
-          baselineEntry && Number.isFinite(baselineEntry.ms) ? baselineEntry.ms : 120000;
-        const timeoutMs = deriveVerifyTimeoutMs(baselineMs);
-        const outcome = runVerifyCommand(command, runCwd, { timeoutMs });
+        const { timeoutMs, source: timeoutSource } = resolveVerifyAttemptTimeout(
+          baselineEntry,
+          verifyTiming
+        );
+        const outcome = await runVerifyCommand(command, runCwd, {
+          timeoutMs,
+          maxOutputBytes: verifyTiming.maxOutputBytes ?? undefined
+        });
         const summary = summarizeFailures(outcome.output);
         const entryResult = {
           command,
           ok: outcome.ok,
           exitCode: outcome.exitCode,
           timedOut: outcome.timedOut,
+          // What this command was actually given, and whether that number was
+          // asked for or measured. A run that reports "timed out" is otherwise
+          // unanswerable after the fact: nothing recorded the budget.
+          timeoutMs,
+          timeoutSource,
+          elidedBytes: Number(outcome.elidedBytes) || 0,
           // These two used to be dropped on the floor by this fixed field
           // list, so a run that only failed because the command was killed
           // for output volume, or was never runnable, looked exactly like a
@@ -1632,6 +1742,17 @@ async function executeTaskRun(request) {
     // an unexplained delay.
     baselineProbeMs,
     baselines,
+    // The effective budget and where each half of it came from. `timeoutMs`
+    // null means every command derived its own from its baseline, which is
+    // recorded per result rather than here.
+    timeouts: {
+      verifyTimeoutMs: verifyTiming.timeoutMs,
+      verifyTimeoutMultiplier: verifyTiming.multiplier,
+      baselineTimeoutMs,
+      maxOutputBytes: verifyTiming.maxOutputBytes,
+      source: verifyTiming.timeoutMs != null ? "explicit" : "derived",
+      sources: verifyTiming.sources
+    },
     results: verifyResults
   };
 
@@ -1750,6 +1871,7 @@ function buildTaskRequest({
   isolate = false,
   verifyCommands = [],
   verifyPlan = null,
+  verifyTiming = null,
   verifyAttempts = 2,
   maxDurationSeconds = null,
   maxTurns = null,
@@ -1769,6 +1891,11 @@ function buildTaskRequest({
     // from. The commands themselves are already concrete by this point - the
     // worker resolves nothing.
     verifyPlan,
+    // Same reason, with teeth: --verify-timeout that reached only the
+    // foreground path would silently do nothing under --background, and
+    // --background is the delegate default for exactly the long-running
+    // imports the flag exists to survive.
+    verifyTiming,
     verifyAttempts,
     maxDurationSeconds,
     maxTurns,
@@ -1950,19 +2077,33 @@ async function handleReview(argv) {
   });
 }
 
+/**
+ * Exported so a test can parse a `run` command line through the REAL option
+ * table rather than a hand-copied one: a flag added here and forgotten there
+ * would be silently swallowed as a positional and folded into the prompt.
+ * parseCommandInput itself stays private.
+ */
+export const TASK_VALUE_OPTIONS = Object.freeze([
+  "model",
+  "effort",
+  "cwd",
+  "prompt-file",
+  "verify",
+  "verify-attempts",
+  // Seconds / seconds / megabytes, in the units a user types. The verify
+  // ceiling used to be a hardcoded 15 minutes with no way to move it, which is
+  // well under a cold Godot import on a large project.
+  "verify-timeout",
+  "baseline-timeout",
+  "verify-max-buffer",
+  "max-duration",
+  "max-turns",
+  "max-cost"
+]);
+
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: [
-      "model",
-      "effort",
-      "cwd",
-      "prompt-file",
-      "verify",
-      "verify-attempts",
-      "max-duration",
-      "max-turns",
-      "max-cost"
-    ],
+    valueOptions: [...TASK_VALUE_OPTIONS],
     repeatableOptions: ["verify"],
     booleanOptions: [
       "json",
@@ -2019,6 +2160,21 @@ async function handleTask(argv) {
     configTrusted: projectConfig.trusted,
     configWithheld: Object.keys(projectConfig.untrusted)
   };
+  // Already precedence-resolved (CLI flag > .grok-build.json), in the runner's
+  // units. `sources` is carried so the run record can say which layer set each
+  // one - "why did this get 40 minutes?" is otherwise unanswerable.
+  const verifyTiming = {
+    timeoutMs: settings.verifyTimeoutMs ?? null,
+    multiplier: settings.verifyTimeoutMultiplier ?? null,
+    baselineTimeoutMs: settings.baselineTimeoutMs ?? null,
+    maxOutputBytes: settings.verifyMaxOutputBytes ?? null,
+    sources: {
+      timeoutMs: settings.sources.verifyTimeoutMs ?? null,
+      multiplier: settings.sources.verifyTimeoutMultiplier ?? null,
+      baselineTimeoutMs: settings.sources.baselineTimeoutMs ?? null,
+      maxOutputBytes: settings.sources.verifyMaxOutputBytes ?? null
+    }
+  };
   const verifyAttempts = resolveVerifyAttempts(settings.verifyAttempts);
   const maxDurationSeconds = resolveMaxDurationSeconds(settings.maxDurationSeconds);
   const maxTurns = resolveMaxTurns(settings.maxTurns);
@@ -2046,6 +2202,7 @@ async function handleTask(argv) {
         isolate,
         verifyCommands,
         verifyPlan,
+        verifyTiming,
         verifyAttempts,
         maxDurationSeconds,
         maxTurns,
@@ -2072,6 +2229,7 @@ async function handleTask(argv) {
         isolate,
         verifyCommands,
         verifyPlan,
+        verifyTiming,
         verifyAttempts,
         maxDurationSeconds,
         maxTurns,

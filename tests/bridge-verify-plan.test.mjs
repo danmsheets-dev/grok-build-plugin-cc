@@ -244,3 +244,61 @@ test("doctor is quiet about a project with no config file", async () => {
   assert.equal(check.ok, true);
   assert.match(check.detail, /no \.grok-build\.json/);
 });
+
+test("--verify-timeout is reported by verify-plan instead of the derived floor", async () => {
+  // The plumbing's user-visible half: before item 7 the ceiling was a
+  // hardcoded 15 minutes and this line always read 120s, whatever the user or
+  // the project asked for.
+  const root = makeProject({ "project.godot": GODOT_PROJECT });
+
+  const derived = await runBridgeJson(["verify-plan", "--cwd", root]);
+  assert.equal(derived.timeoutSeconds, 120);
+  assert.equal(derived.timeoutSource, "derived");
+
+  const explicit = await runBridgeJson([
+    "verify-plan",
+    "--cwd",
+    root,
+    "--verify-timeout",
+    "2400"
+  ]);
+  assert.equal(explicit.timeoutSeconds, 2400, "an explicit budget is used verbatim, above the cap");
+  assert.equal(explicit.timeoutSource, "cli");
+
+  const rendered = await runBridge(["verify-plan", "--cwd", root, "--verify-timeout", "2400"]);
+  assert.match(rendered, /Timeout per command \(set by --verify-timeout\): 2400s/);
+});
+
+test("a trusted config's verifyTimeoutMs is honoured, and the CLI still outranks it", async () => {
+  const root = makeProject({
+    "project.godot": GODOT_PROJECT,
+    [PROJECT_CONFIG_FILENAME]: JSON.stringify({ verifyTimeoutMs: 1_800_000 })
+  });
+  const pluginDataDir = makeTempDir("grok-build-timeout-data-");
+
+  // verifyTimeoutMs is NOT an executable key, so it applies without trust -
+  // a number cannot run anything.
+  const fromConfig = await runBridgeJson(["verify-plan", "--cwd", root], { pluginDataDir });
+  assert.equal(fromConfig.timeoutSeconds, 1800);
+  assert.equal(fromConfig.timeoutSource, "config");
+
+  const fromCli = await runBridgeJson(
+    ["verify-plan", "--cwd", root, "--verify-timeout", "600"],
+    { pluginDataDir }
+  );
+  assert.equal(fromCli.timeoutSeconds, 600);
+  assert.equal(fromCli.timeoutSource, "cli");
+});
+
+test("an unusable --verify-timeout falls through to the config rather than overriding it", async () => {
+  // resolveVerifyTimeoutMs returns null for junk precisely so the next source
+  // in the chain still gets its turn; a 0 would have meant "kill every verify
+  // command the instant it starts".
+  const root = makeProject({
+    [PROJECT_CONFIG_FILENAME]: JSON.stringify({ verifyTimeoutMs: 300_000 })
+  });
+
+  const payload = await runBridgeJson(["verify-plan", "--cwd", root, "--verify-timeout", "abc"]);
+  assert.equal(payload.timeoutSeconds, 300);
+  assert.equal(payload.timeoutSource, "config");
+});
