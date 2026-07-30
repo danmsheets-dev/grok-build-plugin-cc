@@ -308,3 +308,25 @@ test("resolveMaxOutputBytes prefers the caller, then the env, then the 32MB defa
   assert.equal(resolveMaxOutputBytes("0", { GROK_VERIFY_MAX_OUTPUT_BYTES: "2048" }), 2048);
   assert.equal(resolveMaxOutputBytes(undefined, { GROK_VERIFY_MAX_OUTPUT_BYTES: "junk" }), 32 * 1024 * 1024);
 });
+
+test("runCommand restores spawnSync's own 1 MiB default when no budget is given", () => {
+  // The key used to be set unconditionally, so an absent `maxBuffer` reached
+  // spawnSync as an explicit `undefined` - which OVERRIDES the 1 MiB default
+  // rather than falling back to it, and the size check then compares against
+  // undefined and never fires. Every unbounded git call in the plugin was
+  // silently uncapped because of that one key; `land`'s diff was the one that
+  // materialized megabytes of it into a JSON payload.
+  const producer = "process.stdout.write('x'.repeat(2 * 1024 * 1024))";
+
+  const unbounded = runCommand("node", ["-e", producer]);
+  assert.equal(
+    /** @type {NodeJS.ErrnoException|null} */ (unbounded.error)?.code,
+    "ENOBUFS",
+    "2 MiB must not sail past an unspecified budget"
+  );
+
+  const explicit = runCommand("node", ["-e", producer], { maxBuffer: 4 * 1024 * 1024 });
+  assert.equal(explicit.error, null);
+  assert.equal(explicit.status, 0);
+  assert.equal(explicit.stdout.length, 2 * 1024 * 1024);
+});

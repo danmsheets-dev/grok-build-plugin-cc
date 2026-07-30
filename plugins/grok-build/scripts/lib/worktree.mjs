@@ -102,7 +102,94 @@ export function resolveWorktreePath(runId, options = {}) {
 }
 
 /**
+ * Free space a worktree checkout is required to have available before git is
+ * allowed to start writing one.
+ *
+ * Deliberately a flat floor rather than a per-repo estimate. The obvious
+ * estimate - `git ls-tree -r --long HEAD` summed - is itself a full tree walk
+ * on exactly the tens-of-GB repositories it would be protecting, and it
+ * undercounts LFS pointers by orders of magnitude, so the number printed would
+ * be most wrong on the repos the warning exists for. What this catches is the
+ * common case: a disk that is essentially full, where git otherwise fails
+ * halfway through the checkout and leaves an opaque stderr behind a partial
+ * worktree directory.
+ */
+const MIN_WORKTREE_FREE_BYTES = 512 * 1024 * 1024;
+const MIN_WORKTREE_FREE_BYTES_ENV = "GROK_BUILD_MIN_FREE_BYTES";
+
+function formatBytes(bytes) {
+  const value = Number(bytes);
+  if (!Number.isFinite(value) || value < 0) {
+    return "unknown";
+  }
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let index = 0;
+  let scaled = value;
+  while (scaled >= 1024 && index < units.length - 1) {
+    scaled /= 1024;
+    index += 1;
+  }
+  return `${index === 0 ? scaled : scaled.toFixed(1)} ${units[index]}`;
+}
+
+function resolveMinFreeBytes(env) {
+  const raw = Number(env?.[MIN_WORKTREE_FREE_BYTES_ENV]);
+  if (Number.isFinite(raw) && raw >= 0) {
+    return Math.floor(raw);
+  }
+  return MIN_WORKTREE_FREE_BYTES;
+}
+
+/**
+ * Throw before `git worktree add` if the target volume is out of room.
+ *
+ * Never throws for its own failure: `statfsSync` is unsupported on some remote
+ * and virtualised filesystems, and refusing to run there would be a far worse
+ * regression than the opaque git error this replaces. An unreadable volume
+ * simply skips the check.
+ *
+ * @param {string} parentDir directory the worktree will be created inside
+ * @param {(dir: string) => {bsize: number, bavail: number}} statfsImpl
+ * @param {NodeJS.ProcessEnv} env
+ */
+function assertFreeSpaceForWorktree(parentDir, statfsImpl, env) {
+  const required = resolveMinFreeBytes(env);
+  if (required <= 0) {
+    return;
+  }
+
+  let stats;
+  try {
+    stats = statfsImpl(parentDir);
+  } catch {
+    return;
+  }
+
+  const blockSize = Number(stats?.bsize);
+  const availableBlocks = Number(stats?.bavail);
+  if (!Number.isFinite(blockSize) || !Number.isFinite(availableBlocks)) {
+    return;
+  }
+
+  const available = blockSize * availableBlocks;
+  if (available >= required) {
+    return;
+  }
+
+  // `path.parse().root` is the drive on win32 ("H:\\") and "/" on POSIX -
+  // the unit the user actually has to free space on, not the temp subdir.
+  const volume = path.parse(path.resolve(parentDir)).root || parentDir;
+  throw new Error(
+    `Not enough free space on ${volume} to create a worktree: need ~${formatBytes(required)}, have ${formatBytes(available)}. ` +
+      `Free some space, or run without isolation (--no-isolate).`
+  );
+}
+
+/**
  * Create a worktree for a run.
+ *
+ * `statfsImpl`/`gitImpl` exist so the free-space precheck can be tested without
+ * a full disk. They are seams, not configuration: production passes neither.
  *
  * @param {object} options
  * @param {string} options.cwd - source repository cwd
@@ -110,8 +197,18 @@ export function resolveWorktreePath(runId, options = {}) {
  * @param {string} [options.baseRef] - defaults to HEAD
  * @param {string} [options.dataDir]
  * @param {NodeJS.ProcessEnv} [options.env]
+ * @param {typeof fs.statfsSync} [options.statfsImpl]
+ * @param {typeof git} [options.gitImpl]
  */
-export function createWorktree({ cwd, runId, baseRef = "HEAD", dataDir, env }) {
+export function createWorktree({
+  cwd,
+  runId,
+  baseRef = "HEAD",
+  dataDir,
+  env,
+  statfsImpl = fs.statfsSync,
+  gitImpl = git
+}) {
   const repoRoot = ensureGitRepository(cwd);
   if (!runId) {
     throw new Error("runId is required");
@@ -127,10 +224,15 @@ export function createWorktree({ cwd, runId, baseRef = "HEAD", dataDir, env }) {
     throw new Error(`Worktree path already exists: ${worktreePath}`);
   }
 
-  const result = git(repoRoot, ["worktree", "add", "-b", branchName, worktreePath, baseSha]);
+  // After the mkdir so the directory being measured exists, and before the
+  // first git write so a full disk costs a clear message instead of a partial
+  // checkout plus `Failed to create worktree: <git stderr>`.
+  assertFreeSpaceForWorktree(path.dirname(worktreePath), statfsImpl, env ?? process.env);
+
+  const result = gitImpl(repoRoot, ["worktree", "add", "-b", branchName, worktreePath, baseSha]);
   if (result.status !== 0) {
     // Branch may already exist from a crashed run — try without -b
-    const retry = git(repoRoot, ["worktree", "add", worktreePath, branchName]);
+    const retry = gitImpl(repoRoot, ["worktree", "add", worktreePath, branchName]);
     if (retry.status !== 0) {
       const combined = [result.stderr, result.stdout, retry.stderr, retry.stdout]
         .map((s) => (s || "").trim())

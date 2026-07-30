@@ -364,6 +364,60 @@ test("renderTaskResult stays quiet about the commit when there was no commit err
   assert.doesNotMatch(output, /could not commit/);
 });
 
+test("renderTaskResult warns that a linked .godot is shared with the working copy", () => {
+  // The README promises writes reach the real directories; nothing said it at
+  // the moment it matters, which is when a Godot editor is open on the same
+  // import cache a headless verify run is about to reimport into.
+  const output = renderTaskResult(
+    { rawOutput: "Did the work." },
+    {
+      title: "Grok Build Delegate",
+      provision: {
+        provisioned: [{ name: ".godot", kind: "junction" }],
+        failed: [],
+        notes: [".godot is shared with your working copy; close the Godot editor before running verify."]
+      }
+    }
+  );
+  assert.match(output, /Provisioning: \.godot is shared with your working copy/);
+  assert.match(output, /close the Godot editor/);
+});
+
+test("renderTaskResult names a provisioning failure and words the tracked-cache case correctly", () => {
+  // "destination already exists" is fs's wording for a directory that is
+  // TRACKED IN GIT and was therefore already checked out - stale but present,
+  // not absent, so "the first verify runs a cold import" would be wrong.
+  const output = renderTaskResult(
+    { rawOutput: "Did the work." },
+    {
+      title: "Grok Build Delegate",
+      provision: {
+        provisioned: [],
+        failed: [
+          { name: ".godot", reason: "destination already exists" },
+          { name: ".venv", reason: "EPERM: operation not permitted, symlink" }
+        ],
+        notes: []
+      }
+    }
+  );
+  assert.match(output, /Provisioning skipped: \.godot \(already present in the worktree - it is tracked in git\)\./);
+  assert.doesNotMatch(output, /cold import/);
+  // A reason that is a genuine failure is reported verbatim.
+  assert.match(output, /Provisioning skipped: \.venv \(EPERM: operation not permitted, symlink\)\./);
+});
+
+test("renderTaskResult says nothing about provisioning when there is nothing to say", () => {
+  const output = renderTaskResult(
+    { rawOutput: "Did the work." },
+    {
+      title: "Grok Build Delegate",
+      provision: { provisioned: [{ name: "node_modules", kind: "junction" }], failed: [], notes: [] }
+    }
+  );
+  assert.doesNotMatch(output, /Provisioning/);
+});
+
 test("renderTaskResult surfaces a budget stop", () => {
   const output = renderTaskResult(
     { rawOutput: "Partial work done." },

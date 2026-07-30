@@ -136,6 +136,22 @@ function normalizeTools(raw) {
 }
 
 /**
+ * `provision` only carries the import-cache tier today.
+ *
+ * `copy: true` is the opt-out from sharing Godot's `.godot`/`.import` with the
+ * working copy - the same switch as GROK_BUILD_LINK_GODOT_CACHE=0, expressed
+ * per project. Deliberately NOT an executable key: it changes which files are
+ * copied into a worktree, and executes nothing.
+ */
+function normalizeProvision(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return undefined;
+  }
+  const copy = normalizeBoolean(raw.copy);
+  return copy === undefined ? undefined : { copy };
+}
+
+/**
  * Schema v1. Every key is optional; `executable` marks the ones the trust gate
  * withholds. The `expected` text is what a user sees when their value is the
  * wrong shape, so it names the shape, not the type name.
@@ -156,6 +172,7 @@ const SCHEMA = Object.freeze({
   verifyIgnorePatterns: { normalize: normalizeStringArray, expected: "an array of regex strings" },
   isolate: { normalize: normalizeBoolean, expected: "true or false" },
   linkDirs: { normalize: normalizeStringArray, expected: "an array of directory names" },
+  provision: { normalize: normalizeProvision, expected: "an object with a boolean copy" },
   artifactExcludes: { normalize: normalizeStringArray, expected: "an array of pathspec strings" },
   maxDurationSeconds: { normalize: normalizePositiveNumber, expected: "a positive number of seconds" },
   maxTurns: { normalize: normalizePositiveInteger, expected: "an integer >= 1" },

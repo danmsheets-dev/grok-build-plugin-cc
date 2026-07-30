@@ -241,3 +241,29 @@ test("every command file is documented in the plugin README", () => {
     assert.match(readme, new RegExp(`/grok-build:${command}\\b`), `README is missing /grok-build:${command}`);
   }
 });
+
+test("the README warns about the shared Godot cache and names the opt-out", () => {
+  const readme = fs.readFileSync(path.join(PLUGIN_ROOT, "README.md"), "utf8");
+
+  // The link is the default and stays the default, so the hazard it creates -
+  // an open Godot editor writing the same import cache a headless run is
+  // reimporting into - has to be said where the linking is described.
+  assert.match(readme, /close the Godot editor/i);
+  assert.match(readme, /GROK_BUILD_LINK_GODOT_CACHE=0/);
+  assert.match(readme, /"provision": \{"copy": true\}/);
+  assert.match(
+    readme,
+    /`\.godot\/imported` is never copied/,
+    "the reason the default is a link, not a copy"
+  );
+});
+
+test("the README tells the truth about a conflicted land", () => {
+  const readme = fs.readFileSync(path.join(PLUGIN_ROOT, "README.md"), "utf8");
+
+  // `git merge --abort` is the recovery every user reaches for and it exits
+  // 128 here, because --squash writes no MERGE_HEAD.
+  assert.match(readme, /rolls the repository\s+back to HEAD/i);
+  assert.match(readme, /merge --abort` does not work here/);
+  assert.match(readme, /--discard/);
+});

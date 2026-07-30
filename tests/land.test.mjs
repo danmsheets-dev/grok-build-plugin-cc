@@ -8,6 +8,7 @@ import { buildEnv, installFakeGrok } from "./fake-grok-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import {
   generateJobId,
+  resolveJobFile,
   upsertJob,
   writeJobFile
 } from "../plugins/grok-build/scripts/lib/state.mjs";
@@ -503,6 +504,175 @@ test("landing a job twice gives a clean error on the second call, not a raw git 
     assert.notEqual(second.status, 0);
     assert.match(`${second.stdout}${second.stderr}`, /has no worktree to land/i);
     assert.doesNotMatch(`${second.stdout}${second.stderr}`, /fatal:|unknown revision/i);
+  } finally {
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
+});
+
+test("a binary merge conflict rolls the repository back instead of leaving it mid-merge", () => {
+  // Binary files cannot be content-merged, so any asset touched on both sides
+  // conflicts deterministically. Without the rollback, git leaves conflict
+  // markers in the index, the worktree and branch are never cleaned up, the job
+  // is never marked landed - and the recovery every user reaches for fails:
+  // `--squash` writes no MERGE_HEAD, so `git merge --abort` exits 128 with
+  // "There is no merge to abort".
+  const repo = makeTempDir("grok-land-conflict-");
+  const binDir = makeTempDir("grok-land-conflict-bin-");
+  const pluginDataDir = makeTempDir("grok-land-conflict-data-");
+  installFakeGrok(binDir);
+  seedRepo(repo);
+
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  try {
+    // NUL bytes are what make git treat it as binary; nothing else here does.
+    const asset = (marker) => Buffer.from(`${marker}\u0000\u0001\u0002 payload\n`, "binary");
+    fs.writeFileSync(path.join(repo, "asset.bin"), asset("BASE"));
+    run("git", ["add", "asset.bin"], { cwd: repo });
+    run("git", ["commit", "-m", "add binary asset"], { cwd: repo });
+
+    const jobId = generateJobId("run");
+    const created = createWorktree({ cwd: repo, runId: jobId, dataDir: pluginDataDir });
+    fs.writeFileSync(path.join(created.worktreePath, "asset.bin"), asset("AGENT"));
+    run("git", ["commit", "-am", "agent rewrote the asset"], { cwd: created.worktreePath });
+
+    seedFinishedJob(repo, pluginDataDir, {
+      id: jobId,
+      worktree: {
+        path: created.worktreePath,
+        branch: created.branchName,
+        baseSha: created.baseSha
+      }
+    });
+
+    // The other side of the conflict: the same asset, rewritten on main.
+    fs.writeFileSync(path.join(repo, "asset.bin"), asset("HUMAN"));
+    run("git", ["commit", "-am", "human rewrote the asset"], { cwd: repo });
+    const headBefore = run("git", ["rev-parse", "HEAD"], { cwd: repo }).stdout.trim();
+
+    const result = run("node", [SCRIPT, "land", jobId], {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir)
+    });
+
+    const combined = `${result.stderr}\n${result.stdout}`;
+    assert.notEqual(result.status, 0, combined);
+    assert.match(combined, /asset\.bin/);
+    assert.match(combined, /binary/i, "a binary conflict must be labelled as one");
+    // `git merge --abort` is the recovery every user reaches for and it fails
+    // here (exit 128, "There is no merge to abort"), so the message warns
+    // against it rather than staying silent - but it must never appear as an
+    // instruction. Every occurrence has to be the negated one.
+    assert.match(combined, /Do NOT run git merge --abort/);
+    assert.equal(
+      (combined.match(/merge --abort/g) ?? []).length,
+      (combined.match(/Do NOT run git merge --abort/g) ?? []).length,
+      "every mention of merge --abort must be the warning, never a suggestion"
+    );
+    assert.match(combined, new RegExp(`land ${jobId} --discard`));
+    assert.match(combined, /--ours|--theirs/);
+
+    // (b) the repository is back exactly where it was, with nothing staged.
+    assert.equal(run("git", ["status", "--porcelain"], { cwd: repo }).stdout.trim(), "");
+    assert.equal(run("git", ["rev-parse", "HEAD"], { cwd: repo }).stdout.trim(), headBefore);
+    // (c) reset --hard clears the squash state on its own - nothing inside
+    // .git is hand-deleted.
+    for (const leftover of ["SQUASH_MSG", "MERGE_MSG", "AUTO_MERGE"]) {
+      assert.equal(
+        fs.existsSync(path.join(repo, ".git", leftover)),
+        false,
+        `.git/${leftover} must not survive the rollback`
+      );
+    }
+
+    // (d) + (e): the run is still recoverable, so --discard still has something
+    // to discard.
+    assert.equal(fs.existsSync(created.worktreePath), true);
+    assert.match(
+      run("git", ["branch", "--list", created.branchName], { cwd: repo }).stdout,
+      /grok-build\//
+    );
+    const stored = JSON.parse(fs.readFileSync(resolveJobFile(repo, jobId), "utf8"));
+    assert.ok(stored.worktree, "the job must still carry its worktree descriptor");
+    assert.equal(stored.worktree.branch, created.branchName);
+  } finally {
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
+});
+
+test("land bounds the preview diff and never materializes it on the apply path", () => {
+  // The diff used to be read before the --preview branch, so the apply path
+  // paid for a string it discarded - and with no cap at all, because passing
+  // maxBuffer:undefined to spawnSync overrides its 1 MiB default rather than
+  // falling back to it.
+  const repo = makeTempDir("grok-land-bigdiff-");
+  const binDir = makeTempDir("grok-land-bigdiff-bin-");
+  const pluginDataDir = makeTempDir("grok-land-bigdiff-data-");
+  installFakeGrok(binDir);
+  seedRepo(repo);
+
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  try {
+    const jobId = generateJobId("run");
+    const created = createWorktree({ cwd: repo, runId: jobId, dataDir: pluginDataDir });
+    // ~300 KB of added text: comfortably past the 128 KB preview budget.
+    const body = Array.from({ length: 6000 }, (_, i) => `line ${i} ${"x".repeat(40)}`).join("\n");
+    fs.writeFileSync(path.join(created.worktreePath, "big.txt"), `${body}\n`);
+    // One binary file alongside it, for the aggregate count.
+    fs.writeFileSync(
+      path.join(created.worktreePath, "tex.bin"),
+      Buffer.from("\u0000\u0001\u0002binary texture\n", "binary")
+    );
+    run("git", ["add", "-A"], { cwd: created.worktreePath });
+    run("git", ["commit", "-m", "agent wrote a lot"], { cwd: created.worktreePath });
+
+    seedFinishedJob(repo, pluginDataDir, {
+      id: jobId,
+      worktree: {
+        path: created.worktreePath,
+        branch: created.branchName,
+        baseSha: created.baseSha
+      }
+    });
+
+    const preview = run("node", [SCRIPT, "land", jobId, "--preview", "--json"], {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir)
+    });
+    assert.equal(preview.status, 0, preview.stderr || preview.stdout);
+    const previewPayload = JSON.parse(preview.stdout);
+    assert.equal(previewPayload.diff, null, "an oversized diff must not be materialized");
+    assert.match(previewPayload.diffOmitted, /diff omitted: exceeds 128 KB/);
+    assert.match(previewPayload.diffOmitted, new RegExp(`git diff ${created.baseSha}\.\.`));
+    assert.match(previewPayload.diffStat, /big\.txt/, "the stat is what survives the cap");
+    assert.equal(previewPayload.totalBinaryFiles, 1);
+
+    const applied = run("node", [SCRIPT, "land", jobId, "--json"], {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir)
+    });
+    assert.equal(applied.status, 0, applied.stderr || applied.stdout);
+    const applyPayload = JSON.parse(applied.stdout);
+    assert.equal(applyPayload.action, "apply");
+    assert.equal(
+      applyPayload.diff,
+      undefined,
+      "the apply path must not compute a diff body at all"
+    );
+    assert.equal(applyPayload.totalBinaryFiles, 1);
+    assert.match(applyPayload.diffStat, /big\.txt/);
+    const staged = run("git", ["diff", "--cached", "--name-only"], { cwd: repo });
+    assert.match(staged.stdout, /big\.txt/);
+    assert.match(staged.stdout, /tex\.bin/);
   } finally {
     if (previous == null) {
       delete process.env.CLAUDE_PLUGIN_DATA;

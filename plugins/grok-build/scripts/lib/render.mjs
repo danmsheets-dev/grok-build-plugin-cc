@@ -470,6 +470,42 @@ function pushVerifyPlanLines(lines, meta) {
   }
 }
 
+/**
+ * What the isolated worktree was seeded with, and what it was not.
+ *
+ * Two things have to reach the user here. The mandatory one is the shared-cache
+ * warning carried in `notes`: `.godot` is junctioned straight from the working
+ * copy, so a Godot editor left open on the same project is writing into the
+ * cache a headless verify run is reading. The other is a failed link, which is
+ * silent otherwise and shows up only as a run that is inexplicably slow.
+ */
+function pushProvisionLines(lines, provision) {
+  if (!provision || typeof provision !== "object") {
+    return;
+  }
+
+  for (const note of Array.isArray(provision.notes) ? provision.notes : []) {
+    const text = String(note ?? "").trim();
+    if (text) {
+      lines.push(`Provisioning: ${text}`);
+    }
+  }
+
+  for (const entry of Array.isArray(provision.failed) ? provision.failed : []) {
+    const name = String(entry?.name ?? "").trim() || "unknown";
+    const reason = String(entry?.reason ?? "").trim();
+    // "destination already exists" is fs's wording for a case that is not an
+    // error at all: the directory is TRACKED IN GIT, so `git worktree add`
+    // already checked it out. Note that it is stale-but-present, not absent -
+    // saying "the first verify will run a cold import" would be wrong.
+    lines.push(
+      reason === "destination already exists"
+        ? `Provisioning skipped: ${name} (already present in the worktree - it is tracked in git).`
+        : `Provisioning skipped: ${name}${reason ? ` (${reason})` : ""}.`
+    );
+  }
+}
+
 function buildTaskStatusLines(meta = {}) {
   const lines = [];
 
@@ -504,6 +540,8 @@ function buildTaskStatusLines(meta = {}) {
         : "Verified: no - verification did not pass within the attempt budget."
     );
   }
+
+  pushProvisionLines(lines, meta.provision);
 
   if (meta.worktree?.path) {
     lines.push(`Worktree: ${meta.worktree.path} (branch ${meta.worktree.branch ?? "unknown"})`);

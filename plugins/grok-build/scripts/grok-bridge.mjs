@@ -63,7 +63,7 @@ import {
   upsertJob,
   writeJobFile
 } from "./lib/state.mjs";
-import { redactSecretsDeep } from "./lib/redact.mjs";
+import { redactSecrets, redactSecretsDeep } from "./lib/redact.mjs";
 import {
   appendLogLine,
   createJobLogFile,
@@ -113,6 +113,18 @@ const VALID_REASONING_EFFORTS = new Set(["low", "medium", "high"]);
 // before the agent ran. A tight cap here silently produced an empty baseline
 // on a slow cold build, misattributing every pre-existing failure to the run.
 const BASELINE_PROBE_TIMEOUT_MS = 900000;
+
+// `land --preview` materialises the whole diff into a string, into a JSON
+// payload, and then into a terminal. 128 KB is already more than anyone reads;
+// past that the useful artefact is `diffStat` plus the command to run. The
+// worktree's own diff is not bounded by anything else - a single re-imported
+// Godot texture or a re-saved .blend is megabytes on its own.
+const PREVIEW_DIFF_MAX_BYTES = 128 * 1024;
+// `--stat` output is one short line per changed file, so this is only a guard
+// against a pathological change set (thousands of Godot sidecars), not a
+// budget anyone should hit. Explicit because runCommand no longer leaves the
+// key unset - see the maxBuffer note in process.mjs.
+const DIFF_STAT_MAX_BYTES = 1024 * 1024;
 
 // Terminal statuses whose worktree may still hold real, unlanded commits
 // worth protecting from prune/doctor. Confirmed by direct reproduction: a
@@ -596,6 +608,33 @@ function shorten(text, limit = 96) {
     return normalized;
   }
   return `${normalized.slice(0, limit - 3)}...`;
+}
+
+/**
+ * Reduce a provisionWorktree result to something safe to persist in a job file.
+ *
+ * Paths are collapsed to basenames on purpose: the full `from`/`to` pair leaks
+ * the user's filesystem layout into a JSON file the delegate subagent reads
+ * back, and the basename is the only part that identifies WHICH dependency
+ * directory this was. `failed[].reason` is a raw `error.message` straight out
+ * of fs (provision.mjs), so it can carry an absolute path or, on a networked
+ * mount, a credentialed URL - redact and shorten it before it lands anywhere.
+ *
+ * @param {{provisioned: Array<object>, failed: Array<object>, notes: string[]}} result
+ */
+function summarizeProvisionResult(result) {
+  const nameOf = (entry) => path.basename(String(entry?.to || entry?.from || "")) || "unknown";
+  return {
+    provisioned: (result?.provisioned ?? []).map((entry) => ({
+      name: nameOf(entry),
+      kind: entry.kind ?? null
+    })),
+    failed: (result?.failed ?? []).map((entry) => ({
+      name: nameOf(entry),
+      reason: shorten(redactSecrets(String(entry?.reason ?? "unknown")), 160)
+    })),
+    notes: (result?.notes ?? []).map((note) => String(note))
+  };
 }
 
 function firstMeaningfulLine(text, fallback) {
@@ -1436,6 +1475,8 @@ async function executeTaskRun(request) {
 
   let created = null;
   let runCwd = workspaceRoot;
+  /** @type {{provisioned: Array<{name: string, kind: string}>, failed: Array<{name: string, reason: string}>, notes: string[]}|null} */
+  let provisionSummary = null;
   if (isolate && write) {
     created = createWorktree({ cwd: workspaceRoot, runId: request.jobId });
     // Persist worktree descriptor immediately so cancel/crash cannot orphan it
@@ -1449,8 +1490,22 @@ async function executeTaskRun(request) {
         }
       });
     }
-    const plan = planWorktreeLinks(created.repoRoot, created.worktreePath);
-    provisionWorktree(plan);
+    const plan = planWorktreeLinks(created.repoRoot, created.worktreePath, {
+      // Only ever true/false when the project config said so; undefined lets
+      // GROK_BUILD_LINK_GODOT_CACHE decide, which is the documented default
+      // path and the one a background worker inherits through its environment.
+      copyGodotCache: request.provisionCopy
+    });
+    // The result used to be discarded outright, so a link that failed - the
+    // commonest being a `.godot` that is tracked in git and therefore already
+    // checked out into the worktree - was invisible, and the run just got
+    // mysteriously slower.
+    provisionSummary = summarizeProvisionResult(provisionWorktree(plan));
+    // A SECOND patch: the one above fires before planning even starts, so the
+    // summary has nowhere to attach there.
+    if (request.jobId) {
+      patchJobIfActive(workspaceRoot, request.jobId, { provision: provisionSummary });
+    }
     runCwd = created.worktreePath;
   }
 
@@ -1841,6 +1896,7 @@ async function executeTaskRun(request) {
           baselineProbeMs,
           baselineProbeCommands: baselines.length,
           worktree,
+          provision: provisionSummary,
           budgetStopped
         }
       );
@@ -1894,6 +1950,9 @@ async function executeTaskRun(request) {
     rawOutput,
     verified,
     worktree,
+    // What the worktree was seeded with, and what could not be. Null on a
+    // non-isolated run, where there is nothing to provision.
+    provision: provisionSummary,
     grokVersion,
     verify,
     budget,
@@ -1996,6 +2055,7 @@ function buildTaskRequest({
   verifyFailurePatterns = [],
   verifyIgnorePatterns = [],
   noVerifyBaseline = false,
+  provisionCopy = undefined,
   maxDurationSeconds = null,
   maxTurns = null,
   maxCostUsd = null
@@ -2026,6 +2086,10 @@ function buildTaskRequest({
     verifyFailurePatterns,
     verifyIgnorePatterns,
     noVerifyBaseline,
+    // The Godot import-cache tier, from `provision.copy` in .grok-build.json.
+    // Left undefined when the project said nothing, so planWorktreeLinks can
+    // still fall back to GROK_BUILD_LINK_GODOT_CACHE.
+    provisionCopy,
     maxDurationSeconds,
     maxTurns,
     maxCostUsd
@@ -2321,6 +2385,10 @@ async function handleTask(argv) {
   const verifyFailurePatterns = settings.verifyFailurePatterns ?? [];
   const verifyIgnorePatterns = settings.verifyIgnorePatterns ?? [];
   const noVerifyBaseline = Boolean(options["no-verify-baseline"]);
+  // undefined, not false, when the project said nothing: planWorktreeLinks
+  // falls back to GROK_BUILD_LINK_GODOT_CACHE only when the option is absent,
+  // so a default of false would silently shadow the environment variable.
+  const provisionCopy = settings.provision?.copy;
   const maxDurationSeconds = resolveMaxDurationSeconds(settings.maxDurationSeconds);
   const maxTurns = resolveMaxTurns(settings.maxTurns);
   const maxCostUsd = resolveMaxCostUsd(settings.maxCostUsd);
@@ -2352,6 +2420,7 @@ async function handleTask(argv) {
         verifyFailurePatterns,
         verifyIgnorePatterns,
         noVerifyBaseline,
+        provisionCopy,
         maxDurationSeconds,
         maxTurns,
         maxCostUsd
@@ -2382,6 +2451,7 @@ async function handleTask(argv) {
         verifyFailurePatterns,
         verifyIgnorePatterns,
         noVerifyBaseline,
+        provisionCopy,
         maxDurationSeconds,
         maxTurns,
         maxCostUsd,
@@ -2423,6 +2493,135 @@ function describeIgnoredDirtyArtifacts(repoRoot, filteredDirtyFiles) {
   }
   const kept = new Set(filteredDirtyFiles);
   return porcelainDirtyPaths(unfiltered.stdout).filter((entry) => !kept.has(entry));
+}
+
+/**
+ * How many files in a range are binary, per git's own judgement.
+ *
+ * `--numstat` prints "-\t-\t<path>" for anything it will not line-count, which
+ * is exactly the set that cannot be content-merged. Best-effort: a failure here
+ * costs one informational line, never the land.
+ *
+ * @param {string} repoRoot
+ * @param {string} diffRange
+ * @returns {number}
+ */
+function countBinaryDiffFiles(repoRoot, diffRange) {
+  const numstat = git(repoRoot, ["diff", "--numstat", diffRange], {
+    maxBuffer: DIFF_STAT_MAX_BYTES
+  });
+  if (numstat.status !== 0 || numstat.error) {
+    return 0;
+  }
+  return String(numstat.stdout ?? "")
+    .split(/\r?\n/)
+    .filter((line) => /^-\t-\t/.test(line)).length;
+}
+
+/**
+ * The `--preview` diff body, bounded.
+ *
+ * ENOBUFS is spawnSync's cliff - the process is killed and NOTHING is returned,
+ * not even a truncated prefix - so an oversized diff is reported as omitted
+ * rather than half-shown. That is the right trade here: a 300 KB diff is not
+ * something anyone reads out of a terminal, and `diffStat` plus the exact git
+ * command is strictly more useful than a truncation.
+ *
+ * @param {string} repoRoot
+ * @param {string} diffRange
+ * @returns {{diff: string|null, omitted: string|null}}
+ */
+function readPreviewDiff(repoRoot, diffRange) {
+  const result = git(repoRoot, ["diff", diffRange], {
+    // +1 so a diff of exactly the limit still fits.
+    maxBuffer: PREVIEW_DIFF_MAX_BYTES + 1
+  });
+
+  if (result.error && /** @type {NodeJS.ErrnoException} */ (result.error).code === "ENOBUFS") {
+    return {
+      diff: null,
+      omitted: `(diff omitted: exceeds ${Math.round(PREVIEW_DIFF_MAX_BYTES / 1024)} KB - inspect with git diff ${diffRange})`
+    };
+  }
+  if (result.error) {
+    throw result.error;
+  }
+  if (result.status !== 0) {
+    // Same reasoning as the gitChecked on diffStat above: an empty stdout from
+    // a failed diff is indistinguishable from a genuinely empty diff.
+    throw new Error(
+      `git diff ${diffRange} failed (exit ${result.status}): ${(result.stderr || result.stdout || "").trim()}`
+    );
+  }
+  return { diff: result.stdout, omitted: null };
+}
+
+/**
+ * Undo a failed squash merge and explain what to do about it.
+ *
+ * Binary assets conflict deterministically - there is no content merge for a
+ * .blend or a .png - so any asset touched on both sides lands here every time.
+ * Left alone, git has already written conflict markers into the index and the
+ * working tree, and the usual escape hatch does not exist: `--squash` never
+ * writes MERGE_HEAD, so `git merge --abort` exits 128 with "There is no merge
+ * to abort". Never suggest it.
+ *
+ * `reset --hard HEAD` is safe HERE AND ONLY HERE because the dirty-tree gate
+ * above already refused to run against uncommitted work. It also clears
+ * SQUASH_MSG, MERGE_MSG and AUTO_MERGE on its own (verified), so nothing needs
+ * to be hand-deleted from inside .git.
+ *
+ * @param {string} repoRoot
+ * @param {string} jobId
+ * @param {string} branchName
+ * @param {{stdout: string, stderr: string, status: number|null}} merge
+ * @returns {string} message for the thrown error
+ */
+function recoverFromFailedLandMerge(repoRoot, jobId, branchName, merge) {
+  const combined = `${merge.stdout ?? ""}\n${merge.stderr ?? ""}`;
+
+  // git's own words for each case. Deliberately NOT `git diff --numstat
+  // --diff-filter=U`: measured, it emits "0\t0\tasset.bin" for a conflicted
+  // binary, not the "-\t-\t" row, so every conflict would read as text.
+  const binary = new Set(
+    [...combined.matchAll(/Cannot merge binary files: (.+?) \(/g)].map((match) => match[1].trim())
+  );
+  const conflicted = new Set(
+    [...combined.matchAll(/CONFLICT \([^)]*\): Merge conflict in (.+)/g)].map((match) =>
+      match[1].trim()
+    )
+  );
+  for (const file of binary) {
+    conflicted.add(file);
+  }
+
+  const rollback = git(repoRoot, ["reset", "--hard", "HEAD"]);
+  const rollbackFailed =
+    rollback.status !== 0
+      ? ` The rollback itself failed (${(rollback.stderr || rollback.stdout || "").trim()}); inspect the repository by hand before doing anything else.`
+      : "";
+
+  if (conflicted.size === 0) {
+    // Not a conflict at all - a missing branch, a hook, an unborn HEAD. Report
+    // git verbatim rather than inventing a conflict story.
+    const detail = combined.trim().split(/\r?\n/).filter(Boolean).slice(0, 5).join("; ");
+    return (
+      `Could not squash-merge ${branchName}: ${detail || `git exited ${merge.status}`}. ` +
+      `The working tree was restored to HEAD, so nothing was applied.${rollbackFailed}`
+    );
+  }
+
+  const listed = [...conflicted]
+    .map((file) => (binary.has(file) ? `${file} (binary - cannot be content-merged)` : file))
+    .join(", ");
+
+  return (
+    `Landing ${jobId} hit merge conflicts in: ${listed}. ` +
+    `The working tree was restored to HEAD, so nothing was applied and the run is still safe on ${branchName}.${rollbackFailed} ` +
+    `Do NOT run git merge --abort - a squash merge writes no MERGE_HEAD, so it fails with "There is no merge to abort". ` +
+    `Either drop the run with /grok-build:land ${jobId} --discard, ` +
+    `or check out ${branchName} and pick a side per file with git checkout --ours/--theirs before merging by hand.`
+  );
 }
 
 /**
@@ -2497,21 +2696,37 @@ async function handleLand(argv) {
   // wrapper's empty-string result was indistinguishable from a genuinely
   // empty diff - "No changes between base and run branch" printed with
   // total confidence for a run whose branch does not exist at all.
-  const diffStat = gitChecked(repoRoot, ["diff", "--stat", diffRange]).stdout.trim();
-  const diffBody = gitChecked(repoRoot, ["diff", diffRange]).stdout;
+  const diffStat = gitChecked(repoRoot, ["diff", "--stat", diffRange], {
+    maxBuffer: DIFF_STAT_MAX_BYTES
+  }).stdout.trim();
+  // Cheap and useful on both paths: `--stat` prints "Bin 0 -> 1234 bytes" per
+  // binary file but nothing aggregate, and "did this run rewrite 40 textures?"
+  // is the single most load-bearing question before landing an engine project.
+  // Deliberately no cat-file/LFS size accounting: an LFS pointer's own
+  // `version`/`oid`/`size` lines are already printed verbatim in the diff body.
+  const totalBinaryFiles = countBinaryDiffFiles(repoRoot, diffRange);
 
   // Preview is read-only: show what would land without merging or removing.
   if (options.preview) {
+    // Only materialised HERE. It used to be computed before this branch and
+    // then thrown away on the apply path, and with no cap at all: runCommand
+    // passed maxBuffer straight through, and an explicitly-undefined maxBuffer
+    // disables spawnSync's own 1 MiB default rather than falling back to it.
+    const { diff: diffBody, omitted: diffOmitted } = readPreviewDiff(repoRoot, diffRange);
     const payload = {
       jobId: job.id,
       action: "preview",
       worktree,
       diffStat,
-      diff: diffBody
+      totalBinaryFiles,
+      diff: diffBody,
+      diffOmitted
     };
     const text =
       (diffStat ? `${diffStat}\n\n` : "No changes between base and run branch.\n\n") +
+      (totalBinaryFiles > 0 ? `Total: ${totalBinaryFiles} binary file(s)\n\n` : "") +
       (diffBody ? `${diffBody.endsWith("\n") ? diffBody : `${diffBody}\n`}` : "") +
+      (diffOmitted ? `${diffOmitted}\n` : "") +
       `\nPreview only for ${job.id}: nothing was merged or removed. Re-run without --preview to apply, or with --discard to drop.\n`;
     outputCommandResult(payload, text, options.json);
     return;
@@ -2545,7 +2760,15 @@ async function handleLand(argv) {
   // this is the line that tells the user land proceeded despite visible dirt.
   const ignoredDirtyArtifacts = describeIgnoredDirtyArtifacts(repoRoot, dirtyFiles);
 
-  gitChecked(repoRoot, ["merge", "--squash", branchName]);
+  // Unchecked on purpose: gitChecked would throw with git's raw stderr and
+  // leave the repository sitting in a half-merged state with conflict markers
+  // in the index, the worktree still present, and the job still unlanded - and
+  // the recovery every user reaches for, `git merge --abort`, fails with
+  // "There is no merge to abort" because --squash never writes MERGE_HEAD.
+  const merge = git(repoRoot, ["merge", "--squash", branchName]);
+  if (merge.status !== 0) {
+    throw new Error(recoverFromFailedLandMerge(repoRoot, job.id, branchName, merge));
+  }
 
   removeWorktree({
     repoRoot,
@@ -2561,10 +2784,12 @@ async function handleLand(argv) {
     action: "apply",
     worktree,
     diffStat,
+    totalBinaryFiles,
     ignoredDirtyArtifacts
   };
   const text =
     (diffStat ? `${diffStat}\n\n` : "") +
+    (totalBinaryFiles > 0 ? `Total: ${totalBinaryFiles} binary file(s)\n\n` : "") +
     (ignoredDirtyArtifacts.length > 0
       ? `Ignored ${ignoredDirtyArtifacts.length} dirty generated artifact path(s) in the dirty-tree check: ${ignoredDirtyArtifacts.slice(0, 5).join(", ")}\n\n`
       : "") +

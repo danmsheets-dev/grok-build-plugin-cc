@@ -26,8 +26,29 @@ What isolation **does not** guarantee:
 - **Heavyweight directories are linked, not copied.** `node_modules`, `.venv`, `venv`,
   `target` and `vendor` are junctioned (Windows) or symlinked (POSIX) from your repo so
   the verify command can run. **Writes through those links reach your real directories.**
+  Godot's import cache (`.godot`, `.import`) is linked too, so the run header says so:
+  **close the Godot editor before a run verifies**, or the editor and the headless run
+  are writing the same cache. To opt out, set `GROK_BUILD_LINK_GODOT_CACHE=0` or put
+  `{"provision": {"copy": true}}` in `.grok-build.json` — the worktree then gets a
+  private cold cache seeded with only the small state files, and the first verify
+  re-imports. `.godot/imported` is never copied; it is the multi-gigabyte part.
 - **A worktree holds the only copy of unlanded work.** `/grok-build:prune` removes
   worktrees for finished runs. Land before you prune.
+- **A checkout needs room.** An isolated run refuses to start when the volume holding
+  the worktree has less than 512 MB free, rather than failing halfway through the
+  checkout. `GROK_BUILD_MIN_FREE_BYTES` moves the floor; `0` disables the check.
+
+`/grok-build:land <id>` squash-merges the run's branch into your current branch.
+Conflicts are expected on binary assets — a `.blend`, a `.png` or a `.tscn` touched on
+both sides cannot be content-merged. When that happens, land **rolls the repository
+back to HEAD** and names the conflicting files rather than leaving you in a half-merged
+state. Note that `git merge --abort` does not work here: a squash merge writes no
+`MERGE_HEAD`. Either `/grok-build:land <id> --discard`, or check out `grok-build/<id>`
+and pick a side per file.
+
+`/grok-build:land <id> --preview` prints the stat, a `Total: N binary file(s)` count,
+and the diff itself — up to 128 KB. Past that the diff is omitted with the exact
+`git diff` command to run, because a 300 KB diff in a terminal is not a review.
 
 The bridge is read-only by default. `--write` is opt-in at the CLI, but the
 `grok-build:grok-delegate` subagent adds `--write` by policy, so `/grok-build:delegate`

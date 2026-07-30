@@ -39,7 +39,14 @@ export function runCommand(command, args = [], options = {}) {
     env: options.env,
     encoding: "utf8",
     input: options.input,
-    maxBuffer: options.maxBuffer,
+    // The key is only present when the caller actually supplied a budget.
+    // spawnSync applies its 1 MiB default by SPREADING the caller's options
+    // over it, so an explicit `maxBuffer: undefined` overrides the default with
+    // undefined and the size check (`length > maxBuffer`) then compares against
+    // undefined and is never true - measured: 6 MiB of git stdout captured with
+    // no ENOBUFS at all. Every unbounded git call in the plugin was silently
+    // uncapped because of that one key.
+    ...(options.maxBuffer === undefined ? {} : { maxBuffer: options.maxBuffer }),
     stdio: options.stdio ?? "pipe",
     windowsHide: true,
     // Confirmed dead without this: a 300ms timeout let a 4-second command run

@@ -361,3 +361,31 @@ test("verify sources have user-facing labels", () => {
   assert.equal(describeVerifySource("ecosystem-default"), "ecosystem default");
   assert.equal(describeVerifySource("none"), "none");
 });
+
+test("provision.copy reaches the run settings, and a bad shape is a warning not a value", () => {
+  // The per-project form of GROK_BUILD_LINK_GODOT_CACHE=0. Not an executable
+  // key: it decides which files are copied into a worktree and runs nothing.
+  const opted = resolveRunSettings({ config: { provision: { copy: true } } });
+  assert.deepEqual(opted.provision, { copy: true });
+  assert.equal(opted.sources.provision, "config");
+
+  const off = resolveRunSettings({ config: { provision: { copy: false } } });
+  assert.deepEqual(off.provision, { copy: false });
+
+  // Absent, not false: the bridge only overrides the environment variable when
+  // the project actually said something.
+  const silent = resolveRunSettings({ config: { provision: {} } });
+  assert.equal(silent.provision, undefined);
+  assert.equal(resolveRunSettings({ config: {} }).provision, undefined);
+});
+
+test("an untrusted config can still choose the import-cache tier", () => {
+  // provision.copy is deliberately outside the trust gate: the withheld set is
+  // for keys that decide what gets EXECUTED, and copying a cache instead of
+  // sharing it is strictly the safer of the two.
+  const root = makeWorkspace('{"provision":{"copy":true},"verify":["rm -rf /"]}');
+  const loaded = loadProjectConfig(root, { trustedHash: null });
+  assert.equal(loaded.trusted, false);
+  assert.deepEqual(loaded.config.provision, { copy: true });
+  assert.deepEqual(Object.keys(loaded.untrusted), ["verify"]);
+});

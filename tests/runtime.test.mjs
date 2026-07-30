@@ -1066,3 +1066,120 @@ test("--verify-ignore reaches the stored request under --background", () => {
     }
   }
 });
+
+test("a Godot cache that git already checked out is reported, not silently skipped", () => {
+  // The provisionWorktree result used to be discarded outright. A repository
+  // that TRACKS its `.godot` (plenty do, deliberately or not) has it checked
+  // out into every new worktree, so the junction cannot be created - and the
+  // only symptom was a run that was inexplicably slower than the last one.
+  const repo = makeTempDir("grok-provision-report-");
+  const binDir = makeTempDir("grok-provision-report-bin-");
+  const pluginDataDir = makeTempDir("grok-provision-report-data-");
+  installFakeGrok(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  // Tracked on purpose - that is the precondition the whole case rests on.
+  // Deliberately NO project.godot: this exercises provisioning, and a real
+  // Godot project would also pull in ecosystem verify commands that need the
+  // engine binary.
+  fs.mkdirSync(path.join(repo, ".godot"), { recursive: true });
+  fs.writeFileSync(path.join(repo, ".godot", "uid_cache.bin"), "cache\n");
+  run("git", ["add", "-A"], { cwd: repo });
+  run("git", ["commit", "-m", "init with a tracked import cache"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "run", "--write", "--json", "edit something"], {
+    cwd: repo,
+    env: pluginDataEnv(pluginDataDir, binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.ok(payload.provision, "an isolated run must report what it provisioned");
+  const godot = payload.provision.failed.find((entry) => entry.name === ".godot");
+  assert.ok(
+    godot,
+    `.godot must be reported as skipped, got: ${JSON.stringify(payload.provision.failed)}`
+  );
+  assert.equal(godot.reason, "destination already exists");
+  // Basenames only: the payload must not leak the user's filesystem layout.
+  for (const entry of [...payload.provision.failed, ...payload.provision.provisioned]) {
+    assert.doesNotMatch(entry.name, /[\/]/, `${entry.name} must be a basename`);
+  }
+  // A cache that could not be linked is not shared, so the editor warning
+  // must not fire for it.
+  assert.deepEqual(payload.provision.notes, []);
+
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  try {
+    const jobs = listJobs(repo);
+    assert.ok(jobs.length >= 1);
+    const stored = JSON.parse(fs.readFileSync(resolveJobFile(repo, jobs[0].id), "utf8"));
+    assert.match(
+      stored.rendered,
+      /Provisioning skipped: \.godot \(already present in the worktree - it is tracked in git\)\./
+    );
+    // The second patchJobIfActive: the first fires before planning even starts,
+    // so the summary has nowhere to attach there.
+    assert.equal(stored.result.provision.failed[0].name, ".godot");
+  } finally {
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
+});
+
+test("a project config can trade the shared Godot cache for a private copy", () => {
+  // The per-project form of GROK_BUILD_LINK_GODOT_CACHE=0. End to end because
+  // the value has to survive handleTask -> the request -> executeTaskRun ->
+  // planWorktreeLinks, and every hop in that chain is a place it silently
+  // becomes undefined.
+  const repo = makeTempDir("grok-provision-copy-e2e-");
+  const binDir = makeTempDir("grok-provision-copy-e2e-bin-");
+  const pluginDataDir = makeTempDir("grok-provision-copy-e2e-data-");
+  installFakeGrok(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  fs.writeFileSync(path.join(repo, ".gitignore"), ".godot/\n.grok-build.json\n");
+  fs.writeFileSync(
+    path.join(repo, ".grok-build.json"),
+    `${JSON.stringify({ version: 1, provision: { copy: true } }, null, 2)}\n`
+  );
+  fs.mkdirSync(path.join(repo, ".godot", "imported"), { recursive: true });
+  fs.writeFileSync(path.join(repo, ".godot", "uid_cache.bin"), "seed\n");
+  fs.writeFileSync(path.join(repo, ".godot", "imported", "huge.ctex"), "x".repeat(512));
+  run("git", ["add", "-A"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "run", "--write", "--json", "edit something"], {
+    cwd: repo,
+    env: pluginDataEnv(pluginDataDir, binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+  const copied = payload.provision.provisioned.filter((entry) => entry.kind === "copy");
+  assert.ok(
+    copied.some((entry) => entry.name === "uid_cache.bin"),
+    `expected a copied uid_cache.bin, got ${JSON.stringify(payload.provision)}`
+  );
+  assert.ok(
+    !payload.provision.provisioned.some((entry) => entry.name === ".godot"),
+    "the .godot junction must not have been created at all"
+  );
+
+  const worktreeGodot = path.join(payload.worktree.path, ".godot");
+  assert.equal(
+    fs.lstatSync(worktreeGodot).isSymbolicLink(),
+    false,
+    "a copied cache must be a real directory, not a junction into the working copy"
+  );
+  assert.equal(fs.readFileSync(path.join(worktreeGodot, "uid_cache.bin"), "utf8"), "seed\n");
+  assert.equal(
+    fs.existsSync(path.join(worktreeGodot, "imported")),
+    false,
+    ".godot/imported is the gigabyte part and is never copied"
+  );
+});

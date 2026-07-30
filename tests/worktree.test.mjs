@@ -178,6 +178,125 @@ test("createWorktree throws when the worktree path already exists", () => {
   );
 });
 
+test("createWorktree refuses to start a checkout onto a full volume", () => {
+  // Without the precheck, git gets partway through the checkout and dies with
+  // its own disk-full stderr wrapped in "Failed to create worktree: ...",
+  // leaving a half-populated directory behind. The point of the seam is that
+  // this is provable without actually filling a disk.
+  const cwd = makeTempDir("grok-wt-space-");
+  const dataDir = makeTempDir("grok-wt-space-data-");
+  seedRepo(cwd);
+
+  let gitCalls = 0;
+  assert.throws(
+    () =>
+      createWorktree({
+        cwd,
+        runId: "space-1",
+        dataDir,
+        // 4096-byte blocks, 16 of them free: 64 KB on a volume asked for 512 MB.
+        statfsImpl: () => ({ bsize: 4096, bavail: 16, blocks: 1024, bfree: 16 }),
+        gitImpl: () => {
+          gitCalls += 1;
+          return { status: 0, stdout: "", stderr: "" };
+        }
+      }),
+    (error) => {
+      assert.match(error.message, /free space/i);
+      assert.match(error.message, /need ~512\.0 MB/);
+      assert.match(error.message, /have 64\.0 KB/);
+      return true;
+    }
+  );
+
+  assert.equal(gitCalls, 0, "git must never be asked to write onto a full volume");
+  assert.equal(
+    fs.existsSync(resolveWorktreePath("space-1", { dataDir })),
+    false,
+    "no partial worktree directory may be left behind"
+  );
+});
+
+test("createWorktree proceeds when the volume has room, and when it cannot be measured", () => {
+  // The discriminator for the test above, plus the degradation path: statfs is
+  // unsupported on some network and virtualised filesystems, and refusing to
+  // run there would be a far worse regression than the opaque git error the
+  // precheck replaces.
+  const cwd = makeTempDir("grok-wt-space-ok-");
+  const dataDir = makeTempDir("grok-wt-space-ok-data-");
+  seedRepo(cwd);
+
+  const roomy = createWorktree({
+    cwd,
+    runId: "space-ok",
+    dataDir,
+    statfsImpl: () => ({ bsize: 4096, bavail: 10_000_000, blocks: 10_000_000, bfree: 10_000_000 })
+  });
+  assert.ok(fs.existsSync(path.join(roomy.worktreePath, "README.md")));
+  removeWorktree({
+    repoRoot: roomy.repoRoot,
+    worktreePath: roomy.worktreePath,
+    branchName: roomy.branchName
+  });
+
+  const unmeasurable = createWorktree({
+    cwd,
+    runId: "space-unknown",
+    dataDir,
+    statfsImpl: () => {
+      throw Object.assign(new Error("ENOSYS: function not implemented, statfs"), {
+        code: "ENOSYS"
+      });
+    }
+  });
+  assert.ok(fs.existsSync(path.join(unmeasurable.worktreePath, "README.md")));
+  removeWorktree({
+    repoRoot: unmeasurable.repoRoot,
+    worktreePath: unmeasurable.worktreePath,
+    branchName: unmeasurable.branchName
+  });
+});
+
+test("GROK_BUILD_MIN_FREE_BYTES moves the floor, and 0 disables the check", () => {
+  const cwd = makeTempDir("grok-wt-space-env-");
+  const dataDir = makeTempDir("grok-wt-space-env-data-");
+  seedRepo(cwd);
+
+  // 64 KB free is plenty when the floor is 1 KB.
+  const tight = () => ({ bsize: 4096, bavail: 16, blocks: 1024, bfree: 16 });
+  const lowered = createWorktree({
+    cwd,
+    runId: "space-env",
+    dataDir,
+    env: { GROK_BUILD_MIN_FREE_BYTES: "1024" },
+    statfsImpl: tight
+  });
+  assert.ok(fs.existsSync(lowered.worktreePath));
+  removeWorktree({
+    repoRoot: lowered.repoRoot,
+    worktreePath: lowered.worktreePath,
+    branchName: lowered.branchName
+  });
+
+  let measured = false;
+  const disabled = createWorktree({
+    cwd,
+    runId: "space-off",
+    dataDir,
+    env: { GROK_BUILD_MIN_FREE_BYTES: "0" },
+    statfsImpl: () => {
+      measured = true;
+      return tight();
+    }
+  });
+  assert.equal(measured, false, "a zero floor must not even call statfs");
+  removeWorktree({
+    repoRoot: disabled.repoRoot,
+    worktreePath: disabled.worktreePath,
+    branchName: disabled.branchName
+  });
+});
+
 test("removeWorktree deletes the directory and the branch", () => {
   const cwd = makeTempDir("grok-wt-remove-");
   const dataDir = makeTempDir("grok-wt-remove-data-");
