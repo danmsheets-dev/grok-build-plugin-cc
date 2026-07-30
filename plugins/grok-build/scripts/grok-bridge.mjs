@@ -2320,6 +2320,7 @@ async function executeTaskRun(request) {
       rawCount: 0,
       timedOut: false,
       bufferExceeded: false,
+      elidedBytes: 0,
       commandNotFound: false,
       outputFailure: false,
       baselineSkipped: true
@@ -2531,6 +2532,11 @@ async function executeTaskRun(request) {
         const classification = classifyVerifyFailure(summary, baselineEntry, {
           timedOut: outcome.timedOut,
           bufferExceeded: outcome.bufferExceeded,
+          // A truncated capture is a sample of the failures, not the set of
+          // them, so it carries the same "no comparable verdict" weight as the
+          // legacy buffer overflow above. Recorded on the entry already; this
+          // is what makes the classifier act on it.
+          elidedBytes: outcome.elidedBytes,
           commandNotFound: outcome.commandNotFound,
           rawCountComparison
         });

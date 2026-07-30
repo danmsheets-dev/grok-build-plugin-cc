@@ -12,8 +12,17 @@ const DEFAULT_MAX_OUTPUT_BYTES = 32 * 1024 * 1024;
 // banner a tool prints first; the tail carries the failure list and exit
 // summary. Everything between them is where 20 MB of per-frame Godot spam or
 // per-test pytest chatter lives, and none of it survives.
+//
+// These define the DEFAULT SPLIT between the two halves, not a ceiling on
+// either. They used to be applied as `Math.min(OUTPUT_HEAD_BYTES, ...)` and
+// `Math.min(OUTPUT_TAIL_BYTES, ...)`, which pinned retention to 320 KiB for
+// every budget from 4 KB to 32 MB - so `--verify-max-buffer 64` and
+// GROK_VERIFY_MAX_OUTPUT_BYTES were inert above ~1.6 MB and a repo whose
+// verify command legitimately prints megabytes had no way to capture it. Only
+// the RATIO between them survives; see createOutputRing.
 const OUTPUT_HEAD_BYTES = 64 * 1024;
 const OUTPUT_TAIL_BYTES = 256 * 1024;
+const OUTPUT_HEAD_SHARE = OUTPUT_HEAD_BYTES / (OUTPUT_HEAD_BYTES + OUTPUT_TAIL_BYTES);
 // How long to wait for `close` after the tree kill before giving up on the
 // child's own stdio and resolving anyway. Without it a grandchild holding the
 // inherited pipe open could keep the promise pending past the timeout it was
@@ -85,6 +94,12 @@ export function runCommand(command, args = [], options = {}) {
  * handed to the child, so exporting the variable in a shell still works when
  * the caller passes an explicit env of its own.
  *
+ * DEFAULT_MAX_OUTPUT_BYTES is applied as a real ceiling on both inputs, which
+ * is what makes its "outer bound a caller may raise the retention budget to"
+ * comment true: the ring now scales retention UP with the budget, so an
+ * unchecked `GROK_VERIFY_MAX_OUTPUT_BYTES=4000000000` would ask the ring to
+ * hold four gigabytes of a runaway command in memory.
+ *
  * @param {unknown} raw explicit byte count from the caller
  * @param {NodeJS.ProcessEnv} [env]
  * @returns {number}
@@ -92,13 +107,13 @@ export function runCommand(command, args = [], options = {}) {
 export function resolveMaxOutputBytes(raw, env = undefined) {
   const explicit = Number(raw);
   if (Number.isFinite(explicit) && explicit > 0) {
-    return Math.floor(explicit);
+    return Math.min(Math.floor(explicit), DEFAULT_MAX_OUTPUT_BYTES);
   }
   const fromEnv = Number(
     env?.GROK_VERIFY_MAX_OUTPUT_BYTES ?? process.env.GROK_VERIFY_MAX_OUTPUT_BYTES
   );
   if (Number.isFinite(fromEnv) && fromEnv > 0) {
-    return Math.floor(fromEnv);
+    return Math.min(Math.floor(fromEnv), DEFAULT_MAX_OUTPUT_BYTES);
   }
   return DEFAULT_MAX_OUTPUT_BYTES;
 }
@@ -113,19 +128,25 @@ export function resolveMaxOutputBytes(raw, env = undefined) {
  * pipe) and only the middle is dropped, with the elided byte count recorded so
  * the gap is visible rather than silent.
  *
- * Chunks are kept as Buffers and decoded once at the end. Decoding each chunk
- * as it arrives would corrupt any multi-byte character split across a chunk
- * boundary; only the two cut points can still land mid-character, and a single
- * replacement char either side of the elision marker is acceptable.
+ * Chunks are kept as Buffers and decoded once, as ONE buffer, at the end.
+ * Decoding each chunk as it arrives would corrupt any multi-byte character
+ * split across a chunk boundary, and decoding the head and the tail separately
+ * corrupted one straddling the head/tail split - which push() creates for
+ * every stream over headLimit bytes, elided or not.
  *
  * @param {number} maxBytes total retention budget for this stream
  */
 function createOutputRing(maxBytes) {
   const budget = Math.max(2048, Math.floor(Number(maxBytes) || DEFAULT_MAX_OUTPUT_BYTES));
-  // Both halves scale down with a small budget, so a caller that asks for 4 KB
-  // gets roughly 4 KB rather than the 320 KB the fixed sizes would keep.
-  const headLimit = Math.min(OUTPUT_HEAD_BYTES, Math.max(1024, Math.floor(budget / 5)));
-  const tailLimit = Math.max(1024, Math.min(OUTPUT_TAIL_BYTES, budget - headLimit));
+  // Both halves scale WITH the budget, in both directions: a caller that asks
+  // for 4 KB gets roughly 4 KB, and one that asks for 8 MB gets roughly 8 MB.
+  // 1024 is a floor for the head so a tiny budget still keeps the banner, and
+  // the head is never allowed to eat the whole budget.
+  const headLimit = Math.min(
+    budget - 1024,
+    Math.max(1024, Math.floor(budget * OUTPUT_HEAD_SHARE))
+  );
+  const tailLimit = budget - headLimit;
 
   /** @type {Buffer[]} */
   const head = [];
@@ -134,6 +155,53 @@ function createOutputRing(maxBytes) {
   const tail = [];
   let tailBytes = 0;
   let elidedBytes = 0;
+  let snapped = false;
+
+  // Move both cut points onto line boundaries, once, when the capture is read.
+  //
+  // Only reachable once the ring has actually dropped something: while
+  // elidedBytes is 0 the head and tail are CONTIGUOUS - the split is internal
+  // bookkeeping, not a cut - and trimming either of them would destroy output
+  // that fit inside the budget the caller asked for.
+  //
+  // Why this is load-bearing rather than cosmetic: the cuts landed on exact
+  // byte offsets, so the head ended mid-line and the tail began mid-line.
+  // summarizeFailures turns each of those fragments into a failure signature,
+  // and where the tail cut lands moves with the TOTAL byte count of the
+  // stream - so a baseline probe and a post-agent run whose failure set was
+  // byte-for-byte identical produced DIFFERENT signatures, and the run blamed
+  // the agent for a regression that did not exist.
+  const snapToLines = () => {
+    if (snapped || elidedBytes === 0) {
+      return;
+    }
+    snapped = true;
+    // Head: back up to the last newline it contains. A head with no newline at
+    // all is one enormous line; dropping all of it would cost more than the
+    // fragment does, so it is left as it is.
+    const headBuf = Buffer.concat(head, headBytes);
+    const lastNewline = headBuf.lastIndexOf(0x0a);
+    head.length = 0;
+    if (lastNewline >= 0) {
+      head.push(headBuf.subarray(0, lastNewline + 1));
+      elidedBytes += headBytes - (lastNewline + 1);
+      headBytes = lastNewline + 1;
+    } else {
+      head.push(headBuf);
+    }
+    // Tail: skip forward past its first newline, so it starts at the beginning
+    // of a line rather than mid-token. Same "no newline at all" exemption.
+    const tailBuf = Buffer.concat(tail, tailBytes);
+    const firstNewline = tailBuf.indexOf(0x0a);
+    tail.length = 0;
+    if (firstNewline >= 0) {
+      tail.push(tailBuf.subarray(firstNewline + 1));
+      elidedBytes += firstNewline + 1;
+      tailBytes -= firstNewline + 1;
+    } else {
+      tail.push(tailBuf);
+    }
+  };
 
   return {
     push(chunk) {
@@ -164,15 +232,32 @@ function createOutputRing(maxBytes) {
       }
     },
     get elidedBytes() {
+      // Snapping to line boundaries discards bytes, and they are elided bytes
+      // like any other - the invariant callers rely on is
+      // `retained + elided === emitted`, so the count has to be read after the
+      // snap no matter which of the two accessors is touched first.
+      snapToLines();
       return elidedBytes;
     },
     text() {
-      const headText = Buffer.concat(head, headBytes).toString("utf8");
-      const tailText = Buffer.concat(tail, tailBytes).toString("utf8");
-      if (elidedBytes === 0) {
-        return `${headText}${tailText}`;
+      snapToLines();
+      /** @type {Buffer[]} */
+      const parts = [...head];
+      if (elidedBytes > 0) {
+        // Deliberately kept on its own line, and worded with no
+        // error/fail/assert token in it, so summarizeFailures cannot mistake
+        // the marker itself for a failure line.
+        parts.push(Buffer.from(`\n...[elided ${elidedBytes} bytes of output]...\n`, "utf8"));
       }
-      return `${headText}\n...[elided ${elidedBytes} bytes of output]...\n${tailText}`;
+      parts.push(...tail);
+      // ONE decode over the whole retained capture. Two independent
+      // toString("utf8") calls put a decode boundary at exactly headLimit,
+      // which corrupted any multi-byte character straddling it even when
+      // nothing was elided - a Godot resource path, an accented filename, a
+      // pytest tick. grok.mjs's boundPromptForArgv reserves argv slack for
+      // exactly that U+FFFD expansion; the two elisions now agree it does not
+      // happen here.
+      return Buffer.concat(parts).toString("utf8");
     }
   };
 }
@@ -225,6 +310,12 @@ export async function runCommandAsync(command, args = [], options = {}) {
     let timeoutTimer = null;
     /** @type {NodeJS.Timeout|null} */
     let graceTimer = null;
+    // terminateProcessTree already reports whether the signal landed; the
+    // result used to be discarded, so a run whose engine survived taskkill
+    // ("Access is denied" for an elevated process) reported a clean timeout and
+    // said nothing at all about the process it left running.
+    /** @type {{attempted: boolean, delivered: boolean, method: string|null}|null} */
+    let terminateOutcome = null;
 
     const finish = (status, signal, error) => {
       if (settled) {
@@ -246,6 +337,8 @@ export async function runCommandAsync(command, args = [], options = {}) {
         stderr: stderrRing.text(),
         elidedBytes: stdoutRing.elidedBytes + stderrRing.elidedBytes,
         timedOut,
+        // null when no kill was attempted, which is every non-timeout call.
+        terminate: terminateOutcome,
         error: error ?? null
       });
     };
@@ -312,11 +405,12 @@ export async function runCommandAsync(command, args = [], options = {}) {
     timeoutTimer = setTimeout(() => {
       timedOut = true;
       try {
-        terminate(child.pid, { platform, cwd: options.cwd, env: options.env });
+        terminateOutcome = terminate(child.pid, { platform, cwd: options.cwd, env: options.env }) ?? null;
       } catch {
         // A kill that could not be delivered must not turn into an unhandled
         // rejection: fall back to the direct child and let the grace timer
         // resolve either way.
+        terminateOutcome = { attempted: true, delivered: false, method: null };
         try {
           child.kill("SIGKILL");
         } catch {
@@ -324,7 +418,24 @@ export async function runCommandAsync(command, args = [], options = {}) {
         }
       }
       graceTimer = setTimeout(() => {
-        const error = new Error(`command timed out after ${timeoutMs}ms`);
+        // Reaching here means `close` never fired: something in the tree
+        // survived the kill and is still holding the inherited pipes. Those
+        // are ref'd libuv handles, so without letting go of them the event
+        // loop cannot drain and the bridge worker sits alive long after the
+        // run reported that it finished - measured at 5.7s of pure hang for an
+        // 8-second orphan, and minutes-to-indefinitely for a wedged headless
+        // Godot. The ring text is already captured, so nothing is lost by
+        // detaching here.
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        child.stdin?.destroy();
+        child.unref?.();
+        const orphaned = terminateOutcome?.delivered === false;
+        const error = new Error(
+          orphaned
+            ? `command timed out after ${timeoutMs}ms and its process tree could not be terminated${terminateOutcome?.method ? ` (${terminateOutcome.method})` : ""}; the command may still be running`
+            : `command timed out after ${timeoutMs}ms`
+        );
         /** @type {NodeJS.ErrnoException} */ (error).code = "ETIMEDOUT";
         finish(null, null, error);
       }, TERMINATE_GRACE_MS);

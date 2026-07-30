@@ -3,6 +3,7 @@ import path from "node:path";
 import process from "node:process";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
 
 import { makeTempDir } from "./helpers.mjs";
 import { resolveExecutable } from "../plugins/grok-build/scripts/lib/which.mjs";
@@ -259,6 +260,168 @@ test("runCommandAsync scales the ring down with a small budget", async () => {
   assert.equal(result.status, 0);
   assert.ok(result.stdout.length < 8192, `expected ~4KB, got ${result.stdout.length} bytes`);
   assert.ok(result.elidedBytes > 0);
+});
+
+// A ~600 KB producer of fixed-width lines: 108 bytes each (6-digit counter,
+// space, 100 y's, newline), so the emitted byte count is exact arithmetic and
+// every retained line is checkable against one regex.
+const RING_LINE_BYTES = 108;
+const ringProducer = (lines) =>
+  `for(let i=0;i<${lines};i++){console.log(String(i).padStart(6,'0')+' '+'y'.repeat(100))}`;
+
+test("runCommandAsync scales the ring UP with a large budget, not just down", async () => {
+  // The regression this guards: headLimit and tailLimit were applied as
+  // `Math.min(OUTPUT_HEAD_BYTES, ...)` / `Math.min(OUTPUT_TAIL_BYTES, ...)`,
+  // i.e. as CEILINGS. Retention was therefore pinned at 320 KiB for every
+  // budget from 4 KB to 32 MB, which made `--verify-max-buffer 64` and
+  // GROK_VERIFY_MAX_OUTPUT_BYTES inert above ~1.6 MB - measured: the same
+  // 590 KB stream reported `retained 327719 / elided 262326` at budgets of
+  // 1 MB, 8 MB and 64 MB alike. Only the scale-DOWN direction was asserted,
+  // which is why it shipped.
+  const lines = 5600;
+  const emitted = lines * RING_LINE_BYTES;
+
+  const tight = await runCommandAsync(process.execPath, ["-e", ringProducer(lines)], {
+    maxOutputBytes: 320 * 1024
+  });
+  const roomy = await runCommandAsync(process.execPath, ["-e", ringProducer(lines)], {
+    maxOutputBytes: 1024 * 1024
+  });
+
+  assert.ok(tight.elidedBytes > 0, "a 320 KiB budget must still elide a 600 KB stream");
+  assert.equal(
+    roomy.elidedBytes,
+    0,
+    `a 1 MiB budget must capture a ${emitted}-byte stream whole, elided ${roomy.elidedBytes}`
+  );
+  assert.equal(Buffer.byteLength(roomy.stdout), emitted);
+  assert.ok(
+    Buffer.byteLength(roomy.stdout) > Buffer.byteLength(tight.stdout),
+    "raising the budget has to retain strictly more"
+  );
+});
+
+test("the ring's byte accounting is exact: retained + elided === emitted", async () => {
+  // The newline snap discards bytes to move each cut onto a line boundary, and
+  // the classifier now READS elidedBytes to decide whether a capture is
+  // comparable at all - so an undercount would silently restore the phantom
+  // "new-failures" verdict for a truncated run. Checked at several budgets and
+  // several cut positions.
+  for (const [budget, lines] of [
+    [4096, 200],
+    [64 * 1024, 4000],
+    [320 * 1024, 8000],
+    [1024 * 1024, 8000]
+  ]) {
+    const result = await runCommandAsync(process.execPath, ["-e", ringProducer(lines)], {
+      maxOutputBytes: budget
+    });
+    const emitted = lines * RING_LINE_BYTES;
+    const retained = Buffer.byteLength(
+      result.stdout.replace(/\n\.\.\.\[elided \d+ bytes of output\]\.\.\.\n/, "")
+    );
+    assert.equal(
+      retained + result.elidedBytes,
+      emitted,
+      `budget ${budget}: retained ${retained} + elided ${result.elidedBytes} !== emitted ${emitted}`
+    );
+  }
+});
+
+test("the ring cuts on line boundaries so truncation cannot manufacture a failure line", async () => {
+  // Both cuts used to land on exact byte offsets, so the last line of the head
+  // and the first line of the tail were FRAGMENTS. summarizeFailures turns each
+  // fragment into a failure signature, and where the tail cut lands moves with
+  // the stream's total byte count - which is how a 12-byte banner difference
+  // between the baseline probe and the post-agent run produced two different
+  // signatures for a byte-identical failure set.
+  const result = await runCommandAsync(process.execPath, ["-e", ringProducer(8000)], {
+    maxOutputBytes: 64 * 1024
+  });
+
+  assert.ok(result.elidedBytes > 0, "this producer has to overflow the budget");
+  const lines = result.stdout.split("\n");
+  const marker = lines.filter((line) => line.startsWith("...[elided "));
+  assert.equal(marker.length, 1, "expected exactly one elision marker");
+  // The marker is worded with no error/fail/assert token in it precisely so it
+  // cannot itself become a failure signature.
+  assert.doesNotMatch(marker[0], /\b(fail|error|assert)\b/i);
+
+  for (const line of lines) {
+    if (line === "" || line.startsWith("...[elided ")) {
+      continue;
+    }
+    assert.match(
+      line,
+      /^\d{6} y{100}$/,
+      `truncation left a partial line in the capture: ${JSON.stringify(line.slice(0, 60))}`
+    );
+  }
+});
+
+test("the ring does not corrupt a multi-byte character at the head/tail split", async () => {
+  // push() fills the head to EXACTLY headLimit for every stream over that many
+  // bytes, and text() used to decode the head and the tail as two independent
+  // buffers - so a character straddling the split was replaced with U+FFFD even
+  // when elidedBytes was 0 and nothing needed to be dropped at all. A Godot
+  // resource path, an accented filename, or a pytest tick is enough to hit it.
+  const headLimit = Math.floor(65536 / 5);
+  const result = await runCommandAsync(process.execPath, [
+    "-e",
+    `process.stdout.write('a'.repeat(${headLimit - 1}));process.stdout.write('\\u00e9 FAIL: assertion caf\\u00e9 failed\\n')`
+  ], { maxOutputBytes: 64 * 1024 });
+
+  assert.equal(result.status, 0);
+  assert.equal(result.elidedBytes, 0, "the whole stream fits in the budget; nothing may be elided");
+  assert.ok(!result.stdout.includes("�"), "the split corrupted a multi-byte character");
+  assert.ok(
+    result.stdout.includes("é FAIL: assertion café failed"),
+    "the failure line has to survive the split intact"
+  );
+});
+
+test("runCommandAsync lets the process exit when the tree kill never lands", async () => {
+  // TERMINATE_GRACE_MS resolves the promise, but the child's inherited pipes
+  // are ref'd libuv handles: without destroying them and unref'ing the child,
+  // the event loop cannot drain and the bridge worker sits alive until the
+  // orphan exits on its own - minutes, for a wedged headless Godot. The bridge
+  // only ever sets process.exitCode and returns, so nothing else forces it out.
+  //
+  // Asserted from a real child process, because "the promise settled" is not
+  // the property under test - "node exited" is. The existing timeout test
+  // injects an impl that actually kills, so the non-delivered branch had no
+  // coverage at all.
+  const dir = makeTempDir();
+  const moduleUrl = pathToFileURL(
+    path.join(process.cwd(), "plugins/grok-build/scripts/lib/process.mjs")
+  ).href;
+  const scriptPath = path.join(dir, "orphan.mjs");
+  fs.writeFileSync(
+    scriptPath,
+    [
+      `import { runCommandAsync } from ${JSON.stringify(moduleUrl)};`,
+      "const result = await runCommandAsync(process.execPath, ['-e', 'setTimeout(()=>{},8000)'], {",
+      "  timeout: 300,",
+      "  terminateProcessTreeImpl: () => ({ attempted: true, delivered: false, method: 'test' })",
+      "});",
+      "console.log(JSON.stringify({ code: result.error?.code, terminate: result.terminate }));"
+    ].join("\n")
+  );
+
+  const started = Date.now();
+  const outer = await runCommandAsync(process.execPath, [scriptPath]);
+  const elapsed = Date.now() - started;
+
+  const reported = JSON.parse(outer.stdout.trim());
+  assert.equal(reported.code, "ETIMEDOUT");
+  // terminateProcessTree already computed {delivered:false}; runCommandAsync
+  // used to throw that verdict away, so the run record reported a clean finish
+  // for a command it had left running.
+  assert.deepEqual(reported.terminate, { attempted: true, delivered: false, method: "test" });
+  assert.ok(
+    elapsed < 5000,
+    `the orphan's pipes kept the process alive for ${elapsed}ms (child sleeps 8s)`
+  );
 });
 
 test("runCommandAsync kills the tree on timeout and reports ETIMEDOUT", async () => {

@@ -114,9 +114,12 @@ so a run cannot claim success without it having passed.
 - A command that outlives its budget has its **whole process tree** killed, not just the
   shell wrapping it — an orphaned `godot.exe` would otherwise keep the import lock. Raise the
   budget with `--verify-timeout <seconds>` or `verifyTimeoutMs` in `.grok-build.json`.
-- A command that prints more than the output budget is **not** a failure: the first 64 KB and
-  the last 256 KB are kept, the middle is replaced by an `...[elided N bytes of output]...`
-  marker, and the command's real exit code is what counts.
+- A command that prints more than the output budget is **not** a failure: a fifth of the
+  budget is kept from the head and the rest from the tail, both cut on line boundaries, the
+  middle is replaced by an `...[elided N bytes of output]...` marker, and the command's real
+  exit code is what counts. A capture whose middle was dropped is only a *sample* of the
+  failures, so it is reported as `verify-output-truncated` and never blamed on the agent —
+  raise `--verify-max-buffer` to get an attributed verdict back.
 - `--no-verify-baseline` skips the pre-run measurement. That makes verification **strict**:
   with nothing measured, every failure — pre-existing or not — is treated as this run's.
 

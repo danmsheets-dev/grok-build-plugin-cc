@@ -240,12 +240,20 @@ export async function runVerifyCommand(command, cwd, options = {}) {
   });
 
   if (result.error?.code === "ETIMEDOUT") {
+    // A tree kill that did not land means the engine is still running after
+    // this run has said it finished. runCommandAsync now surfaces that verdict
+    // instead of discarding it, and the record is the only place a reader would
+    // ever learn of the process left behind.
+    const orphanNote =
+      result.terminate?.delivered === false
+        ? " Its process tree could not be terminated, so the command may still be running."
+        : "";
     return {
       ok: false,
       exitCode: null,
       timedOut: true,
       commandNotFound: false,
-      output: `command timed out after ${options.timeoutMs}ms`
+      output: `command timed out after ${options.timeoutMs}ms${orphanNote}`
     };
   }
 
@@ -372,6 +380,7 @@ export async function runVerifyCommand(command, cwd, options = {}) {
  *   rawCount: number,
  *   timedOut: boolean,
  *   bufferExceeded: boolean,
+ *   elidedBytes: number,
  *   commandNotFound: boolean,
  *   outputFailure: boolean
  * }[]>}
@@ -414,6 +423,12 @@ export async function probeBaselines(commands, cwd, options = {}) {
       // only say so if the flag survived the probe.
       timedOut: Boolean(probe?.timedOut),
       bufferExceeded: Boolean(probe?.bufferExceeded),
+      // The ring's own truncation flag, and the one the async runner can
+      // actually raise: a probe that overflowed the retention budget captured
+      // a head+tail SAMPLE of the failures, and where its cuts landed depends
+      // on the probe's total byte count. Comparing that against a differently
+      // cut sample is what manufactured phantom "new-failures" verdicts.
+      elidedBytes: Number(probe?.elidedBytes) || 0,
       commandNotFound: Boolean(probe?.commandNotFound)
     });
   }
@@ -747,12 +762,14 @@ export function deriveVerifyTimeoutMs(baselineMs, options = {}) {
  *   rawCount: number,
  *   timedOut: boolean,
  *   bufferExceeded?: boolean,
+ *   elidedBytes?: number,
  *   commandNotFound?: boolean,
  *   baselineSkipped?: boolean
  * }|undefined|null} baselineEntry
  * @param {{
  *   timedOut?: boolean,
  *   bufferExceeded?: boolean,
+ *   elidedBytes?: number,
  *   commandNotFound?: boolean,
  *   rawCountComparison?: "strict"|"ignore"
  * }} [options]
@@ -778,14 +795,28 @@ export function classifyVerifyFailure(current, baselineEntry, options = {}) {
     return { blamed: false, reason: "verify-timed-out", infrastructure: true };
   }
 
-  if (options.bufferExceeded) {
+  // Two ways the same thing happens. `bufferExceeded` is the legacy synchronous
+  // runner's cliff (the process was killed the moment maxBuffer was crossed);
+  // `elidedBytes > 0` is the async ring having dropped the middle of the
+  // stream. Either way what survived is a SAMPLE of the failures, not the set
+  // of them, and where the sample's cuts land moves with the total byte count -
+  // so comparing it line-for-line against a baseline sample cut somewhere else
+  // reported "new-failures" for a byte-identical failure set and spent a model
+  // turn chasing a failure that did not exist.
+  //
+  // Deliberately an ESCAPABLE state rather than a permanent one for a chatty
+  // repo: the retention budget genuinely scales now (see createOutputRing), so
+  // `--verify-max-buffer` / GROK_VERIFY_MAX_OUTPUT_BYTES buy back a comparable
+  // capture and with it an attributed verdict. That was not true when the ring
+  // capped retention at 320 KiB no matter what the user asked for.
+  if (options.bufferExceeded || Number(options.elidedBytes) > 0) {
     return { blamed: false, reason: "verify-output-truncated", infrastructure: true };
   }
 
-  if (baselineEntry?.bufferExceeded) {
-    // Symmetric to the timeout guard below: the probe was killed mid-output,
-    // so whatever signature it did capture is a truncated prefix, not a
-    // baseline anything can be compared against.
+  if (baselineEntry?.bufferExceeded || Number(baselineEntry?.elidedBytes) > 0) {
+    // Symmetric to the timeout guard below: the probe was killed mid-output or
+    // had its middle elided, so whatever signature it did capture is a partial
+    // sample, not a baseline anything can be compared against.
     return { blamed: false, reason: "baseline-unknown" };
   }
 

@@ -288,8 +288,17 @@ test("runVerifyCommand keeps the head and tail of a 20MB firehose and still repo
   assert.equal(result.timedOut, false);
   assert.notEqual(result.bufferExceeded, true, "overflow is no longer a failure mode");
   assert.ok(
-    result.output.length < 512 * 1024,
+    result.output.length < 1200 * 1024,
     `expected a bounded capture, got ${result.output.length} bytes`
+  );
+  // Was `< 512 * 1024`, and it passed for the wrong reason: retention was
+  // capped at 320 KiB for EVERY budget, so the 1 MiB asked for here had no
+  // effect whatsoever. The budget is a real budget now, and asserting that it
+  // is actually spent is what keeps `--verify-max-buffer` from silently
+  // reverting to a no-op ceiling.
+  assert.ok(
+    result.output.length > 768 * 1024,
+    `expected the 1 MiB budget to be used, got only ${result.output.length} bytes`
   );
   assert.ok(result.elidedBytes > 0, "expected the middle of the stream to be elided");
   assert.match(result.output, /\.\.\.\[elided \d+ bytes of output\]\.\.\./);
@@ -333,6 +342,127 @@ test("runVerifyCommand still labels a legacy maxBuffer overflow distinctly, not 
   assert.equal(classified.blamed, false);
   assert.equal(classified.reason, "verify-output-truncated");
   assert.equal(classified.infrastructure, true);
+});
+
+// A Godot-shaped firehose: the same SCRIPT ERROR line 8000 times, ~590 KB.
+// The "current" variant differs from the "baseline" only by one extra leading
+// banner line, which is the entire delta the reproduction turned on.
+const GODOT_ERROR_LINE =
+  "console.log('SCRIPT ERROR: Invalid get index ' + String.fromCharCode(39) + 'health' + String.fromCharCode(39) + ' (on base: ' + String.fromCharCode(39) + 'Nil' + String.fromCharCode(39) + ').')";
+const godotFirehose = (banner) =>
+  `node -e "${banner ? "console.log('BANNER-1.2.3');" : ""}for(let i=0;i<8000;i++){${GODOT_ERROR_LINE}}"`;
+
+test("a byte-shifted truncated capture is not blamed on the agent", async () => {
+  // The reproduced regression. Both cuts landed on exact byte offsets, so the
+  // head's last line and the tail's first line were fragments whose position
+  // moved with the stream's TOTAL byte count. A 12-byte banner was enough to
+  // give two byte-identical failure sets two different signatures, and
+  // classifyVerifyFailure returned {blamed:true, reason:"new-failures"} - a
+  // real model turn spent chasing a failure that did not exist. Under main's
+  // 5 MB maxBuffer the same output was captured whole and reported
+  // unchanged-from-baseline, so this was a 0.4.0 regression.
+  const budget = 320 * 1024;
+  const baselineRun = await runVerifyCommand(godotFirehose(false), process.cwd(), {
+    timeoutMs: 120000,
+    maxOutputBytes: budget
+  });
+  const currentRun = await runVerifyCommand(godotFirehose(true), process.cwd(), {
+    timeoutMs: 120000,
+    maxOutputBytes: budget
+  });
+
+  assert.ok(baselineRun.elidedBytes > 0, "the fixture has to overflow the budget");
+  assert.ok(currentRun.elidedBytes > 0, "the fixture has to overflow the budget");
+
+  const baselineSummary = summarizeFailures(baselineRun.output);
+  const currentSummary = summarizeFailures(currentRun.output);
+  // Half one: the newline snap. No fragment ids, so the signature no longer
+  // depends on where the byte offset happened to land.
+  assert.deepEqual(
+    currentSummary.signature,
+    baselineSummary.signature,
+    "a 12-byte shift must not change the failure signature"
+  );
+  assert.deepEqual(baselineSummary.signature, [
+    "script error: invalid get index 'health' (on base: 'nil')."
+  ]);
+
+  // Half two: the classifier guard. Even with identical signatures, a capture
+  // whose middle was dropped is a SAMPLE of the failures - it carries the same
+  // "no comparable verdict" weight the legacy bufferExceeded flag did.
+  const classification = classifyVerifyFailure(
+    currentSummary,
+    {
+      ok: false,
+      signature: baselineSummary.signature,
+      rawCount: baselineSummary.rawCount,
+      timedOut: false,
+      bufferExceeded: false,
+      elidedBytes: baselineRun.elidedBytes,
+      commandNotFound: false
+    },
+    {
+      timedOut: false,
+      bufferExceeded: currentRun.bufferExceeded,
+      elidedBytes: currentRun.elidedBytes,
+      commandNotFound: false
+    }
+  );
+  assert.equal(classification.blamed, false);
+  assert.equal(classification.reason, "verify-output-truncated");
+  assert.equal(classification.infrastructure, true);
+});
+
+test("a NON-truncated run is still blamed for a genuinely new failure", async () => {
+  // The guard above converts blame into "infrastructure", which could mask a
+  // real regression permanently for a chatty repo. It must fire only when the
+  // capture was actually truncated: the same fixture inside a budget that fits
+  // it whole reports elidedBytes 0 and stays fully attributable. The escape
+  // hatch is real precisely because the retention budget scales now.
+  const roomy = await runVerifyCommand(godotFirehose(true), process.cwd(), {
+    timeoutMs: 120000,
+    maxOutputBytes: 4 * 1024 * 1024
+  });
+  assert.equal(roomy.elidedBytes, 0, "a 4 MiB budget must capture ~590 KB whole");
+
+  const summary = summarizeFailures(roomy.output);
+  const classification = classifyVerifyFailure(
+    summary,
+    { ok: true, signature: [], rawCount: 0, timedOut: false, elidedBytes: 0 },
+    { timedOut: false, elidedBytes: roomy.elidedBytes, commandNotFound: false }
+  );
+  assert.equal(classification.blamed, true);
+  assert.equal(classification.reason, "new-failures");
+});
+
+test("classifyVerifyFailure treats an elided capture the same as a buffer overflow", () => {
+  const current = classifyVerifyFailure(
+    { signature: ["error: a"], rawCount: 1 },
+    { ok: true, signature: [], rawCount: 0, timedOut: false },
+    { elidedBytes: 4096 }
+  );
+  assert.equal(current.blamed, false);
+  assert.equal(current.reason, "verify-output-truncated");
+  assert.equal(current.infrastructure, true);
+
+  // Mirrored on the baseline side, exactly as bufferExceeded already is: a
+  // probe whose middle was dropped captured a partial sample, not a baseline.
+  const baseline = classifyVerifyFailure(
+    { signature: ["error: a"], rawCount: 1 },
+    { ok: false, signature: ["error: b"], rawCount: 1, timedOut: false, elidedBytes: 4096 },
+    {}
+  );
+  assert.equal(baseline.blamed, false);
+  assert.equal(baseline.reason, "baseline-unknown");
+
+  // And zero must remain fully attributable.
+  const clean = classifyVerifyFailure(
+    { signature: ["error: a"], rawCount: 1 },
+    { ok: true, signature: [], rawCount: 0, timedOut: false, elidedBytes: 0 },
+    { elidedBytes: 0 }
+  );
+  assert.equal(clean.blamed, true);
+  assert.equal(clean.reason, "new-failures");
 });
 
 test("runVerifyCommand flags a command that cannot be started at all", async () => {
@@ -519,6 +649,31 @@ test("probeBaselines awaits an async runner and mirrors its infrastructure flags
   });
   assert.equal(baselines.length, 1);
   assert.equal(baselines[0].timedOut, true);
+  assert.equal(
+    classifyVerifyFailure({ signature: ["error: x"], rawCount: 1 }, baselines[0]).reason,
+    "baseline-unknown"
+  );
+});
+
+test("probeBaselines carries the ring's truncation flag through to the classifier", async () => {
+  // Every infrastructure flag the post-agent pass can raise has to be mirrored
+  // on the baseline entry, or the asymmetry itself becomes the blame. elidedBytes
+  // is the one the async runner can actually raise - bufferExceeded needs the
+  // legacy synchronous runner - so without this the baseline half of the guard
+  // was unreachable in practice.
+  const baselines = await probeBaselines(["noisy"], "/tmp/project", {
+    runVerifyCommandImpl: async () => ({
+      ok: false,
+      exitCode: 1,
+      timedOut: false,
+      bufferExceeded: false,
+      commandNotFound: false,
+      elidedBytes: 262144,
+      output: "exit_code: 1\nstderr:\nError: partial capture"
+    })
+  });
+
+  assert.equal(baselines[0].elidedBytes, 262144);
   assert.equal(
     classifyVerifyFailure({ signature: ["error: x"], rawCount: 1 }, baselines[0]).reason,
     "baseline-unknown"
