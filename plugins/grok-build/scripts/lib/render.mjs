@@ -421,10 +421,35 @@ export function renderNativeReviewResult(result, meta) {
  */
 function buildTaskStatusLines(meta = {}) {
   const lines = [];
+
+  // The baseline probe runs for every verify run now, not just isolated write
+  // runs, so on a non-isolated run it is a full extra verify pass. Reporting
+  // the cost is the price of that change: an unexplained doubling of wall
+  // clock is exactly how a useful safeguard gets switched off.
+  const probeMs = Number(meta.baselineProbeMs);
+  if (Number.isFinite(probeMs) && probeMs > 0) {
+    const commandCount = Number(meta.baselineProbeCommands);
+    const scope = Number.isFinite(commandCount) && commandCount > 0
+      ? ` across ${commandCount} verify command${commandCount === 1 ? "" : "s"}`
+      : "";
+    lines.push(
+      `Baseline probe: ${(probeMs / 1000).toFixed(1)}s${scope} (measured before the agent ran).`
+    );
+  }
+
   if (meta.verified === true) {
     lines.push(`Verified: yes${meta.verifyNote ? ` (${meta.verifyNote})` : ""}`);
   } else if (meta.verified === false) {
-    lines.push("Verified: no - verification did not pass within the attempt budget.");
+    // The note used to be dropped entirely on this branch, so a run that
+    // failed verification for an infrastructure reason - a timed-out or
+    // unrunnable command - told the user only "verification did not pass",
+    // implying their code was at fault. That is the same computed-and-never-
+    // delivered failure this whole block exists to fix.
+    lines.push(
+      meta.verifyNote
+        ? `Verified: no - ${meta.verifyNote}`
+        : "Verified: no - verification did not pass within the attempt budget."
+    );
   }
 
   if (meta.worktree?.path) {

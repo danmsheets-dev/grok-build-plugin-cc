@@ -7,6 +7,22 @@ const DEFAULT_CAP_MS = 900_000;
 const DEFAULT_MULTIPLIER = 4;
 const MAX_BUFFER = 5 * 1024 * 1024;
 
+// A verify command that cannot even be started is an infrastructure fault, not
+// a code failure - but the exit code cannot tell us that. Every command is
+// wrapped in `cmd /d /s /c` on win32 (see below), and cmd.exe reports its own
+// "not recognized" failure as exit **1**, not the 9009 a bare shell would use;
+// two independent measurements confirmed the 1. So the detection has to read
+// the message. The patterns are anchored to a line start on purpose so that a
+// compiler diagnostic like `error TS2307: Cannot find module 'x'` or a test
+// line containing "command not found" as prose cannot false-positive. 127 is
+// kept only as a POSIX assist (dash/ash word the message differently enough
+// that anchoring alone would miss them).
+const NOT_RUNNABLE = [
+  /^'[^']+' is not recognized as an internal or external command/m,
+  /^The system cannot find the path specified\.$/m,
+  /^(?:[^\s:]*sh): (?:line \d+: )?[^:]+: (?:command )?not found$/m
+];
+
 /**
  * Run a verify command string without shell:true so paths with spaces stay intact.
  * On win32 uses ComSpec/cmd.exe with /d /s /c; elsewhere /bin/sh -c.
@@ -23,6 +39,8 @@ const MAX_BUFFER = 5 * 1024 * 1024;
  *   ok: boolean,
  *   exitCode: number|null,
  *   timedOut: boolean,
+ *   bufferExceeded?: boolean,
+ *   commandNotFound?: boolean,
  *   output: string
  * }}
  */
@@ -54,6 +72,7 @@ export function runVerifyCommand(command, cwd, options = {}) {
       ok: false,
       exitCode: null,
       timedOut: true,
+      commandNotFound: false,
       output: `command timed out after ${options.timeoutMs}ms`
     };
   }
@@ -69,6 +88,7 @@ export function runVerifyCommand(command, cwd, options = {}) {
       exitCode: null,
       timedOut: false,
       bufferExceeded: true,
+      commandNotFound: false,
       output: `command output exceeded the ${MAX_BUFFER} byte limit and was killed before it could finish. This is not a code failure - the command produced too much stdout/stderr to capture. Re-run it with a quieter or more targeted flag (e.g. a specific test file, --silent, or piping through a summary) rather than changing any source file.`
     };
   }
@@ -78,6 +98,10 @@ export function runVerifyCommand(command, cwd, options = {}) {
       ok: false,
       exitCode: null,
       timedOut: false,
+      // ENOENT here means the *shell* is missing, which is exactly as
+      // un-runnable as a missing verify binary and equally not the agent's
+      // fault - blaming a code change for it sent runs chasing a phantom bug.
+      commandNotFound: /** @type {NodeJS.ErrnoException} */ (result.error).code === "ENOENT",
       output: `Failed to run command: ${result.error.message}`
     };
   }
@@ -85,6 +109,13 @@ export function runVerifyCommand(command, cwd, options = {}) {
   const status = result.status;
   const stdout = result.stdout ?? "";
   const stderr = result.stderr ?? "";
+  // Gated on a non-zero status so that a command which merely *prints* one of
+  // these messages - a test asserting on cmd.exe's wording, a build log that
+  // recovered from a missing optional tool - and then succeeds is still a
+  // pass. Nothing that failed to start can exit 0.
+  const commandNotFound =
+    status !== 0 &&
+    (status === 127 || NOT_RUNNABLE.some((re) => re.test(`${stdout}\n${stderr}`)));
   const parts = [`exit_code: ${status}`];
   if (stdout) {
     parts.push(`stdout:\n${stdout}`);
@@ -100,8 +131,60 @@ export function runVerifyCommand(command, cwd, options = {}) {
     ok: status === 0,
     exitCode: status,
     timedOut: false,
+    commandNotFound,
     output: parts.join("\n")
   };
+}
+
+/**
+ * Measure what each verify command already reports BEFORE the agent runs, so a
+ * suite that was red on arrival is never blamed on the run.
+ *
+ * Extracted from the bridge so it can be exercised without spawning anything,
+ * and declared async even though runVerifyCommand is currently synchronous:
+ * the async runner lands next and this way its arrival is a one-line change
+ * here instead of a rewrite of every caller.
+ *
+ * @param {string[]} commands
+ * @param {string} cwd
+ * @param {{ runVerifyCommandImpl?: typeof runVerifyCommand, timeoutMs?: number }} [options]
+ * @returns {Promise<{
+ *   command: string,
+ *   ok: boolean,
+ *   ms: number,
+ *   signature: string[],
+ *   rawCount: number,
+ *   timedOut: boolean,
+ *   bufferExceeded: boolean,
+ *   commandNotFound: boolean
+ * }[]>}
+ */
+export async function probeBaselines(commands, cwd, options = {}) {
+  const runVerifyCommandImpl = options.runVerifyCommandImpl ?? runVerifyCommand;
+  const baselines = [];
+
+  for (const command of commands ?? []) {
+    const started = Date.now();
+    const probe = await runVerifyCommandImpl(command, cwd, { timeoutMs: options.timeoutMs });
+    const ms = Date.now() - started;
+    const summary = summarizeFailures(probe?.output);
+    baselines.push({
+      command,
+      ok: Boolean(probe?.ok),
+      ms,
+      signature: summary.signature,
+      rawCount: summary.rawCount,
+      // Every infrastructure flag the post-agent pass can raise has to be
+      // mirrored here too. A baseline that timed out / overflowed its buffer /
+      // never started is an unknown baseline, and classifyVerifyFailure can
+      // only say so if the flag survived the probe.
+      timedOut: Boolean(probe?.timedOut),
+      bufferExceeded: Boolean(probe?.bufferExceeded),
+      commandNotFound: Boolean(probe?.commandNotFound)
+    });
+  }
+
+  return baselines;
 }
 
 /**
@@ -335,11 +418,63 @@ export function deriveVerifyTimeoutMs(baselineMs, options = {}) {
  * happens to iterate — checking just the first command let a genuine
  * regression in a second command go unnoticed.
  *
+ * The infrastructure flags arrive as an explicit third argument rather than
+ * riding along on `current`: `current` is a summarizeFailures() result, and
+ * smuggling runVerifyCommand fields into that shape would make two unrelated
+ * producers responsible for the same object.
+ *
  * @param {{ signature: string[], rawCount: number }} current
- * @param {{ ok: boolean, signature: string[], rawCount: number, timedOut: boolean }|undefined} baselineEntry
- * @returns {{ blamed: boolean, reason: string, comparison?: string }}
+ * @param {{
+ *   ok: boolean,
+ *   signature: string[],
+ *   rawCount: number,
+ *   timedOut: boolean,
+ *   bufferExceeded?: boolean,
+ *   commandNotFound?: boolean
+ * }|undefined|null} baselineEntry
+ * @param {{ timedOut?: boolean, bufferExceeded?: boolean, commandNotFound?: boolean }} [options]
+ * @returns {{
+ *   blamed: boolean,
+ *   reason: string,
+ *   comparison?: string,
+ *   fatal?: boolean,
+ *   infrastructure?: boolean
+ * }}
  */
-export function classifyVerifyFailure(current, baselineEntry) {
+export function classifyVerifyFailure(current, baselineEntry, options = {}) {
+  // Everything above the baseline guards is an infrastructure outcome: the
+  // command never produced a comparable verdict at all. These used to fall
+  // straight through to compareFailureSignatures, which saw an empty current
+  // signature, called it "incomparable", and blamed the run for a timeout or
+  // an output overflow it had nothing to do with.
+  if (options.commandNotFound || baselineEntry?.commandNotFound) {
+    return { blamed: false, reason: "verify-command-not-runnable", fatal: true };
+  }
+
+  if (options.timedOut) {
+    return { blamed: false, reason: "verify-timed-out", infrastructure: true };
+  }
+
+  if (options.bufferExceeded) {
+    return { blamed: false, reason: "verify-output-truncated", infrastructure: true };
+  }
+
+  if (baselineEntry?.bufferExceeded) {
+    // Symmetric to the timeout guard below: the probe was killed mid-output,
+    // so whatever signature it did capture is a truncated prefix, not a
+    // baseline anything can be compared against.
+    return { blamed: false, reason: "baseline-unknown" };
+  }
+
+  if (baselineEntry == null) {
+    // No probe ran for this command (or it was not in the probed list). That
+    // is honestly "we don't know", not "the agent broke it" - the old code
+    // compared against an empty baseline and reported new-failures for every
+    // pre-existing one. Deliberately NOT faked as a timed-out baseline: the
+    // run record has to say which of the two actually happened.
+    return { blamed: false, reason: "baseline-missing" };
+  }
+
   if (baselineEntry?.timedOut) {
     // The baseline probe itself never finished, so there is no comparable
     // pre-existing state - reporting a confident regression here would be a

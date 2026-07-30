@@ -68,6 +68,7 @@ import {
 import {
   classifyVerifyFailure,
   deriveVerifyTimeoutMs,
+  probeBaselines,
   runVerifyCommand,
   summarizeFailures
 } from "./lib/verify.mjs";
@@ -141,6 +142,27 @@ function resolveVerifyAttempts(raw) {
   const verifyAttempts =
     Number.isFinite(parsed) && Number.isInteger(parsed) && parsed >= 1 ? parsed : 2;
   return verifyAttempts;
+}
+
+// Wording matters here: this text is the only explanation the user gets for a
+// run that reports "Verified: no" without any failing code, so each one has to
+// name the infrastructure cause and say plainly that it is not a code failure.
+const VERIFY_INFRASTRUCTURE_NOTES = {
+  "verify-command-not-runnable":
+    "the verify command could not be started (not found on PATH) - this is not a code failure",
+  "verify-timed-out":
+    "the verify command timed out - this is an infrastructure limit, not a code failure",
+  "verify-output-truncated":
+    "the verify command produced more output than could be captured and was killed - this is not a code failure",
+  "baseline-unknown":
+    "the baseline probe for this command never produced a comparable result, so its failures cannot be attributed to this run",
+  "baseline-missing":
+    "no baseline was measured for this command, so its failures cannot be attributed to this run"
+};
+
+function describeVerifyInfrastructureStop(entry) {
+  const detail = VERIFY_INFRASTRUCTURE_NOTES[entry.attribution] ?? entry.attribution;
+  return `${detail} (${entry.command})`;
 }
 
 function resolveMaxDurationSeconds(raw) {
@@ -1011,31 +1033,38 @@ async function executeTaskRun(request) {
     runCwd = created.worktreePath;
   }
 
-  /** @type {{ command: string, ok: boolean, ms: number, signature: string[], rawCount: number, timedOut: boolean }[]} */
-  const baselines = [];
-  if (verifyCommands.length > 0 && created) {
-    for (const command of verifyCommands) {
-      const started = Date.now();
-      // A generous cap, not the derived per-attempt timeout: this is the ONLY
-      // chance to learn what was already broken before the agent touched
-      // anything, and a cold-build ecosystem (Godot's first asset import,
-      // a fresh cargo build) can legitimately take minutes. A tight cap here
-      // used to discard the timeout result silently, so any command that ran
-      // long got recorded as an empty baseline signature - and every one of
-      // its real, pre-existing failures then looked "new" once the agent's
-      // run finished, blaming it for something it never touched.
-      const probe = runVerifyCommand(command, runCwd, { timeoutMs: BASELINE_PROBE_TIMEOUT_MS });
-      const ms = Date.now() - started;
-      const summary = summarizeFailures(probe.output);
-      baselines.push({
-        command,
-        ok: probe.ok,
-        ms,
-        signature: summary.signature,
-        rawCount: summary.rawCount,
-        timedOut: Boolean(probe.timedOut)
-      });
-    }
+  /** @type {Awaited<ReturnType<typeof probeBaselines>>} */
+  let baselines = [];
+  let baselineProbeMs = null;
+  // The probe used to be gated on `created`, i.e. on an isolated write run
+  // only. Under --no-isolate, or read-only, there was no baseline at all:
+  // baselines.find() returned undefined, compareFailureSignatures compared
+  // against an empty set, and every failure that was already there before the
+  // run started came back as "new-failures" attributed to the agent. It now
+  // runs whenever there is anything to attribute, in runCwd - the same
+  // directory the post-agent pass below uses, so the comparison stays
+  // apples-to-apples whether or not a worktree exists.
+  //
+  // The skip is deliberate and narrow: a read-only run with no verify attempts
+  // has nothing it could possibly be blamed for, so the extra pass is pure
+  // wall-clock cost. Everywhere else the cost is real (a full extra verify
+  // pass) and is reported in the run's status block rather than hidden.
+  const shouldProbeBaselines =
+    verifyCommands.length > 0 && !(write === false && verifyAttempts === 0);
+  if (shouldProbeBaselines) {
+    const probeStarted = Date.now();
+    // A generous cap, not the derived per-attempt timeout: this is the ONLY
+    // chance to learn what was already broken before the agent touched
+    // anything, and a cold-build ecosystem (Godot's first asset import,
+    // a fresh cargo build) can legitimately take minutes. A tight cap here
+    // used to discard the timeout result silently, so any command that ran
+    // long got recorded as an empty baseline signature - and every one of
+    // its real, pre-existing failures then looked "new" once the agent's
+    // run finished, blaming it for something it never touched.
+    baselines = await probeBaselines(verifyCommands, runCwd, {
+      timeoutMs: BASELINE_PROBE_TIMEOUT_MS
+    });
+    baselineProbeMs = Date.now() - probeStarted;
   }
 
   const firstAgent = await runHeadlessAgentWithDurationBudget(
@@ -1093,6 +1122,11 @@ async function executeTaskRun(request) {
       // actually checked, so the run could report success while a real
       // regression sat right there in the results array.
       let firstBlamed = null;
+      // The first outcome that says nothing about the agent's work at all:
+      // the verify command timed out, drowned its own output buffer, or could
+      // not be started. Tracked separately from firstBlamed because it must
+      // stop the run rather than trigger a fix turn.
+      let firstInfrastructure = null;
 
       for (const command of verifyCommands) {
         const baselineEntry = baselines.find((entry) => entry.command === command);
@@ -1106,6 +1140,13 @@ async function executeTaskRun(request) {
           ok: outcome.ok,
           exitCode: outcome.exitCode,
           timedOut: outcome.timedOut,
+          // These two used to be dropped on the floor by this fixed field
+          // list, so a run that only failed because the command was killed
+          // for output volume, or was never runnable, looked exactly like a
+          // plain non-zero exit in the persisted record.
+          bufferExceeded: Boolean(outcome.bufferExceeded),
+          commandNotFound: Boolean(outcome.commandNotFound),
+          failureSource: null,
           output: outcome.output,
           signature: summary.signature
         };
@@ -1115,10 +1156,29 @@ async function executeTaskRun(request) {
           continue;
         }
 
-        const classification = classifyVerifyFailure(summary, baselineEntry);
+        const classification = classifyVerifyFailure(summary, baselineEntry, {
+          timedOut: outcome.timedOut,
+          bufferExceeded: outcome.bufferExceeded,
+          commandNotFound: outcome.commandNotFound
+        });
         entryResult.attribution = classification.reason;
         if (classification.comparison) {
           entryResult.comparison = classification.comparison;
+        }
+
+        const isInfrastructure =
+          Boolean(classification.fatal) ||
+          Boolean(classification.infrastructure) ||
+          classification.reason === "baseline-unknown" ||
+          classification.reason === "baseline-missing";
+        entryResult.failureSource = classification.blamed
+          ? "agent"
+          : isInfrastructure
+            ? "infrastructure"
+            : "baseline";
+
+        if (isInfrastructure && !firstInfrastructure) {
+          firstInfrastructure = entryResult;
         }
 
         if (!classification.blamed) {
@@ -1131,6 +1191,17 @@ async function executeTaskRun(request) {
       }
 
       verifyResults = iterationResults;
+
+      // An infrastructure outcome is not evidence either way, so the run must
+      // not claim success and must not spend a turn asking the agent to "fix"
+      // it. Sending it back used to be actively harmful: handed a timeout or
+      // a truncated-output message, the model goes looking for a code bug
+      // that does not exist and edits something that was never broken.
+      if (firstInfrastructure) {
+        verified = false;
+        verifyNote = describeVerifyInfrastructureStop(firstInfrastructure);
+        break;
+      }
 
       if (!firstBlamed) {
         verified = true;
@@ -1236,6 +1307,8 @@ async function executeTaskRun(request) {
           write,
           verified,
           verifyNote,
+          baselineProbeMs,
+          baselineProbeCommands: baselines.length,
           worktree,
           budgetStopped
         }
@@ -1245,6 +1318,11 @@ async function executeTaskRun(request) {
     commands: verifyCommands,
     attempts: attempt,
     note: verifyNote,
+    // The probe is now unconditional, so on a non-isolated run it doubles the
+    // verify wall clock. That cost has to be visible rather than showing up as
+    // an unexplained delay.
+    baselineProbeMs,
+    baselines,
     results: verifyResults
   };
 

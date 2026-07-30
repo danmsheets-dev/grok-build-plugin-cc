@@ -579,6 +579,17 @@ test("bogus --verify-attempts still yields a definite verified boolean", () => {
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
   // Non-integer attempts used to leave verified null → reported as plain completed.
+  //
+  // The verify command has to PASS at baseline and fail afterwards. A command
+  // that fails unconditionally used to work here only because the baseline
+  // probe was skipped on a non-isolated run; now that the probe always runs,
+  // an always-red command is correctly classified as already-failing and is
+  // no longer blamed on the run. This marker-file command is red only from
+  // its second invocation onward, which is exactly the "the run broke it"
+  // shape the attempts path is meant to exercise - and it needs no binary
+  // beyond node.
+  const verifyCommand =
+    `node -e "const fs=require('fs');const p='.gvmarker';if(fs.existsSync(p)){process.exit(1)}fs.writeFileSync(p,'1')"`;
   const result = run(
     "node",
     [
@@ -586,7 +597,7 @@ test("bogus --verify-attempts still yields a definite verified boolean", () => {
       "run",
       "--json",
       "--verify",
-      "node -e process.exit(1)",
+      verifyCommand,
       "--verify-attempts",
       "2.5",
       "do something"
@@ -604,6 +615,17 @@ test("bogus --verify-attempts still yields a definite verified boolean", () => {
   assert.notEqual(payload.verified, undefined);
   assert.equal(payload.verified, false);
 
+  // The probe used to be gated on an isolated write run, so a run like this
+  // one had no baseline at all and blamed whatever it found. It now runs here
+  // too - and its cost is reported.
+  assert.ok(
+    Number.isFinite(payload.verify.baselineProbeMs),
+    "expected a measured baseline probe duration"
+  );
+  assert.equal(payload.verify.baselines.length, 1);
+  assert.equal(payload.verify.baselines[0].ok, true, "the marker command passes at baseline");
+  assert.equal(payload.verify.results[0].failureSource, "agent");
+
   const previous = process.env.CLAUDE_PLUGIN_DATA;
   process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
   try {
@@ -619,6 +641,41 @@ test("bogus --verify-attempts still yields a definite verified boolean", () => {
   }
 });
 
+test("an unrunnable verify command is reported as infrastructure, never blamed on the agent", () => {
+  // Regression: a verify command that could not be started at all looked
+  // exactly like a failing test suite - non-zero exit, no recognisable
+  // failure lines - so it was attributed to the run, fed back to the agent as
+  // something to "fix", and could still end up reported as verified. None of
+  // those three are honest. Hermetic: the binary genuinely does not exist, so
+  // nothing is installed or spawned beyond the fake grok.
+  const repo = makeTempDir("grok-verify-unrunnable-");
+  const binDir = makeTempDir("grok-verify-unrunnable-bin-");
+  const pluginDataDir = makeTempDir("grok-verify-unrunnable-data-");
+  installFakeGrok(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run(
+    "node",
+    [SCRIPT, "run", "--json", "--verify", "grok-build-nonexistent-binary-xyz --headless", "do something"],
+    {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir)
+    }
+  );
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.verified, false, "an unrunnable verify command can never mean verified");
+  assert.equal(payload.verify.results[0].commandNotFound, true);
+  assert.equal(payload.verify.results[0].failureSource, "infrastructure");
+  assert.equal(payload.verify.results[0].attribution, "verify-command-not-runnable");
+  assert.match(payload.verify.note, /not a code failure/i);
+  // Breaks out without spending a fix turn on a command that never ran.
+  assert.equal(payload.verify.attempts, 0);
+});
 
 test("import uses grok import and prints resume hint", () => {
   const home = makeTempDir();

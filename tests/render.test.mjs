@@ -174,6 +174,59 @@ test("renderTaskResult surfaces a failing verification with its note", () => {
     { title: "Grok Build Delegate", verified: false, verifyNote: "still failing after 2 attempts" }
   );
   assert.match(output, /Verified: no/);
+  assert.match(output, /still failing after 2 attempts/);
+});
+
+test("renderTaskResult explains an infrastructure verify failure instead of implying a code fault", () => {
+  // Regression: the verified:false branch emitted one fixed sentence and
+  // dropped verifyNote entirely, so a run that failed because the verify
+  // command timed out or was never runnable told the user only that
+  // "verification did not pass" - the computed-and-never-delivered failure
+  // this status block exists to prevent.
+  const output = renderTaskResult(
+    { rawOutput: "Did the work." },
+    {
+      title: "Grok Build Delegate",
+      verified: false,
+      verifyNote:
+        "the verify command could not be started (not found on PATH) - this is not a code failure (godot --headless)"
+    }
+  );
+  assert.match(output, /Verified: no - the verify command could not be started/);
+  assert.match(output, /not a code failure/);
+  assert.doesNotMatch(output, /within the attempt budget/);
+});
+
+test("renderTaskResult still explains a plain verification failure without a note", () => {
+  const output = renderTaskResult(
+    { rawOutput: "Attempted a fix." },
+    { title: "Grok Build Delegate", verified: false }
+  );
+  assert.match(output, /Verified: no - verification did not pass within the attempt budget/);
+});
+
+test("renderTaskResult reports what the baseline probe cost", () => {
+  // The probe is unconditional now, so on a non-isolated run it doubles the
+  // verify wall clock. An unexplained doubling is how a safeguard gets
+  // switched off; the cost has to be visible.
+  const output = renderTaskResult(
+    { rawOutput: "Did the work." },
+    {
+      title: "Grok Build Delegate",
+      verified: true,
+      baselineProbeMs: 4200,
+      baselineProbeCommands: 2
+    }
+  );
+  assert.match(output, /Baseline probe: 4\.2s across 2 verify commands \(measured before the agent ran\)\./);
+});
+
+test("renderTaskResult omits the baseline probe line when no probe ran", () => {
+  const output = renderTaskResult(
+    { rawOutput: "Did the work." },
+    { title: "Grok Build Delegate", verified: true, baselineProbeMs: null }
+  );
+  assert.doesNotMatch(output, /Baseline probe/);
 });
 
 test("renderTaskResult surfaces the worktree and a land hint", () => {
