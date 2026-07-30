@@ -607,6 +607,42 @@ export function terminateProcessTree(pid, options = {}) {
   const graceMs = options.graceMs ?? 200;
   // Short settle between win32 escalation steps. Injected so tests do not sleep.
   const settleMs = options.settleMs ?? 250;
+  // How long the FINAL verdict waits for the tree to actually disappear.
+  //
+  // A single probe 250ms after the last kill is not enough: a Rust binary with
+  // MCP children and a tool shell takes longer than that to unwind, so a kill
+  // that worked was reported as `delivered: false`. Observed exactly that -
+  // `stop` said "process kill was not confirmed" for two PIDs that were already
+  // gone by the time anyone looked.
+  //
+  // Polling only ever converts a false negative into the truth: a process that
+  // is genuinely still alive stays alive for the whole window, so this cannot
+  // manufacture a false success.
+  const confirmTimeoutMs = options.confirmTimeoutMs ?? 3000;
+  const confirmStepMs = options.confirmStepMs ?? 100;
+
+  /**
+   * Poll until the pid is gone or the budget runs out. True = gone.
+   *
+   * The step is floored at 1ms because the loop advances by it: a caller (or a
+   * test) passing 0 would otherwise never increment `waited` and spin forever
+   * inside the bridge worker. Measured the hard way.
+   */
+  const waitForExit = (candidatePid) => {
+    if (!isAliveImpl(candidatePid)) {
+      return true;
+    }
+    const step = Math.max(1, Number(confirmStepMs) || 0);
+    let waited = 0;
+    while (waited < confirmTimeoutMs) {
+      sleepMs(step);
+      waited += step;
+      if (!isAliveImpl(candidatePid)) {
+        return true;
+      }
+    }
+    return false;
+  };
 
   if (platform === "win32") {
     const methods = [];
@@ -747,13 +783,14 @@ export function terminateProcessTree(pid, options = {}) {
       sleepMs(settleMs);
     }
 
-    const stillAlive = isAliveImpl(pid);
+    // Final verdict polls rather than sampling once — see waitForExit.
+    const exited = waitForExit(pid);
     return {
       attempted: true,
-      delivered: !stillAlive,
+      delivered: exited,
       method: methods.join("+") || "taskkill",
       errorText: errorParts.join("; ") || null,
-      survivors: stillAlive ? [pid] : [],
+      survivors: exited ? [] : [pid],
       result: lastResult
     };
   }
@@ -847,14 +884,16 @@ export function terminateProcessTree(pid, options = {}) {
     };
   }
 
-  sleepMs(40);
-  const stillAlive = isAliveImpl(pid);
+  // Same polling verdict as the win32 branch: a process group unwinding after
+  // SIGKILL can outlast a single 40ms sample, and reporting a survivor that is
+  // already gone sends the user to Task Manager for nothing.
+  const exited = waitForExit(pid);
   return {
     attempted: true,
-    delivered: !stillAlive,
+    delivered: exited,
     method: methods.join("+") || "process-sigkill",
-    errorText: stillAlive ? "process still alive after SIGKILL" : null,
-    survivors: stillAlive ? [pid] : []
+    errorText: exited ? null : "process still alive after SIGKILL",
+    survivors: exited ? [] : [pid]
   };
 }
 

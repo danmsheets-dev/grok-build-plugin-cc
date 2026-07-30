@@ -497,3 +497,52 @@ test("runCommand restores spawnSync's own 1 MiB default when no budget is given"
   assert.equal(explicit.status, 0);
   assert.equal(explicit.stdout.length, 2 * 1024 * 1024);
 });
+
+test("terminateProcessTree confirms a kill that lands after the first probe", () => {
+  // Regression: the final verdict sampled liveness once, ~250ms after the last
+  // kill. A Rust binary with MCP children and a tool shell takes longer than
+  // that to unwind, so `stop` reported "process kill was not confirmed" for two
+  // PIDs that were already gone by the time anyone looked. Polling only ever
+  // turns a false negative into the truth.
+  let probes = 0;
+  const outcome = terminateProcessTree(4242, {
+    platform: "win32",
+    settleMs: 0,
+    confirmStepMs: 0,
+    confirmTimeoutMs: 50,
+    runCommandImpl: () => ({
+      status: 1,
+      stdout: "",
+      stderr: "ERROR: The process with PID 4242 could not be terminated.\nReason: The operation attempted is not supported.",
+      error: null
+    }),
+    // Alive for the first few asks, gone afterwards - a process in teardown.
+    isAliveImpl: () => {
+      probes += 1;
+      return probes < 4;
+    }
+  });
+
+  assert.equal(outcome.attempted, true);
+  assert.equal(outcome.delivered, true, "a process that exits during the poll counts as killed");
+  assert.deepEqual(outcome.survivors, []);
+});
+
+test("terminateProcessTree still reports a genuine survivor", () => {
+  const outcome = terminateProcessTree(4243, {
+    platform: "win32",
+    settleMs: 0,
+    confirmStepMs: 0,
+    confirmTimeoutMs: 20,
+    runCommandImpl: () => ({
+      status: 1,
+      stdout: "",
+      stderr: "ERROR: could not be terminated.",
+      error: null
+    }),
+    isAliveImpl: () => true
+  });
+
+  assert.equal(outcome.delivered, false);
+  assert.deepEqual(outcome.survivors, [4243]);
+});
