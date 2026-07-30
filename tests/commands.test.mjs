@@ -264,6 +264,19 @@ test("the README warns about the shared Godot cache and names the opt-out", () =
   );
 });
 
+test("the README documents the Blender sandbox, including what it deliberately leaves alone", () => {
+  const readme = fs.readFileSync(path.join(PLUGIN_ROOT, "README.md"), "utf8");
+
+  assert.match(readme, /`--blender-sandbox`/);
+  assert.match(readme, /`--env KEY=VALUE`/);
+  assert.match(readme, /BLENDER_USER_SCRIPTS/);
+  // The two things a user cannot discover by running it: preferences survive
+  // because BLENDER_USER_CONFIG is untouched, and nothing is auto-enabled, so a
+  // test script that does not call addon_utils.enable finds no add-on at all.
+  assert.match(readme, /BLENDER_USER_CONFIG/);
+  assert.match(readme, /addon_utils\.enable/);
+});
+
 test("the README tells the truth about a conflicted land", () => {
   const readme = fs.readFileSync(path.join(PLUGIN_ROOT, "README.md"), "utf8");
 

@@ -339,6 +339,7 @@ export async function runVerifyCommand(command, cwd, options = {}) {
  * @param {string} cwd
  * @param {{
  *   runVerifyCommandImpl?: typeof runVerifyCommand,
+ *   env?: NodeJS.ProcessEnv,
  *   timeoutMs?: number,
  *   maxOutputBytes?: number,
  *   outputFailurePatterns?: {id: string, re: RegExp}[],
@@ -362,12 +363,15 @@ export async function probeBaselines(commands, cwd, options = {}) {
 
   for (const command of commands ?? []) {
     const started = Date.now();
-    // The output budget, the failure patterns, and the ignore list all have to
-    // match the post-agent pass. A baseline captured under a tighter bound (or
-    // without the pattern set that makes an exit-0 Godot import count as a
-    // failure) records a shorter signature, and every failure the fuller
-    // capture then finds looks new.
+    // The output budget, the failure patterns, the ignore list and the
+    // ENVIRONMENT all have to match the post-agent pass. A baseline captured
+    // under a tighter bound (or without the pattern set that makes an exit-0
+    // Godot import count as a failure) records a shorter signature, and every
+    // failure the fuller capture then finds looks new. The env is the same
+    // argument with a bigger blast radius: a baseline measured without the
+    // run's --env overrides can be running a different binary entirely.
     const probe = await runVerifyCommandImpl(command, cwd, {
+      env: options.env,
       timeoutMs: options.timeoutMs,
       maxOutputBytes: options.maxOutputBytes,
       outputFailurePatterns: options.outputFailurePatterns

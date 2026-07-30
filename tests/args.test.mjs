@@ -150,3 +150,46 @@ test("the run command's real option table accepts the verify timing flags", asyn
   assert.equal(result.options["verify-max-buffer"], "32");
   assert.deepEqual(result.positionals, ["fix the importer"]);
 });
+
+test("--env is repeatable and splits on the first = only", async () => {
+  // Parsed through the real table for the same reason as above, then through
+  // the real parser. A Windows path and a base64 token both legitimately
+  // contain further `=`, so anything but a first-separator split corrupts them.
+  const { TASK_VALUE_OPTIONS, parseEnvAssignments } = await import(
+    "../plugins/grok-build/scripts/grok-bridge.mjs"
+  );
+
+  assert.ok(TASK_VALUE_OPTIONS.includes("env"));
+
+  const result = parseArgs(
+    ["--env", "FOO=bar", "--env", String.raw`PATHX=C:\a=b`, "--env", "EMPTY=", "run it"],
+    { valueOptions: [...TASK_VALUE_OPTIONS], repeatableOptions: ["env"] }
+  );
+
+  assert.deepEqual(parseEnvAssignments(result.options.env), {
+    FOO: "bar",
+    PATHX: String.raw`C:\a=b`,
+    // An empty value is a legitimate way to blank an inherited variable, not an
+    // absent override.
+    EMPTY: ""
+  });
+  assert.deepEqual(result.positionals, ["run it"]);
+});
+
+test("parseEnvAssignments accepts a single value and rejects a malformed one", async () => {
+  const { parseEnvAssignments } = await import(
+    "../plugins/grok-build/scripts/grok-bridge.mjs"
+  );
+
+  // parseArgs hands back a bare string for one occurrence and an array for
+  // several, so both shapes reach this function.
+  assert.deepEqual(parseEnvAssignments("FOO=bar"), { FOO: "bar" });
+  assert.deepEqual(parseEnvAssignments(undefined), {});
+  assert.deepEqual(parseEnvAssignments([]), {});
+
+  // Loud, not silent: an override that quietly does nothing surfaces later as a
+  // verify failure with no visible cause.
+  assert.throws(() => parseEnvAssignments("FOO"), /--env/);
+  assert.throws(() => parseEnvAssignments("=bar"), /KEY=VALUE/);
+  assert.throws(() => parseEnvAssignments(["FOO=bar", "  =x"]), /KEY=VALUE/);
+});

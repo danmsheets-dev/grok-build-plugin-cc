@@ -2,6 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
+import { detectEcosystems } from "./ecosystem.mjs";
+
 // Heavyweight directories linked from the source repo into a fresh worktree
 // so the first verify command does not fail for lack of dependencies. Covers
 // the five target ecosystems: Godot's import cache (.godot for Godot 4,
@@ -155,6 +157,140 @@ export function planWorktreeLinks(repoRoot, worktreePath, options = {}) {
   }
 
   return { links, notes };
+}
+
+/**
+ * The worktree-private scratch directory. Anything under it belongs to the run,
+ * never to the project, which is why `.grok-build/` is in worktree.mjs's
+ * GENERATED_ARTIFACT_PATTERNS: on win32 `git add` walks a junction (Windows
+ * reports one as a directory), and the Blender sandbox below points a junction
+ * at a directory that is ITSELF inside the worktree, so without the exclude a
+ * commit would carry a second copy of the whole add-on.
+ *
+ * Note the trailing-less name: the project config file is `.grok-build.json`,
+ * a sibling, and neither the exclude pathspec nor anything here touches it.
+ */
+export const WORKTREE_SCRATCH_DIR = ".grok-build";
+
+/** Where a sandboxed Blender looks for add-ons, relative to the worktree. */
+export const BLENDER_SANDBOX_SCRIPTS_RELATIVE = `${WORKTREE_SCRATCH_DIR}/blender/scripts`;
+export const BLENDER_SANDBOX_EXTENSIONS_RELATIVE = `${WORKTREE_SCRATCH_DIR}/blender/extensions`;
+
+/**
+ * The one thing a user MUST know when they turn the sandbox on: with a private
+ * scripts directory nothing is enabled for them, in either startup mode.
+ */
+export const BLENDER_SANDBOX_ENABLE_NOTE =
+  "a sandboxed add-on is auto-enabled in neither startup mode - the test script must call addon_utils.enable(\"<module>\", default_set=False, persistent=True).";
+
+/**
+ * Plan an in-worktree Blender add-on scripts directory.
+ *
+ * The standard Blender add-on workflow symlinks the per-user
+ * `scripts/addons/<name>` at the developer's source checkout, so a headless
+ * verify run inside an isolated worktree loads the add-on from their REAL
+ * repository - it exercises pre-agent code, which is exactly the failure
+ * isolation exists to prevent. Blender has no CLI flag for "use this add-on
+ * directory"; the only lever is the BLENDER_USER_* environment, which is why
+ * this returns an `env` rather than command arguments (see item 25's --env).
+ *
+ * Deliberately opt-in (`--blender-sandbox`). Applying it automatically would
+ * hide every OTHER add-on the user's verify script depends on and turn working
+ * verify commands red.
+ *
+ * Only BLENDER_USER_SCRIPTS and BLENDER_USER_EXTENSIONS are set.
+ * BLENDER_USER_CONFIG is deliberately NOT set: Cycles' GPU device selection and
+ * every add-on preference live in `userpref.blend` under that directory, so
+ * pointing it at an empty sandbox silently forces CPU rendering and drops the
+ * user's preferences.
+ *
+ * @param {string} worktreePath
+ * @param {{
+ *   platform?: string,
+ *   repoRoot?: string,
+ *   addonName?: string,
+ *   existsSync?: typeof fs.existsSync,
+ *   readdirSync?: typeof fs.readdirSync,
+ *   readFileSync?: typeof fs.readFileSync,
+ *   env?: NodeJS.ProcessEnv
+ * }} [options]
+ * @returns {{scriptsDir: string|null, extensionsDir: string|null, addonName: string|null, addonSource: string|null, links: Array<{from: string, to: string, kind: string}>, env: Record<string, string>, notes: string[]}}
+ */
+export function planBlenderScriptSandbox(worktreePath, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const kind = platform === "win32" ? "junction" : "symlink";
+  // The same injectable trio detectEcosystems wants. Detection is reused rather
+  // than reimplemented so "what counts as a Blender add-on" has exactly one
+  // definition (blender_manifest.toml, or an __init__.py whose first 4 KB
+  // carries `bl_info =`), at the root or one directory down.
+  const io = {
+    existsSync: options.existsSync ?? fs.existsSync,
+    readdirSync: options.readdirSync ?? fs.readdirSync,
+    readFileSync: options.readFileSync ?? fs.readFileSync,
+    env: options.env ?? process.env
+  };
+
+  const nothing = (note) => ({
+    scriptsDir: null,
+    extensionsDir: null,
+    addonName: null,
+    addonSource: null,
+    links: [],
+    env: {},
+    notes: note ? [note] : []
+  });
+
+  if (!worktreePath) {
+    return nothing("--blender-sandbox: a worktree path is required, so nothing was sandboxed.");
+  }
+
+  const wt = path.resolve(String(worktreePath));
+  const descriptor = detectEcosystems(wt, io).find((entry) => entry.id === "blender");
+  // `detectedBy: "blend-file"` is a Blender PROJECT (a .blend scene), not an
+  // add-on. There is no module to link, and pointing BLENDER_USER_SCRIPTS at an
+  // empty directory would only cost the user their other add-ons.
+  const addonRelative = descriptor?.manifestPath ?? descriptor?.addonInitPath ?? null;
+  if (!addonRelative) {
+    return nothing(
+      "--blender-sandbox: no add-on (blender_manifest.toml or a bl_info __init__.py) was found at the worktree root or one level down, so nothing was sandboxed."
+    );
+  }
+
+  // detectEcosystems reports forward-slash relative paths; "." is the root.
+  const addonDirRelative = path.posix.dirname(addonRelative);
+  const atRoot = addonDirRelative === "." || addonDirRelative === "";
+  const addonSource = atRoot ? wt : path.join(wt, ...addonDirRelative.split("/"));
+  // Blender imports an add-on under its DIRECTORY name, so the link has to keep
+  // it. A repo whose root is itself the add-on has no such directory inside the
+  // worktree - and the worktree's own basename is a run id, not a module name -
+  // so the repository name is used, which is what the developer's own manual
+  // symlink into scripts/addons would have been called.
+  const addonName =
+    options.addonName ??
+    (atRoot ? path.basename(path.resolve(String(options.repoRoot ?? wt))) : addonDirRelative);
+
+  const scriptsDir = path.join(wt, ...BLENDER_SANDBOX_SCRIPTS_RELATIVE.split("/"));
+  const extensionsDir = path.join(wt, ...BLENDER_SANDBOX_EXTENSIONS_RELATIVE.split("/"));
+
+  return {
+    scriptsDir,
+    extensionsDir,
+    addonName,
+    addonSource,
+    links: [{ from: addonSource, to: path.join(scriptsDir, "addons", addonName), kind }],
+    env: {
+      BLENDER_USER_SCRIPTS: scriptsDir,
+      // Pointed at a sandbox directory that is never created. An absent
+      // extensions directory is how "this run sees none of your installed
+      // extensions" is expressed; Blender creates its user directories on
+      // demand and needs no help here.
+      BLENDER_USER_EXTENSIONS: extensionsDir
+    },
+    notes: [
+      `--blender-sandbox: ${addonName} is linked into ${BLENDER_SANDBOX_SCRIPTS_RELATIVE}/addons and BLENDER_USER_SCRIPTS points there, so this run sees only this add-on (your Blender preferences are untouched).`,
+      BLENDER_SANDBOX_ENABLE_NOTE
+    ]
+  };
 }
 
 /**

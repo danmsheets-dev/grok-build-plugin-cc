@@ -54,6 +54,30 @@ The bridge is read-only by default. `--write` is opt-in at the CLI, but the
 `grok-build:grok-delegate` subagent adds `--write` by policy, so `/grok-build:delegate`
 is write-capable unless you ask for read-only.
 
+## Blender add-on isolation
+
+Blender loads add-ons from a per-user scripts directory, and the standard workflow
+symlinks `scripts/addons/<name>` at your **source checkout**. An isolated run therefore
+verifies your real repository, not the worktree — the agent's changes are not what gets
+tested, which is the exact failure isolation exists to prevent.
+
+`--blender-sandbox` fixes that for one run: the add-on (a `blender_manifest.toml`, or an
+`__init__.py` carrying `bl_info`, at the worktree root or one directory down) is linked
+into `.grok-build/blender/scripts/addons/<name>` inside the worktree, and
+`BLENDER_USER_SCRIPTS` / `BLENDER_USER_EXTENSIONS` point there for both the verify
+commands and the agent.
+
+- **It is opt-in, and it should be.** A private scripts directory hides every *other*
+  add-on your verify script may depend on, so applying it automatically would turn
+  working verify commands red.
+- **`BLENDER_USER_CONFIG` is deliberately left alone.** Cycles' GPU device selection and
+  every add-on preference live in `userpref.blend` under that directory; pointing it at
+  an empty sandbox silently forces CPU rendering and drops your preferences.
+- **Nothing is auto-enabled**, in either startup mode. Your test script must call
+  `addon_utils.enable("<module>", default_set=False, persistent=True)`.
+- `.grok-build/` is excluded from the run's commit, so the linked copy of the add-on
+  can never be committed twice.
+
 ## Verification
 
 `--verify "<cmd>"` makes a green result mean something.
@@ -248,6 +272,8 @@ A run also reports what it did to the disk and how it was captured:
 | `--verify-timeout <seconds>` | Budget for each verify command. Used verbatim; without it the budget is derived from the measured baseline (4x, floored at 120s, capped at 900s) |
 | `--baseline-timeout <seconds>` | Budget for the pre-run baseline probe. Only ever raises the 900s default |
 | `--verify-max-buffer <megabytes>` | How much verify output to keep. Output over the budget is not an error: the head and tail are kept and the middle is elided |
+| `--env KEY=VALUE` | Set a variable for the verify commands **and** the agent (repeatable). Split on the first `=` only, so a value may contain more. The full process environment is inherited; these are overrides on top of it |
+| `--blender-sandbox` | Give the run a private Blender add-on directory inside the worktree (see below). Opt-in, and only meaningful for an isolated write run |
 | `--no-isolate` | Edit the working tree directly instead of using a worktree |
 | `--max-duration <seconds>` | Stop the run after a wall-clock limit |
 | `--max-turns <n>` | Cap agent turns (passed through to the CLI) |

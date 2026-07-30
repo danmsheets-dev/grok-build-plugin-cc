@@ -673,6 +673,48 @@ test("Blender save backups are excluded but the .blend scene itself is committed
   });
 });
 
+test("the run's own .grok-build scratch directory never reaches a commit", () => {
+  // --blender-sandbox links the add-on to a path INSIDE the worktree. On win32
+  // git walks a junction as an ordinary directory, so without the exclude the
+  // commit would carry a second copy of the whole add-on; the real link is
+  // exercised below, and a plain file covers the POSIX shape.
+  const cwd = makeTempDir("grok-wt-scratch-");
+  const dataDir = makeTempDir("grok-wt-scratch-data-");
+  seedRepo(cwd);
+
+  const created = createWorktree({ cwd, runId: "scratch-1", dataDir });
+  const wt = created.worktreePath;
+
+  writeFileIn(wt, "myaddon/__init__.py", "bl_info = {}\n");
+  writeFileIn(wt, ".grok-build/blender/scripts/marker", "sandbox\n");
+  fs.mkdirSync(path.join(wt, ".grok-build", "blender", "scripts", "addons"), { recursive: true });
+  fs.symlinkSync(
+    path.join(wt, "myaddon"),
+    path.join(wt, ".grok-build", "blender", "scripts", "addons", "myaddon"),
+    LINK_KIND
+  );
+  // The project config file is a SIBLING with a longer name and is ordinary
+  // tracked source: `**/.grok-build` must not match it.
+  writeFileIn(wt, ".grok-build.json", '{"version": 1}\n');
+
+  const committed = commitWorktreeChanges(wt, "sandbox nearby");
+  assert.equal(committed.committed, true);
+
+  const names = committedNames(wt);
+  assert.ok(names.includes("myaddon/__init__.py"), names.join(", "));
+  assert.ok(names.includes(".grok-build.json"), `the config file is source: ${names.join(", ")}`);
+  assert.ok(
+    !names.some((name) => name.startsWith(".grok-build/")),
+    `nothing under the scratch directory may be committed, got: ${names.join(", ")}`
+  );
+
+  removeWorktree({
+    repoRoot: created.repoRoot,
+    worktreePath: created.worktreePath,
+    branchName: created.branchName
+  });
+});
+
 test("machine-local Godot credentials never reach a commit", () => {
   const cwd = makeTempDir("grok-wt-creds-");
   const dataDir = makeTempDir("grok-wt-creds-data-");

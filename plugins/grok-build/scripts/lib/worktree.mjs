@@ -65,7 +65,19 @@ const GENERATED_ARTIFACT_PATTERNS = Object.freeze([
   ".nuxt/",
   ".svelte-kit/",
   ".turbo/",
-  ".parcel-cache/"
+  ".parcel-cache/",
+  // The run's own scratch directory inside the worktree (provision.mjs's
+  // WORKTREE_SCRATCH_DIR). Nothing under it is the user's work. It matters most
+  // for --blender-sandbox, whose junction points at a directory that is itself
+  // inside the worktree: on win32 git walks a junction as an ordinary directory,
+  // so without this the commit would carry a duplicate copy of the whole add-on
+  // (measured - removing this entry stages
+  // `.grok-build/blender/scripts/addons/myaddon/__init__.py`).
+  //
+  // A directory pattern, and only a directory pattern: the project config file
+  // `.grok-build.json` is a SIBLING with a longer name, it is normal tracked
+  // source, and `**/.grok-build` never matches it.
+  ".grok-build/"
 ]);
 
 /**

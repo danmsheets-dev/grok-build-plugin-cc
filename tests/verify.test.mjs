@@ -525,6 +525,51 @@ test("probeBaselines awaits an async runner and mirrors its infrastructure flags
   );
 });
 
+test("a verify command runs with the caller's environment overrides", async () => {
+  // Blender is the reason --env exists: it has no CLI flag for "use this add-on
+  // directory", only BLENDER_USER_SCRIPTS and friends. The override has to be
+  // layered ON TOP of process.env - a bare overrides object would strip PATH
+  // and SystemRoot and break every command on Windows, so `node` itself would
+  // not resolve.
+  const withOverride = await runVerifyCommand(
+    "node -e process.exit(process.env.GROK_ENV_PROBE==='bar'?0:3)",
+    process.cwd(),
+    { env: { ...process.env, GROK_ENV_PROBE: "bar" } }
+  );
+  assert.equal(withOverride.ok, true);
+  assert.equal(withOverride.exitCode, 0);
+
+  // The discriminator: the identical command without the override.
+  const without = await runVerifyCommand(
+    "node -e process.exit(process.env.GROK_ENV_PROBE==='bar'?0:3)",
+    process.cwd()
+  );
+  assert.equal(without.ok, false);
+  assert.equal(without.exitCode, 3);
+});
+
+test("the baseline probe measures with the same environment as the real pass", async () => {
+  // A baseline measured WITHOUT the run's overrides can be running a different
+  // binary entirely, and every difference the real pass then finds is
+  // attributed to the agent.
+  const seen = [];
+  const fake = async (command, cwd, options) => {
+    seen.push(options?.env);
+    return { ok: true, exitCode: 0, timedOut: false, output: "exit_code: 0" };
+  };
+
+  await probeBaselines(["a", "b"], "/tmp/project", {
+    runVerifyCommandImpl: fake,
+    env: { PATH: "/sandbox/bin", BLENDER_USER_SCRIPTS: "/wt/.grok-build/blender/scripts" }
+  });
+
+  assert.equal(seen.length, 2);
+  for (const env of seen) {
+    assert.equal(env?.BLENDER_USER_SCRIPTS, "/wt/.grok-build/blender/scripts");
+    assert.equal(env?.PATH, "/sandbox/bin");
+  }
+});
+
 test("probeBaselines returns an empty list for an empty command list", () => {
   return probeBaselines([], "/tmp/project", {
     runVerifyCommandImpl: () => {

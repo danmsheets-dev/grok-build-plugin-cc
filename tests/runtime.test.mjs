@@ -1181,6 +1181,214 @@ test("--verify-ignore reaches the stored request under --background", () => {
   }
 });
 
+test("--env reaches the verify command, and the run says which variables it set", () => {
+  // Blender is the reason this exists: it has no CLI flag for "use this add-on
+  // directory", only BLENDER_USER_SCRIPTS and friends. End to end because the
+  // map has to survive handleTask -> the request -> executeTaskRun -> both the
+  // baseline probe and the real pass, and each hop is a place it silently
+  // becomes undefined. Hermetic: `node` is the only binary involved.
+  const repo = makeTempDir("grok-env-e2e-");
+  const binDir = makeTempDir("grok-env-e2e-bin-");
+  const pluginDataDir = makeTempDir("grok-env-e2e-data-");
+  installFakeGrok(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  // Space-free -e script: cmd.exe /d /s /c strips exactly one outer quote pair,
+  // and a nested `"` inside a spaced argument is what mangles on win32.
+  const probe = "node -e process.exit(process.env.GROK_ENV_PROBE==='bar'?0:3)";
+  const args = [SCRIPT, "run", "--json", "--verify", probe];
+
+  const withEnv = run(
+    "node",
+    [...args, "--env", "GROK_ENV_PROBE=bar", "--env", "MY_PAT=s3cr3t-value", "check the env"],
+    { cwd: repo, env: pluginDataEnv(pluginDataDir, binDir) }
+  );
+  assert.equal(withEnv.status, 0, withEnv.stderr || withEnv.stdout);
+  const passed = JSON.parse(withEnv.stdout);
+  assert.equal(passed.verified, true);
+  assert.equal(passed.verify.results[0].exitCode, 0);
+  // The probe measured the SAME environment, or the baseline comparison would
+  // be against a different command.
+  assert.equal(passed.verify.baselines[0].ok, true);
+  // Which variables a run imposed is diagnostic; their values are the user's
+  // secrets, and redaction is by key NAME (a token under MY_PAT is exactly the
+  // case a value-shaped regex misses).
+  assert.equal(passed.env.GROK_ENV_PROBE, "bar");
+  assert.equal(passed.env.MY_PAT, "[redacted]");
+  assert.ok(
+    !JSON.stringify(passed).includes("s3cr3t-value"),
+    "a sensitive value must not survive anywhere in the persisted payload"
+  );
+
+  // The discriminator: the identical run without the override.
+  const withoutEnv = run("node", [...args, "check the env"], {
+    cwd: repo,
+    env: pluginDataEnv(pluginDataDir, binDir)
+  });
+  assert.equal(withoutEnv.status, 0, withoutEnv.stderr || withoutEnv.stdout);
+  const bare = JSON.parse(withoutEnv.stdout);
+  assert.equal(bare.verify.results[0].exitCode, 3);
+  assert.deepEqual(bare.env, {});
+});
+
+test("--env and --blender-sandbox reach the stored request under --background", () => {
+  // A background worker resolves nothing of its own: whatever did not make it
+  // into the request simply does not happen, and --background is the delegate
+  // default.
+  const repo = makeTempDir("grok-env-bg-");
+  const binDir = makeTempDir("grok-env-bg-bin-");
+  const pluginDataDir = makeTempDir("grok-env-bg-data-");
+  installFakeGrok(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run(
+    "node",
+    [
+      SCRIPT,
+      "run",
+      "--background",
+      "--json",
+      "--blender-sandbox",
+      "--env",
+      "BLENDER_USER_SCRIPTS=/somewhere/scripts",
+      "--env",
+      String.raw`PATHX=C:\a=b`,
+      "do something"
+    ],
+    { cwd: repo, env: pluginDataEnv(pluginDataDir, binDir) }
+  );
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const launch = JSON.parse(result.stdout);
+
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  try {
+    const stored = JSON.parse(fs.readFileSync(resolveJobFile(repo, launch.jobId), "utf8"));
+    // Verbatim, not redacted: this object is the worker's INPUT, and a
+    // background run handed "[redacted]" for its token would simply fail.
+    assert.deepEqual(stored.request.env, {
+      BLENDER_USER_SCRIPTS: "/somewhere/scripts",
+      PATHX: String.raw`C:\a=b`
+    });
+    assert.equal(stored.request.blenderSandbox, true);
+  } finally {
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
+});
+
+test("--blender-sandbox verifies against the worktree's add-on, not the developer's checkout", () => {
+  // The bug: Blender loads add-ons from a per-user scripts directory, and the
+  // standard workflow points scripts/addons/<name> at the SOURCE checkout - so
+  // an isolated run verifies pre-agent code, which is exactly the failure
+  // isolation exists to prevent. No Blender is involved here; the verify
+  // command asserts the same thing Blender would discover.
+  const repo = makeTempDir("grok-blender-sandbox-e2e-");
+  const binDir = makeTempDir("grok-blender-sandbox-e2e-bin-");
+  const pluginDataDir = makeTempDir("grok-blender-sandbox-e2e-data-");
+  installFakeGrok(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "myaddon"), { recursive: true });
+  fs.writeFileSync(
+    path.join(repo, "myaddon", "__init__.py"),
+    'bl_info = {"name": "My Addon", "blender": (4, 2, 0)}\n'
+  );
+  fs.writeFileSync(path.join(repo, "myaddon", "ops.py"), "MARKER\n");
+  run("git", ["add", "-A"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  // Resolves the add-on exactly as Blender would: through BLENDER_USER_SCRIPTS.
+  // Space-free so cmd.exe's single-outer-quote-pair rule cannot mangle it, and
+  // `String(...)` rather than `||`: cmd.exe reads `||` as its own operator and
+  // splits the command line in half.
+  const probe =
+    "node -e process.exit(require('fs').existsSync(require('path').join(String(process.env.BLENDER_USER_SCRIPTS),'addons','myaddon','ops.py'))?0:9)";
+
+  const result = run(
+    "node",
+    [SCRIPT, "run", "--write", "--json", "--blender-sandbox", "--verify", probe, "edit the addon"],
+    { cwd: repo, env: pluginDataEnv(pluginDataDir, binDir) }
+  );
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.verified, true, JSON.stringify(payload.verify?.results?.[0] ?? null));
+  assert.equal(
+    payload.verify.results[0].exitCode,
+    0,
+    payload.verify.results[0].output
+  );
+
+  // The sandbox is inside the worktree - that is what makes it isolation.
+  const scriptsDir = payload.env.BLENDER_USER_SCRIPTS;
+  assert.ok(scriptsDir, "BLENDER_USER_SCRIPTS must be reported");
+  assert.ok(
+    scriptsDir.startsWith(payload.worktree.path),
+    `${scriptsDir} must live inside ${payload.worktree.path}`
+  );
+  // And the link resolves to the WORKTREE's copy of the add-on. The whole bug
+  // is that it otherwise resolves to the user's real checkout, where the
+  // agent's changes are not.
+  const worktreeReal = fs.realpathSync(payload.worktree.path);
+  const linkedReal = fs.realpathSync(path.join(scriptsDir, "addons", "myaddon"));
+  assert.ok(
+    linkedReal.startsWith(worktreeReal),
+    `the sandboxed add-on resolved to ${linkedReal}, outside ${worktreeReal}`
+  );
+  // Cycles' GPU device selection and every add-on preference live in
+  // userpref.blend under BLENDER_USER_CONFIG; pointing it at an empty sandbox
+  // silently forces CPU rendering and drops the user's preferences.
+  assert.equal(payload.env.BLENDER_USER_CONFIG, undefined);
+  assert.ok(
+    payload.provision.notes.some((note) => note.includes("addon_utils.enable")),
+    `a sandboxed add-on is auto-enabled in neither startup mode: ${JSON.stringify(payload.provision.notes)}`
+  );
+});
+
+test("--blender-sandbox on a non-isolated run says it did nothing", () => {
+  // The sandbox is torn down with the worktree. Building one in the user's real
+  // checkout would leave a junction behind that nothing cleans up, so the flag
+  // declines rather than half-applying - and says so.
+  const repo = makeTempDir("grok-blender-noisolate-");
+  const binDir = makeTempDir("grok-blender-noisolate-bin-");
+  const pluginDataDir = makeTempDir("grok-blender-noisolate-data-");
+  installFakeGrok(binDir);
+  initGitRepo(repo);
+  fs.mkdirSync(path.join(repo, "myaddon"), { recursive: true });
+  fs.writeFileSync(path.join(repo, "myaddon", "__init__.py"), "bl_info = {}\n");
+  run("git", ["add", "-A"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run(
+    "node",
+    [SCRIPT, "run", "--write", "--no-isolate", "--json", "--blender-sandbox", "--no-verify", "edit"],
+    { cwd: repo, env: pluginDataEnv(pluginDataDir, binDir) }
+  );
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.worktree, null);
+  assert.ok(
+    payload.provision.notes.some((note) => note.includes("--blender-sandbox needs an isolated")),
+    JSON.stringify(payload.provision)
+  );
+  assert.deepEqual(payload.env, {});
+  assert.ok(
+    !fs.existsSync(path.join(repo, ".grok-build")),
+    "nothing may be created in the user's real checkout"
+  );
+});
+
 test("a Godot cache that git already checked out is reported, not silently skipped", () => {
   // The provisionWorktree result used to be discarded outright. A repository
   // that TRACKS its `.godot` (plenty do, deliberately or not) has it checked

@@ -4,10 +4,12 @@ import path from "node:path";
 import fs from "node:fs";
 
 import {
+  BLENDER_SANDBOX_SCRIPTS_RELATIVE,
   GODOT_CACHE_DIRS,
   GODOT_SHARED_CACHE_NOTE,
   PROVISION_COPY_PATHS,
   PROVISION_LINK_DIRS,
+  planBlenderScriptSandbox,
   planWorktreeLinks,
   provisionWorktree
 } from "../plugins/grok-build/scripts/lib/provision.mjs";
@@ -305,6 +307,172 @@ describe("Godot import cache tier", () => {
       !realFs.existsSync(path.join(repo, ".godot", "written_by_the_run.bin")),
       "a copied cache must not write through to the user's working copy"
     );
+  });
+});
+
+describe("planBlenderScriptSandbox", () => {
+  // Every call passes the REAL fs explicitly (see the realFs note at the top of
+  // this file: the describes above leave node:test's global MockTracker holding
+  // fs). Nothing here starts Blender - the plan is pure filesystem reading.
+  const io = {
+    existsSync: realFs.existsSync,
+    readdirSync: realFs.readdirSync,
+    readFileSync: realFs.readFileSync,
+    env: {}
+  };
+
+  function seedAddon(prefix, files) {
+    const wt = makeTempDir(prefix);
+    for (const [relative, body] of Object.entries(files)) {
+      const target = path.join(wt, ...relative.split("/"));
+      realFs.mkdirSync(path.dirname(target), { recursive: true });
+      realFs.writeFileSync(target, body, "utf8");
+    }
+    return wt;
+  }
+
+  test("a depth-1 bl_info add-on is linked into the worktree's own scripts directory", () => {
+    const wt = seedAddon("grok-blender-sandbox-", {
+      "myaddon/__init__.py": 'bl_info = {"name": "My Addon", "blender": (4, 2, 0)}\n',
+      "myaddon/ops.py": "import bpy\n"
+    });
+
+    const plan = planBlenderScriptSandbox(wt, { ...io, platform: "win32" });
+
+    assertModule.strictEqual(plan.links.length, 1);
+    assertModule.strictEqual(plan.addonName, "myaddon");
+    assertModule.strictEqual(plan.links[0].from, path.join(wt, "myaddon"));
+    assertModule.strictEqual(
+      plan.links[0].to,
+      path.join(wt, ".grok-build", "blender", "scripts", "addons", "myaddon")
+    );
+    // Windows has no symlink privilege by default; a junction needs none.
+    assertModule.strictEqual(plan.links[0].kind, "junction");
+    assertModule.strictEqual(
+      plan.env.BLENDER_USER_SCRIPTS,
+      path.join(wt, ...BLENDER_SANDBOX_SCRIPTS_RELATIVE.split("/"))
+    );
+    assertModule.ok(
+      plan.env.BLENDER_USER_SCRIPTS.startsWith(wt),
+      "the sandbox must live inside the worktree, or it is not isolation"
+    );
+    assertModule.ok(plan.env.BLENDER_USER_EXTENSIONS.startsWith(wt));
+  });
+
+  test("BLENDER_USER_CONFIG is never set, whatever the layout", () => {
+    // Cycles' GPU device selection and every add-on preference live in
+    // userpref.blend under that directory. Pointing it at an empty sandbox
+    // silently forces CPU rendering and drops the user's preferences, which is
+    // a far worse trade than the one the sandbox is making.
+    const layouts = [
+      { "myaddon/__init__.py": "bl_info = {}\n" },
+      { "blender_manifest.toml": 'id = "my_ext"\n' },
+      { "addon/blender_manifest.toml": 'id = "my_ext"\n' }
+    ];
+    for (const files of layouts) {
+      const wt = seedAddon("grok-blender-config-", files);
+      const plan = planBlenderScriptSandbox(wt, { ...io, platform: "linux" });
+      assertModule.ok(plan.links.length === 1, JSON.stringify(files));
+      assertModule.deepStrictEqual(
+        Object.keys(plan.env).sort(),
+        ["BLENDER_USER_EXTENSIONS", "BLENDER_USER_SCRIPTS"],
+        `only these two may be set, got ${Object.keys(plan.env)}`
+      );
+    }
+  });
+
+  test("off win32 the link is a symlink, not a junction", () => {
+    const wt = seedAddon("grok-blender-symlink-", {
+      "myaddon/__init__.py": "bl_info = {}\n"
+    });
+    const plan = planBlenderScriptSandbox(wt, { ...io, platform: "linux" });
+    assertModule.strictEqual(plan.links[0].kind, "symlink");
+  });
+
+  test("a 4.2+ extension manifest is detected as well as bl_info", () => {
+    const wt = seedAddon("grok-blender-manifest-", {
+      "myext/blender_manifest.toml": 'schema_version = "1.0.0"\nid = "myext"\n'
+    });
+    const plan = planBlenderScriptSandbox(wt, { ...io, platform: "linux" });
+    assertModule.strictEqual(plan.addonName, "myext");
+    assertModule.strictEqual(plan.links[0].from, path.join(wt, "myext"));
+  });
+
+  test("a plain Python package is not an add-on and is left alone", () => {
+    // The discriminator for the whole feature: sandboxing a non-add-on would
+    // hide the user's real add-ons and buy nothing.
+    const wt = seedAddon("grok-blender-plain-", {
+      "mypkg/__init__.py": "from .core import main\n",
+      "mypkg/core.py": "def main():\n    pass\n"
+    });
+
+    const plan = planBlenderScriptSandbox(wt, { ...io, platform: "linux" });
+
+    assertModule.deepStrictEqual(plan.links, []);
+    assertModule.deepStrictEqual(plan.env, {});
+    assertModule.strictEqual(plan.scriptsDir, null);
+    assertModule.ok(
+      plan.notes.some((note) => note.includes("no add-on")),
+      `the user has to be told nothing was sandboxed, got: ${JSON.stringify(plan.notes)}`
+    );
+  });
+
+  test("a .blend scene with no add-on is a Blender project, not something to sandbox", () => {
+    const wt = seedAddon("grok-blender-scene-", { "scene.blend": "BLENDER\n" });
+    const plan = planBlenderScriptSandbox(wt, { ...io, platform: "linux" });
+    assertModule.deepStrictEqual(plan.links, []);
+    assertModule.deepStrictEqual(plan.env, {});
+  });
+
+  test("a root-level add-on is linked under the repository's name, never the run id", () => {
+    // The worktree's basename is a run id ("run-20260101-abcd"), which is not a
+    // Python module name and not what the developer's own symlink was called.
+    const wt = seedAddon("grok-blender-root-", {
+      "__init__.py": 'bl_info = {"name": "Root Addon"}\n'
+    });
+    const plan = planBlenderScriptSandbox(wt, {
+      ...io,
+      platform: "linux",
+      repoRoot: path.join(path.dirname(wt), "my_real_addon")
+    });
+    assertModule.strictEqual(plan.addonName, "my_real_addon");
+    assertModule.strictEqual(plan.links[0].from, wt);
+  });
+
+  test("the plan says out loud that a sandboxed add-on is not auto-enabled", () => {
+    const wt = seedAddon("grok-blender-enable-", {
+      "myaddon/__init__.py": "bl_info = {}\n"
+    });
+    const plan = planBlenderScriptSandbox(wt, { ...io, platform: "linux" });
+    assertModule.ok(
+      plan.notes.some((note) => note.includes("addon_utils.enable")),
+      `got: ${JSON.stringify(plan.notes)}`
+    );
+  });
+
+  test("provisionWorktree materialises the sandbox and the add-on is reachable through it", () => {
+    // Real filesystem, real link. On win32 that is a junction, which needs no
+    // elevation; elsewhere a directory symlink.
+    const wt = seedAddon("grok-blender-provision-", {
+      "myaddon/__init__.py": "bl_info = {}\n",
+      "myaddon/ops.py": "MARKER\n"
+    });
+
+    const plan = planBlenderScriptSandbox(wt, io);
+    const result = provisionWorktree(plan, realFs);
+
+    assertModule.deepStrictEqual(result.failed, []);
+    assertModule.strictEqual(result.provisioned.length, 1);
+    assertModule.strictEqual(
+      realFs.readFileSync(
+        path.join(plan.env.BLENDER_USER_SCRIPTS, "addons", "myaddon", "ops.py"),
+        "utf8"
+      ),
+      "MARKER\n"
+    );
+    // The extensions sandbox is deliberately NOT created: an absent directory
+    // is how "this run sees none of your installed extensions" is expressed.
+    assertModule.ok(!realFs.existsSync(plan.env.BLENDER_USER_EXTENSIONS));
   });
 });
 

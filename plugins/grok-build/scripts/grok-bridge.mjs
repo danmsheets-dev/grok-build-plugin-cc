@@ -52,7 +52,11 @@ import {
   revokeProjectConfigTrust
 } from "./lib/project-config.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
-import { planWorktreeLinks, provisionWorktree } from "./lib/provision.mjs";
+import {
+  planBlenderScriptSandbox,
+  planWorktreeLinks,
+  provisionWorktree
+} from "./lib/provision.mjs";
 import {
   claimJobTerminal,
   generateJobId,
@@ -255,6 +259,102 @@ function cliSettingsFromTaskOptions(options = {}) {
     model: options.model,
     effort: options.effort
   };
+}
+
+/**
+ * Parse repeatable `--env KEY=VALUE` into an override map.
+ *
+ * Split on the FIRST `=` only: a Windows PATH-shaped value
+ * (`--env PATHX=C:\a=b`) and a base64 token both legitimately contain more.
+ * An empty key, or a token with no `=` at all, throws rather than being
+ * silently dropped - a typo'd override that quietly does nothing produces a
+ * verify failure with no visible cause, and parseCommandInput already fails
+ * loudly for a malformed option.
+ *
+ * Exported for tests; the CLI reaches it through handleTask.
+ *
+ * @param {string|string[]|undefined|null} raw
+ * @returns {Record<string, string>}
+ */
+export function parseEnvAssignments(raw) {
+  const tokens = raw === undefined || raw === null ? [] : Array.isArray(raw) ? raw : [raw];
+  /** @type {Record<string, string>} */
+  const overrides = {};
+  for (const token of tokens) {
+    const text = String(token ?? "");
+    const separator = text.indexOf("=");
+    const key = separator === -1 ? "" : text.slice(0, separator).trim();
+    if (separator === -1 || !key) {
+      throw new Error(`Invalid --env ${JSON.stringify(text)}. Use --env KEY=VALUE.`);
+    }
+    // The value is NOT trimmed: trailing whitespace can be meaningful, and a
+    // value of "" is a legitimate way to blank an inherited variable.
+    overrides[key] = text.slice(separator + 1);
+  }
+  return overrides;
+}
+
+/**
+ * A JSON round trip (the background job record) can hand back anything, so the
+ * override map is re-validated on the way out rather than trusted.
+ *
+ * @param {unknown} raw
+ * @returns {Record<string, string>}
+ */
+function normalizeEnvOverrides(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return {};
+  }
+  /** @type {Record<string, string>} */
+  const overrides = {};
+  for (const [key, value] of Object.entries(raw)) {
+    if (key && (typeof value === "string" || typeof value === "number" || typeof value === "boolean")) {
+      overrides[key] = String(value);
+    }
+  }
+  return overrides;
+}
+
+/**
+ * The environment a verify command and the agent actually run with.
+ *
+ * ALWAYS a full copy of process.env with the overrides layered on top, never
+ * the bare override map: `runVerifyCommand` hands `options.env` straight to the
+ * spawn, so a bare object would strip PATH and SystemRoot and break every
+ * command on Windows. Returns undefined when there is nothing to override, so a
+ * run without --env spawns with exactly the environment it always did.
+ *
+ * @param {Record<string, string>} overrides
+ * @returns {NodeJS.ProcessEnv|undefined}
+ */
+function buildRunEnvironment(overrides) {
+  return Object.keys(overrides).length > 0 ? { ...process.env, ...overrides } : undefined;
+}
+
+/**
+ * Keys whose VALUE never reaches a persisted record.
+ *
+ * Redaction is by key NAME rather than by running the values through
+ * redactSecretsDeep: that function rewrites `KEY=value`-shaped strings, which
+ * is the wrong shape here (these are already split into a map), and it would
+ * both mangle innocent paths and miss a token stored under a key like MY_PAT.
+ */
+const SENSITIVE_ENV_KEY_PATTERN = /(token|secret|key|password|passwd|credential|pat)$/i;
+
+/**
+ * The override map as it is safe to persist and show: keys verbatim, sensitive
+ * values replaced. Which variables a run set is diagnostic information; their
+ * values are the user's secrets.
+ *
+ * @param {Record<string, string>} overrides
+ */
+function redactEnvForRecord(overrides) {
+  /** @type {Record<string, string>} */
+  const record = {};
+  for (const [key, value] of Object.entries(overrides)) {
+    record[key] = SENSITIVE_ENV_KEY_PATTERN.test(key) ? "[redacted]" : String(value);
+  }
+  return record;
 }
 
 /**
@@ -1644,6 +1744,11 @@ async function executeTaskRun(request) {
   const maxDurationSeconds = resolveMaxDurationSeconds(request.maxDurationSeconds);
   const maxTurns = resolveMaxTurns(request.maxTurns);
   const maxCostUsd = resolveMaxCostUsd(request.maxCostUsd);
+  // Already merged by handleTask (--env over a trusted config's `env`), and
+  // re-validated here because a background worker reads this map back out of a
+  // JSON file. Blender is the reason it exists: it has no CLI flag for "use
+  // this add-on directory", only BLENDER_USER_SCRIPTS and friends.
+  const envOverrides = normalizeEnvOverrides(request.env);
 
   const grokVersion = getGrokAvailability(request.cwd).detail ?? null;
 
@@ -1651,6 +1756,8 @@ async function executeTaskRun(request) {
   let runCwd = workspaceRoot;
   /** @type {{provisioned: Array<{name: string, kind: string}>, failed: Array<{name: string, reason: string}>, notes: string[]}|null} */
   let provisionSummary = null;
+  /** @type {Record<string, string>|null} */
+  let blenderSandboxEnv = null;
   if (isolate && write) {
     created = createWorktree({ cwd: workspaceRoot, runId: request.jobId });
     // Persist worktree descriptor immediately so cancel/crash cannot orphan it
@@ -1675,13 +1782,55 @@ async function executeTaskRun(request) {
     // checked out into the worktree - was invisible, and the run just got
     // mysteriously slower.
     provisionSummary = summarizeProvisionResult(provisionWorktree(plan));
+    if (request.blenderSandbox) {
+      // Inside the worktree, so unlinkReparsePointsSync already tears the
+      // junction down with the rest of the run, and `.grok-build/` is excluded
+      // from the commit so the linked add-on cannot be committed twice.
+      const sandboxPlan = planBlenderScriptSandbox(created.worktreePath, {
+        repoRoot: created.repoRoot
+      });
+      const sandboxResult = summarizeProvisionResult(provisionWorktree(sandboxPlan));
+      provisionSummary = {
+        provisioned: [...provisionSummary.provisioned, ...sandboxResult.provisioned],
+        failed: [...provisionSummary.failed, ...sandboxResult.failed],
+        notes: [...provisionSummary.notes, ...sandboxResult.notes]
+      };
+      // Only claim the sandbox when the link actually landed. Setting
+      // BLENDER_USER_SCRIPTS at an add-on directory that does not exist is
+      // strictly worse than not sandboxing at all: Blender would then find NO
+      // add-ons, and the verify command fails for a reason that has nothing to
+      // do with the code.
+      if (Object.keys(sandboxPlan.env).length > 0 && sandboxResult.failed.length === 0) {
+        blenderSandboxEnv = sandboxPlan.env;
+      } else if (sandboxResult.failed.length > 0) {
+        provisionSummary.notes.push(
+          "--blender-sandbox: the add-on could not be linked, so BLENDER_USER_SCRIPTS was left alone and Blender will use your real add-on directory."
+        );
+      }
+    }
     // A SECOND patch: the one above fires before planning even starts, so the
     // summary has nowhere to attach there.
     if (request.jobId) {
       patchJobIfActive(workspaceRoot, request.jobId, { provision: provisionSummary });
     }
     runCwd = created.worktreePath;
+  } else if (request.blenderSandbox) {
+    // The sandbox lives inside a worktree and is torn down with it. Building one
+    // in the user's real checkout would leave a junction behind in their
+    // repository, which nothing cleans up.
+    provisionSummary = {
+      provisioned: [],
+      failed: [],
+      notes: [
+        "--blender-sandbox needs an isolated write run (--write, without --no-isolate); nothing was sandboxed."
+      ]
+    };
   }
+
+  // Layered so the sandbox is a DERIVED default and an explicit --env still
+  // wins: a user who typed BLENDER_USER_SCRIPTS themselves gets the value they
+  // typed.
+  const runEnv = buildRunEnvironment({ ...(blenderSandboxEnv ?? {}), ...envOverrides });
 
   /** @type {Awaited<ReturnType<typeof probeBaselines>>} */
   let baselines = [];
@@ -1758,6 +1907,11 @@ async function executeTaskRun(request) {
     // run finished, blaming it for something it never touched.
     baselines = await probeBaselines(verifyCommands, runCwd, {
       timeoutMs: baselineTimeoutMs,
+      // Same environment the post-agent pass gets, for the same reason as the
+      // output budget below: a baseline measured without the run's overrides
+      // can be running a different binary, and every difference it then finds
+      // is attributed to the agent.
+      env: runEnv,
       // Must match what the post-agent pass gets: a baseline captured under a
       // tighter output budget records a shorter signature, and every failure
       // the fuller capture then finds looks new. Same reasoning for the
@@ -1801,6 +1955,11 @@ async function executeTaskRun(request) {
       rules: loadRunReportRules(),
       outputFormat: "streaming-json",
       onProgress: request.onProgress,
+      // The agent runs the project's own tooling by hand as well as the bridge
+      // does, so it needs the same environment - otherwise a Blender add-on
+      // that verifies green from the bridge fails the moment the agent runs the
+      // same command itself. undefined when there is nothing to override.
+      env: runEnv,
       // Spill target for a prompt too large for argv. Anchored on the workspace
       // state dir, not runCwd: an isolated run's cwd is a throwaway worktree
       // that land or cleanup will delete out from under the record.
@@ -1874,6 +2033,7 @@ async function executeTaskRun(request) {
         });
         const commandStarted = Date.now();
         const outcome = await runVerifyCommand(command, runCwd, {
+          env: runEnv,
           timeoutMs,
           maxOutputBytes: verifyTiming.maxOutputBytes ?? undefined,
           outputFailurePatterns
@@ -2019,6 +2179,9 @@ async function executeTaskRun(request) {
           cwd: runCwd,
           outputFormat: "streaming-json",
           promptFileDir: resolveStateDir(workspaceRoot),
+          // Same overrides as the first turn: the fix turn re-runs the very
+          // command that just failed.
+          env: runEnv,
           onProgress: request.onProgress
         },
         maxDurationSeconds
@@ -2235,6 +2398,11 @@ async function executeTaskRun(request) {
     changedFiles,
     verified,
     worktree,
+    // Which environment variables this run imposed on the verify commands and
+    // the agent, with sensitive VALUES withheld by key name. Recorded because
+    // "why did this pass here and fail for me?" is otherwise unanswerable, and
+    // includes anything --blender-sandbox derived.
+    env: redactEnvForRecord({ ...(blenderSandboxEnv ?? {}), ...envOverrides }),
     // What the worktree was seeded with, and what could not be. Null on a
     // non-isolated run, where there is nothing to provision.
     provision: provisionSummary,
@@ -2351,6 +2519,8 @@ function buildTaskRequest({
   verifyIgnorePatterns = [],
   noVerifyBaseline = false,
   provisionCopy = undefined,
+  blenderSandbox = false,
+  env = {},
   maxDurationSeconds = null,
   maxTurns = null,
   maxCostUsd = null
@@ -2385,6 +2555,14 @@ function buildTaskRequest({
     // Left undefined when the project said nothing, so planWorktreeLinks can
     // still fall back to GROK_BUILD_LINK_GODOT_CACHE.
     provisionCopy,
+    // Opt-in, and only meaningful for an isolated write run.
+    blenderSandbox,
+    // Environment overrides, VERBATIM. This object is the detached worker's
+    // input, not a report: redacting here would hand the background run a
+    // literal "[redacted]" for its API token. The redacted copy is what reaches
+    // the payload. It lands in the same job file the prompt already does, under
+    // the plugin's state directory.
+    env,
     maxDurationSeconds,
     maxTurns,
     maxCostUsd
@@ -2589,6 +2767,11 @@ export const TASK_VALUE_OPTIONS = Object.freeze([
   "verify-timeout",
   "baseline-timeout",
   "verify-max-buffer",
+  // Repeatable KEY=VALUE. Blender has no CLI flag for "use this add-on
+  // directory" - BLENDER_USER_SCRIPTS and friends are the only lever - and an
+  // engine build routinely needs one or two variables set to run headless at
+  // all.
+  "env",
   "max-duration",
   "max-turns",
   "max-cost"
@@ -2597,7 +2780,7 @@ export const TASK_VALUE_OPTIONS = Object.freeze([
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: [...TASK_VALUE_OPTIONS],
-    repeatableOptions: ["verify", "verify-ignore"],
+    repeatableOptions: ["verify", "verify-ignore", "env"],
     booleanOptions: [
       "json",
       "write",
@@ -2614,6 +2797,9 @@ async function handleTask(argv) {
       // verification strict, since with nothing measured every failure is
       // treated as this run's.
       "no-verify-baseline",
+      // Opt-in, never automatic: a private Blender scripts directory hides
+      // every other add-on the user's verify script may depend on.
+      "blender-sandbox",
       "no-isolate"
     ],
     aliasMap: {
@@ -2684,6 +2870,13 @@ async function handleTask(argv) {
   // falls back to GROK_BUILD_LINK_GODOT_CACHE only when the option is absent,
   // so a default of false would silently shadow the environment variable.
   const provisionCopy = settings.provision?.copy;
+  const blenderSandbox = Boolean(options["blender-sandbox"]);
+  // Merged key by key rather than resolved through resolveRunSettings, whose
+  // precedence is whole-value: one `--env FOO=bar` would otherwise shadow the
+  // project's entire env block. `settings.env` is already trust-gated - an
+  // untrusted .grok-build.json cannot set PATH (or LD_PRELOAD, or NODE_OPTIONS)
+  // and thereby choose which binary every verify command runs.
+  const envOverrides = { ...(settings.env ?? {}), ...parseEnvAssignments(options.env) };
   const maxDurationSeconds = resolveMaxDurationSeconds(settings.maxDurationSeconds);
   const maxTurns = resolveMaxTurns(settings.maxTurns);
   const maxCostUsd = resolveMaxCostUsd(settings.maxCostUsd);
@@ -2716,6 +2909,8 @@ async function handleTask(argv) {
         verifyIgnorePatterns,
         noVerifyBaseline,
         provisionCopy,
+        blenderSandbox,
+        env: envOverrides,
         maxDurationSeconds,
         maxTurns,
         maxCostUsd
@@ -2747,6 +2942,8 @@ async function handleTask(argv) {
         verifyIgnorePatterns,
         noVerifyBaseline,
         provisionCopy,
+        blenderSandbox,
+        env: envOverrides,
         maxDurationSeconds,
         maxTurns,
         maxCostUsd,
