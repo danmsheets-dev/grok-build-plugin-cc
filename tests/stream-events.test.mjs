@@ -98,32 +98,88 @@ test("the end event supplies session id, usage and cost", () => {
       total_tokens: 28053
     },
     num_turns: 1,
-    total_cost_usd: 0.0470828
+    total_cost_usd: 0.0470828,
+    modelUsage: {
+      "grok-4.5-build": {
+        inputTokens: 22648,
+        outputTokens: 29,
+        cacheReadInputTokens: 5376,
+        modelCalls: 1,
+        costUSD: 0.0470828
+      }
+    }
   });
   const result = transcript.finish();
 
   assert.equal(result.sessionId, "019fae7c-fb03-7321-870e-0778e3119399");
   assert.equal(result.stopReason, "EndTurn");
-  assert.deepEqual(result.usage, {
-    inputTokens: 22648,
-    cachedInputTokens: 5376,
-    outputTokens: 29,
-    reasoningTokens: 24,
-    totalTokens: 28053,
-    costUsd: 0.0470828,
-    numTurns: 1
-  });
+  assert.equal(result.usage.inputTokens, 22648);
+  assert.equal(result.usage.cachedInputTokens, 5376);
+  assert.equal(result.usage.outputTokens, 29);
+  assert.equal(result.usage.reasoningTokens, 24);
+  assert.equal(result.usage.totalTokens, 28053);
+  assert.equal(result.usage.costUsd, 0.0470828);
+  assert.equal(result.usage.numTurns, 1);
+  assert.equal(result.usage.resolvedModel, "grok-4.5-build");
+  assert.ok(result.usage.modelUsage["grok-4.5-build"]);
 });
 
-test("unknown event types are recorded and do not break the transcript", () => {
+test("tool events are counted and do not land in unknownTypes", () => {
   const transcript = createStreamTranscript();
   transcript.accept({ type: "text", data: "a" });
   assert.equal(transcript.accept({ type: "tool_use", name: "write" }).phase, null);
+  transcript.accept({ type: "tool_result", content: "ok" });
   transcript.accept({ type: "text", data: "b" });
   const result = transcript.finish();
 
-  assert.deepEqual(result.unknownTypes, ["tool_use"]);
-  assert.deepEqual(result.messages, ["a", "b"], "an unknown type still ends the current message");
+  assert.deepEqual(result.unknownTypes, []);
+  assert.equal(result.toolCallCount, 1);
+  assert.deepEqual(result.messages, ["a", "b"], "a tool event still ends the current message");
+});
+
+test("toolCallCount is null when the stream has no tool vocabulary", () => {
+  // A prose-only stream must not be reported as zero tools - that would mark
+  // every healthy answer as completed-blind when the CLI simply does not emit
+  // tool events.
+  const transcript = createStreamTranscript();
+  feed(transcript, [
+    { type: "thought", data: "planning" },
+    { type: "text", data: "done" },
+    { type: "end", stopReason: "EndTurn" }
+  ]);
+  assert.equal(transcript.finish().toolCallCount, null);
+});
+
+test("toolCallCount is a genuine 0 when the end event reports zero tool calls", () => {
+  const transcript = createStreamTranscript();
+  feed(transcript, [
+    { type: "text", data: "nothing to do" },
+    { type: "end", stopReason: "EndTurn", toolCallCount: 0 }
+  ]);
+  assert.equal(transcript.finish().toolCallCount, 0);
+});
+
+test("toolCallCount counts multiple invocations", () => {
+  const transcript = createStreamTranscript();
+  feed(transcript, [
+    { type: "tool_use", name: "Grep" },
+    { type: "tool_result", content: "x" },
+    { type: "tool_call", name: "Read" },
+    { type: "tool_result", content: "y" },
+    { type: "end", stopReason: "EndTurn" }
+  ]);
+  assert.equal(transcript.finish().toolCallCount, 2);
+});
+
+test("unknown non-tool event types are still recorded", () => {
+  const transcript = createStreamTranscript();
+  transcript.accept({ type: "text", data: "a" });
+  assert.equal(transcript.accept({ type: "widget_ping", name: "x" }).phase, null);
+  transcript.accept({ type: "text", data: "b" });
+  const result = transcript.finish();
+
+  assert.deepEqual(result.unknownTypes, ["widget_ping"]);
+  assert.deepEqual(result.messages, ["a", "b"]);
 });
 
 test("the transcript and the answer are separate fields, and finalMessage still means the transcript", () => {
@@ -258,11 +314,14 @@ test("a mixed stream counts the events it knows and names the ones it does not",
   feed(transcript, [
     { type: "text", data: "Working." },
     { type: "tool_call", name: "edit" },
+    { type: "widget_ping", name: "x" },
     { type: "end", stopReason: "EndTurn" }
   ]);
   const result = transcript.finish();
 
-  assert.equal(result.recognizedEvents, 2);
-  assert.deepEqual(result.unknownTypes, ["tool_call"]);
+  // text + tool_call + end are recognized; widget_ping is unknown.
+  assert.equal(result.recognizedEvents, 3);
+  assert.deepEqual(result.unknownTypes, ["widget_ping"]);
+  assert.equal(result.toolCallCount, 1);
   assert.deepEqual(result.messages, ["Working."]);
 });

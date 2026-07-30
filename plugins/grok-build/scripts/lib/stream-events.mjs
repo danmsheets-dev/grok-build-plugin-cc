@@ -84,19 +84,163 @@ function toFiniteNumber(value, fallback = 0) {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
-function normalizeUsage(event) {
+/**
+ * Pick the model the provider actually served from `modelUsage`.
+ * The key with the most modelCalls wins; a sole key wins even without counts.
+ * Requested model (e.g. grok-4.5) and served model (e.g. grok-4.5-build) differ
+ * on Hyper, and the key is the only place the served id appears.
+ */
+export function resolveModelFromUsage(modelUsage) {
+  if (!modelUsage || typeof modelUsage !== "object" || Array.isArray(modelUsage)) {
+    return null;
+  }
+  const entries = Object.entries(modelUsage).filter(([key]) => typeof key === "string" && key.trim());
+  if (entries.length === 0) {
+    return null;
+  }
+  if (entries.length === 1) {
+    return entries[0][0];
+  }
+  let bestKey = entries[0][0];
+  let bestCalls = -1;
+  for (const [key, value] of entries) {
+    const calls = toFiniteNumber(value?.modelCalls ?? value?.model_calls, 0);
+    if (calls > bestCalls) {
+      bestCalls = calls;
+      bestKey = key;
+    }
+  }
+  return bestKey;
+}
+
+/**
+ * Event names that mean a tool was invoked (not merely a result arriving).
+ * The CLI vocabulary has moved more than once; match both historical and
+ * current names, case-insensitively on the hyphen/underscore form.
+ */
+const TOOL_INVOCATION_TYPES = new Set([
+  "tool_use",
+  "tool_call",
+  "toolcall",
+  "tool-call",
+  "tool_request",
+  "tool-request",
+  "function_call",
+  "functioncall",
+  "mcp_tool_call",
+  "mcp_call"
+]);
+
+/**
+ * Any event that proves this CLI stream speaks a tool vocabulary.
+ * Presence of a result/response without a paired invocation still means the
+ * bridge can count (and a genuine zero is possible via end-event fields);
+ * absence of every tool-shaped type means the count is unknown, not zero.
+ */
+const TOOL_SIGNAL_TYPES = new Set([
+  ...TOOL_INVOCATION_TYPES,
+  "tool_result",
+  "tool-result",
+  "tool_response",
+  "tool-response",
+  "function_result",
+  "function_response",
+  "mcp_tool_result",
+  "tool"
+]);
+
+function normalizeToolType(type) {
+  return String(type ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/-/g, "_");
+}
+
+function isToolInvocationType(type) {
+  const normalized = normalizeToolType(type);
+  if (!normalized) {
+    return false;
+  }
+  if (TOOL_INVOCATION_TYPES.has(normalized) || TOOL_INVOCATION_TYPES.has(String(type ?? "").trim().toLowerCase())) {
+    return true;
+  }
+  // Hyphen forms land here after normalize; also catch function_call-style names.
+  return (
+    (normalized.includes("tool") && (normalized.includes("call") || normalized.includes("use") || normalized.includes("request"))) ||
+    normalized === "function_call" ||
+    normalized === "functioncall" ||
+    normalized === "mcp_call" ||
+    normalized === "mcp_tool_call"
+  ) && !normalized.includes("result") && !normalized.includes("response") && !normalized.includes("output");
+}
+
+function isToolSignalType(type) {
+  const normalized = normalizeToolType(type);
+  if (!normalized) {
+    return false;
+  }
+  if (TOOL_SIGNAL_TYPES.has(normalized) || TOOL_SIGNAL_TYPES.has(String(type ?? "").trim().toLowerCase())) {
+    return true;
+  }
+  if (isToolInvocationType(type)) {
+    return true;
+  }
+  return (
+    normalized.includes("tool") ||
+    normalized.startsWith("function_") ||
+    normalized.startsWith("mcp_")
+  ) && normalized !== "thought";
+}
+
+function readExplicitToolCallCount(event) {
+  const candidates = [
+    event?.toolCallCount,
+    event?.tool_call_count,
+    event?.num_tool_calls,
+    event?.numToolCalls,
+    event?.toolCalls
+  ];
+  for (const value of candidates) {
+    if (value == null) {
+      continue;
+    }
+    if (Array.isArray(value)) {
+      return value.length;
+    }
+    const parsed = Number(value);
+    if (Number.isFinite(parsed) && parsed >= 0) {
+      return parsed;
+    }
+  }
+  return null;
+}
+
+export function normalizeUsage(event) {
   const usage = event?.usage;
   if (!usage || typeof usage !== "object") {
     return null;
   }
+  const modelUsage =
+    event?.modelUsage && typeof event.modelUsage === "object" && !Array.isArray(event.modelUsage)
+      ? event.modelUsage
+      : usage.modelUsage && typeof usage.modelUsage === "object" && !Array.isArray(usage.modelUsage)
+        ? usage.modelUsage
+        : null;
+  const resolvedModel = resolveModelFromUsage(modelUsage);
   return {
-    inputTokens: toFiniteNumber(usage.input_tokens),
-    cachedInputTokens: toFiniteNumber(usage.cache_read_input_tokens),
-    outputTokens: toFiniteNumber(usage.output_tokens),
-    reasoningTokens: toFiniteNumber(usage.reasoning_tokens),
-    totalTokens: toFiniteNumber(usage.total_tokens),
-    costUsd: Number.isFinite(Number(event.total_cost_usd)) ? Number(event.total_cost_usd) : null,
-    numTurns: Number.isFinite(Number(event.num_turns)) ? Number(event.num_turns) : null
+    inputTokens: toFiniteNumber(usage.input_tokens ?? usage.inputTokens),
+    cachedInputTokens: toFiniteNumber(usage.cache_read_input_tokens ?? usage.cachedInputTokens),
+    outputTokens: toFiniteNumber(usage.output_tokens ?? usage.outputTokens),
+    reasoningTokens: toFiniteNumber(usage.reasoning_tokens ?? usage.reasoningTokens),
+    totalTokens: toFiniteNumber(usage.total_tokens ?? usage.totalTokens),
+    costUsd: Number.isFinite(Number(event.total_cost_usd ?? event.totalCostUsd ?? usage.costUsd))
+      ? Number(event.total_cost_usd ?? event.totalCostUsd ?? usage.costUsd)
+      : null,
+    numTurns: Number.isFinite(Number(event.num_turns ?? event.numTurns ?? usage.numTurns))
+      ? Number(event.num_turns ?? event.numTurns ?? usage.numTurns)
+      : null,
+    ...(modelUsage ? { modelUsage } : {}),
+    ...(resolvedModel ? { resolvedModel } : {})
   };
 }
 
@@ -117,6 +261,13 @@ export function createStreamTranscript() {
   let sessionId = null;
   let stopReason = null;
   let usage = null;
+  // null until the stream proves it speaks a tool vocabulary. A CLI that never
+  // emits tool events would otherwise look like "zero tools" and mark every
+  // healthy prose-only run completed-blind. Only a genuine 0 (signal present,
+  // invocations absent, or an explicit end-event count) may be reported as 0.
+  let toolVocabularySeen = false;
+  let toolInvocationCount = 0;
+  let explicitToolCallCount = null;
 
   function closeCurrentMessage() {
     const completed = current.trim();
@@ -137,6 +288,14 @@ export function createStreamTranscript() {
       // did all its work through tools) still counts as understood.
       if (type === "text" || type === "thought" || type === "end") {
         recognizedEvents += 1;
+      } else if (type && isToolSignalType(type)) {
+        // Tool traffic is recognized even when it is not prose: a tool-only
+        // turn still proves the stream format is one we speak.
+        recognizedEvents += 1;
+        toolVocabularySeen = true;
+        if (isToolInvocationType(type)) {
+          toolInvocationCount += 1;
+        }
       }
 
       if (type === "text") {
@@ -152,7 +311,15 @@ export function createStreamTranscript() {
           sessionId = typeof event.sessionId === "string" ? event.sessionId : sessionId;
           stopReason = typeof event.stopReason === "string" ? event.stopReason : stopReason;
           usage = normalizeUsage(event) ?? usage;
-        } else if (type && type !== "thought") {
+          const explicit = readExplicitToolCallCount(event);
+          if (explicit != null) {
+            // An explicit end-event count is the only way a run with no tool
+            // events in the stream can still report a genuine 0 rather than
+            // null - Hyper/Grok may start shipping this without per-call events.
+            toolVocabularySeen = true;
+            explicitToolCallCount = explicit;
+          }
+        } else if (type && type !== "thought" && !isToolSignalType(type)) {
           unknownTypes.add(type);
         }
       }
@@ -164,6 +331,15 @@ export function createStreamTranscript() {
     finish() {
       closeCurrentMessage();
       const joined = messages.join(MESSAGE_SEPARATOR);
+      // Explicit end-event count wins when present: it is the provider's own
+      // total. Otherwise the live invocation count, but only once the stream
+      // has shown it speaks tools at all.
+      let toolCallCount = null;
+      if (explicitToolCallCount != null) {
+        toolCallCount = explicitToolCallCount;
+      } else if (toolVocabularySeen) {
+        toolCallCount = toolInvocationCount;
+      }
       return {
         messages: [...messages],
         // The whole narration. Every `text` run that followed a `thought` is a
@@ -186,6 +362,7 @@ export function createStreamTranscript() {
         sessionId,
         stopReason,
         usage,
+        toolCallCount,
         unknownTypes: [...unknownTypes],
         // Zero means the CLI emitted a stream this parser understood nothing
         // of - a renamed event vocabulary, or not NDJSON at all. Callers use it

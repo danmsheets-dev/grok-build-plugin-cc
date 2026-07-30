@@ -43,6 +43,73 @@ function redactTerminalClaimPatch(patch = {}) {
 
 export const SESSION_ID_ENV = "GROK_CC_SESSION_ID";
 
+/** stopReasons that mean a clean, full completion rather than an early exit. */
+const CLEAN_STOP_REASONS = new Set(["EndTurn", "StopSequence"]);
+
+/**
+ * Decide the terminal status from the full outcome tuple.
+ *
+ * First match wins. The old ladder (exit 0 → completed, else failed) stored a
+ * Cancelled/max-duration run with zero tool calls as "completed", which is how
+ * blind and truncated runs reached the user as success.
+ *
+ * @param {{
+ *   timedOut?: boolean,
+ *   exitStatus?: number|null,
+ *   stopReason?: string|null,
+ *   toolCallCount?: number|null,
+ *   changedFileCount?: number|null,
+ *   write?: boolean,
+ *   verified?: boolean|null,
+ *   hadWork?: boolean
+ * }} outcome
+ * @returns {string}
+ */
+export function decideCompletionStatus(outcome = {}) {
+  const timedOut = Boolean(outcome.timedOut);
+  const exitStatus = outcome.exitStatus;
+  const stopReason = typeof outcome.stopReason === "string" ? outcome.stopReason.trim() : "";
+  const toolCallCount =
+    outcome.toolCallCount == null || !Number.isFinite(Number(outcome.toolCallCount))
+      ? null
+      : Number(outcome.toolCallCount);
+  const changedFileCount =
+    outcome.changedFileCount == null || !Number.isFinite(Number(outcome.changedFileCount))
+      ? null
+      : Number(outcome.changedFileCount);
+  const write = Boolean(outcome.write);
+  const verified = outcome.verified;
+  // "Had any work to do": a prompt-only idle resume with nothing to act on is
+  // not "blind". Default true so ordinary runs still trip completed-blind when
+  // the agent made zero tool calls.
+  const hadWork = outcome.hadWork !== false;
+
+  if (timedOut) {
+    return "timed-out";
+  }
+  // Missing exitStatus is treated as failure only when the runner never set it
+  // after a real process close - callers pass 0 on success. null/undefined here
+  // means "unknown/failed process" rather than success.
+  if (exitStatus == null || exitStatus !== 0) {
+    return "failed";
+  }
+  if (stopReason && !CLEAN_STOP_REASONS.has(stopReason)) {
+    return "completed-truncated";
+  }
+  if (write === true && changedFileCount === 0) {
+    return "completed-noop";
+  }
+  // Genuine 0 only - never null (unknown). A CLI that does not emit tool
+  // events must not mark every prose-only run as blind.
+  if (toolCallCount === 0 && hadWork) {
+    return "completed-blind";
+  }
+  if (verified === false) {
+    return "completed-unverified";
+  }
+  return "completed";
+}
+
 export function nowIso() {
   return new Date().toISOString();
 }
@@ -343,15 +410,22 @@ export async function runTrackedJob(job, runner, options = {}) {
 
   try {
     const execution = await runner();
-    // A run that finished but whose verify never passed is terminal, and is not
-    // success. Only an explicitly unverified execution downgrades a zero exit.
-    // timed-out is its own terminal status so duration caps are not reported as
-    // ordinary failures.
-    const completionStatus = execution.timedOut
-      ? "timed-out"
-      : execution.exitStatus === 0
-        ? (execution.verified === false ? "completed-unverified" : "completed")
-        : "failed";
+    // Full-tuple decision: exit 0 alone is not success (Cancelled stopReason,
+    // zero tools, zero files, failed verify all used to store as "completed").
+    const completionStatus = decideCompletionStatus({
+      timedOut: execution.timedOut,
+      exitStatus: execution.exitStatus,
+      stopReason: execution.stopReason ?? execution.payload?.stopReason ?? null,
+      toolCallCount: execution.toolCallCount ?? execution.payload?.toolCallCount ?? null,
+      changedFileCount:
+        execution.changedFileCount ??
+        execution.payload?.changedFiles?.total ??
+        execution.worktree?.changedFileCount ??
+        null,
+      write: execution.write ?? job.write,
+      verified: execution.verified,
+      hadWork: execution.hadWork
+    });
     // Redact once, centrally, before anything text-bearing reaches disk or the
     // --json CLI path (which serializes the same payload we return here).
     const redactedPayload = redactSecretsDeep(execution.payload);
@@ -369,6 +443,19 @@ export async function runTrackedJob(job, runner, options = {}) {
       ...(redactedVerify !== undefined ? { verify: redactedVerify } : {})
     };
 
+    const resolvedModel =
+      execution.resolvedModel ??
+      execution.usage?.resolvedModel ??
+      redactedPayload?.usage?.resolvedModel ??
+      null;
+    const stopReason = execution.stopReason ?? redactedPayload?.stopReason ?? null;
+    const toolCallCount = execution.toolCallCount ?? redactedPayload?.toolCallCount ?? null;
+    const changedFileCount =
+      execution.changedFileCount ??
+      redactedPayload?.changedFiles?.total ??
+      execution.worktree?.changedFileCount ??
+      null;
+
     const claim = claimJobTerminal(
       job.workspaceRoot,
       job.id,
@@ -379,6 +466,13 @@ export async function runTrackedJob(job, runner, options = {}) {
         summary: redactedSummary,
         result: redactedPayload,
         usage: execution.usage ?? null,
+        resolvedModel,
+        stopReason,
+        toolCallCount,
+        changedFileCount,
+        write: execution.write ?? job.write,
+        verified: execution.verified ?? null,
+        model: execution.model ?? job.model ?? null,
         grokVersion: execution.grokVersion ?? null,
         verify: redactedVerify ?? null,
         worktree: execution.worktree ?? job.worktree ?? null,

@@ -20,9 +20,13 @@ What isolation **does not** guarantee:
 
 - **`--no-isolate` turns it off**, and then the agent edits your tree directly, as before.
 - **Read-only runs are not isolated** and do not need to be — they cannot write.
+  As of 0.5.0 they use `--always-approve` plus `--deny Edit(**)` / `Write(**)` /
+  `NotebookEdit(**)` (deny beats YOLO). They do **not** use `--permission-mode plan` or
+  `--sandbox read-only`: those returned empty tool bodies (and Windows Grep false zeros)
+  while Hyper's sandbox is unix-only anyway.
 - **A worktree is not a sandbox.** The agent still runs with your permissions and can
   reach anything on the machine outside the repository. Isolation protects your *working
-  tree*, not your filesystem. `grok --sandbox` owns that, not this plugin.
+  tree*, not your filesystem.
 - **Heavyweight directories are linked, not copied.** `node_modules`, `.venv`, `venv`,
   `target`, `vendor`, `.tox`, `__pypackages__`, `.next`, `.nuxt`, `.svelte-kit`,
   `.turbo`, `.parcel-cache`, and Godot's import cache (`.godot`, `.import`) are
@@ -96,7 +100,9 @@ goes before you use it that way:
   key (one containing `token`, `secret`, `key`, `pass`, `passwd`, `password`, `passphrase`,
   `credential`, `cred`, `pat`, `dsn`, or `auth`, anywhere in the name, delimited by `_` or
   a boundary) is replaced with `[redacted]` before it ever reaches the index or a run's
-  own display.
+  own display. From 0.5.0 the index also mirrors usage, stopReason, toolCallCount, and
+  related reporting fields so `runs --json` (schemaVersion 2) does not show null for
+  values that only lived in `jobs/<id>.json`.
 - Do not pass a long-lived credential through `--env` on a `--background` run unless you
   trust the plugin's state directory (and anything that backs it up) as much as you trust
   your shell's own environment.
@@ -112,7 +118,9 @@ so a run cannot claim success without it having passed.
 - On new failures the agent is re-invoked to fix them, up to `--verify-attempts`
   (default 2).
 - A run whose verification never passes is reported **`completed-unverified`**, never as
-  success.
+  success. Other honest terminals (0.5.0+): `completed-truncated` (early stopReason),
+  `completed-noop` (write run, zero files), `completed-blind` (zero tool calls),
+  `timed-out`.
 - A command that outlives its budget has its **whole process tree** killed, not just the
   shell wrapping it — an orphaned `godot.exe` would otherwise keep the import lock. Raise the
   budget with `--verify-timeout <seconds>` or `verifyTimeoutMs` in `.grok-build.json`.
@@ -296,11 +304,20 @@ A run also reports what it did to the disk and how it was captured:
   named, and if *nothing* in the stream was recognized the raw stdout is shown (last 200 lines)
   under an explicit `showing raw stdout` note rather than being silently discarded.
 
+## Changelog (0.5.0)
+
+- Honest terminal statuses: `completed-truncated`, `completed-noop`, `completed-blind`, plus existing `completed-unverified` / `timed-out`.
+- Read-only runs use YOLO + deny Edit/Write/NotebookEdit (no plan/sandbox).
+- Usage, served model, stopReason, and tool/file counts mirrored into the run index; `runs --json` is schemaVersion 2.
+- `show` always appends `===BRIDGE-RESULT===`; run header prints CLI, model, isolation, verify plan.
+- New `models [--json]` subcommand; pay-per-token models need `GROK_BUILD_ALLOW_PAY_PER_TOKEN=1`.
+- Every subcommand accepts `--help` / `-h`.
+
 ## Requirements
 
 - Node.js >= 18.18
 - The `grok` CLI on `PATH`, or `GROK_BINARY` pointing at a compatible CLI (see [Alternate CLIs](#alternate-clis))
-- A logged-in Grok session — `grok models` must succeed
+- A logged-in Grok session — `grok models` must succeed (Hyper may exit non-zero on a successful listing; the bridge treats a model list as success)
 - `HOME` or `GROK_HOME` must be set. On Windows neither is set by default; the bridge's core paths work without it, but `grok` subcommands such as `grok worktree` fail with `neither $GROK_HOME nor $HOME is set`.
 
 ## Commands
@@ -312,8 +329,8 @@ A run also reports what it did to the disk and how it was captured:
 | `/grok-build:review` | Read-only review of local git state |
 | `/grok-build:critique` | Adversarial design and risk pass, structured JSON output |
 | `/grok-build:import` | Imports the current Claude transcript into a Grok session |
-| `/grok-build:runs` | Lists active and recent runs |
-| `/grok-build:show` | Shows stored output for a finished run |
+| `/grok-build:runs` | Lists active and recent runs (`--json` schemaVersion 2; legacy keys kept one minor version) |
+| `/grok-build:show` | Shows stored output plus a `===BRIDGE-RESULT===` trailer |
 | `/grok-build:stop` | Stops an active run and terminates its process trees |
 | `/grok-build:land` | Reviews an isolated run's diff, then merges or discards it |
 | `/grok-build:doctor` | Diagnoses environment and run state, with a fix for each problem |

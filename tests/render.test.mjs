@@ -61,6 +61,8 @@ test("renderStoredJobResult prefers rendered output for structured review jobs",
   assert.doesNotMatch(output, /^\{/);
   assert.match(output, /Grok session ID: thr_123/);
   assert.match(output, /Resume in Grok: grok -r thr_123/);
+  assert.match(output, /===BRIDGE-RESULT===/);
+  assert.match(output, /===END-BRIDGE-RESULT===/);
 });
 
 import { formatUsageLine, formatUsageTotals, renderJobStatusReport } from "../plugins/grok-build/scripts/lib/render.mjs";

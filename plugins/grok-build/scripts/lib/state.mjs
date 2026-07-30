@@ -195,13 +195,48 @@ export function withStateLock(cwd, fn) {
   throw new Error(`Timed out acquiring state lock at ${lockPath}`);
 }
 
-// completed-unverified is terminal but NOT success: the run finished and its
-// verify command never passed. cancelled still wins over everything, so a run the
-// user stopped is never reported as finished by a worker that lands moments later.
-const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "completed-unverified", "timed-out"]);
+// Terminal statuses beyond plain completed/failed/cancelled. The honest ladder
+// in decideCompletionStatus (tracked-jobs.mjs) can land on any of these; each
+// must be recognized by claimJobTerminal, runs/show filters, and land/prune
+// guards. cancelled still wins over everything, so a run the user stopped is
+// never reported as finished by a worker that lands moments later.
+const TERMINAL_STATUSES = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+  "completed-unverified",
+  "completed-truncated",
+  "completed-noop",
+  "completed-blind",
+  "timed-out"
+]);
 
 export function isTerminalJobStatus(status) {
   return TERMINAL_STATUSES.has(status);
+}
+
+/** Fields the shared index must mirror so `runs --json` does not show null for values that only live in jobs/<id>.json. */
+const INDEX_TERMINAL_MIRROR_FIELDS = [
+  "usage",
+  "resolvedModel",
+  "stopReason",
+  "write",
+  "verified",
+  "changedFileCount",
+  "toolCallCount",
+  "worktree",
+  "grokVersion",
+  "model"
+];
+
+function pickIndexMirrorFields(source = {}) {
+  const picked = {};
+  for (const key of INDEX_TERMINAL_MIRROR_FIELDS) {
+    if (source[key] !== undefined) {
+      picked[key] = source[key];
+    }
+  }
+  return picked;
 }
 
 function readJobFileIfPresent(cwd, jobId) {
@@ -279,7 +314,11 @@ export function claimJobTerminal(cwd, jobId, nextStatus, patch = {}) {
           threadId: merged.threadId ?? existing.threadId ?? null,
           pid: null,
           agentPid: null,
-          errorMessage: merged.errorMessage ?? existing.errorMessage
+          errorMessage: merged.errorMessage ?? existing.errorMessage,
+          // Usage/model/counts can arrive on a late cancel merge after the
+          // worker finished streaming; keep them on the index so runs still
+          // shows what the cancelled run spent.
+          ...pickIndexMirrorFields({ ...existing, ...merged })
         });
         saveStateUnlocked(cwd, state);
         return { claimed: false, status: "cancelled", job: merged, reason: "cancelled-merge" };
@@ -323,7 +362,12 @@ export function claimJobTerminal(cwd, jobId, nextStatus, patch = {}) {
       kindLabel: nextJob.kindLabel ?? existing.kindLabel,
       title: nextJob.title ?? existing.title,
       jobClass: nextJob.jobClass ?? existing.jobClass,
-      write: nextJob.write ?? existing.write
+      write: nextJob.write ?? existing.write,
+      // jobs/<id>.json already holds the full record; the index used to drop
+      // usage/stopReason/counts, so runs --json showed null for every finished
+      // run even when the job file had them. Mirror the fields that runs/show
+      // need without re-reading every job file on list.
+      ...pickIndexMirrorFields(nextJob)
     });
     saveStateUnlocked(cwd, state);
     return { claimed: true, status: nextStatus, job: nextJob, reason: "claimed" };

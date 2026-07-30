@@ -18,11 +18,15 @@ import {
   resolveReviewTarget
 } from "./lib/git.mjs";
 import {
+  assertModelBillingAllowed,
+  buildHeadlessPermissionOptions,
   buildReviewPrompt,
   DEFAULT_CONTINUE_PROMPT,
   describeMissingBinary,
+  detectCliBrand,
   getGrokAuthStatus,
   getGrokAvailability,
+  listGrokModels,
   parseStructuredOutput,
   readOutputSchema,
   runHeadlessAgent,
@@ -81,6 +85,7 @@ import {
   createJobProgressUpdater,
   createJobRecord,
   createProgressReporter,
+  decideCompletionStatus,
   nowIso,
   resolveJobKillTargets,
   runTrackedJob,
@@ -107,6 +112,7 @@ import {
   removeWorktree
 } from "./lib/worktree.mjs";
 import {
+  formatUsageLine,
   renderCancelReport,
   renderJobStatusReport,
   renderNativeReviewResult,
@@ -114,7 +120,8 @@ import {
   renderSetupReport,
   renderStatusReport,
   renderStoredJobResult,
-  renderTaskResult
+  renderTaskResult,
+  summarizeSessionUsage
 } from "./lib/render.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -146,9 +153,19 @@ const DIFF_STAT_MAX_BYTES = 1024 * 1024;
 // by prune --apply, because the guard checked only the literal string
 // "completed". A run whose verification failed or that hit --max-duration
 // is exactly the kind of work most worth reviewing before it is discarded,
-// not less. failed/cancelled/abandoned are deliberately excluded: those
-// represent a run that did not produce work worth preserving by default.
-const AWAITING_LAND_STATUSES = new Set(["completed", "completed-unverified", "timed-out"]);
+// not less. completed-truncated / completed-blind may also hold partial work.
+// completed-noop is included so an empty isolated worktree is still cleaned
+// only by explicit land --discard / prune --include-unlanded, not by accident.
+// failed/cancelled/abandoned are deliberately excluded: those represent a
+// run that did not produce work worth preserving by default.
+const AWAITING_LAND_STATUSES = new Set([
+  "completed",
+  "completed-unverified",
+  "completed-truncated",
+  "completed-noop",
+  "completed-blind",
+  "timed-out"
+]);
 
 function printUsage() {
   console.log(
@@ -156,6 +173,7 @@ function printUsage() {
       "Usage:",
       "  node scripts/grok-bridge.mjs check [--json]",
       "  node scripts/grok-bridge.mjs doctor [--json]",
+      "  node scripts/grok-bridge.mjs models [--json]",
       "  node scripts/grok-bridge.mjs verify-plan [--verify <command>]... [--no-verify] [--cwd|-C <dir>] [--json]",
       "  node scripts/grok-bridge.mjs trust-config [--revoke] [--cwd|-C <dir>] [--json]",
       "  node scripts/grok-bridge.mjs prune [--apply] [--include-unlanded] [--json]",
@@ -171,13 +189,72 @@ function printUsage() {
       "    Verify commands run in THE BRIDGE, never the agent, so a run cannot claim success without",
       "    having passed. A run whose verification never passes is reported completed-unverified, never",
       "    as success. See `verify-plan` to preview the resolved plan without running it.",
+      "    Pay-per-token models (openai/*) require GROK_BUILD_ALLOW_PAY_PER_TOKEN=1.",
       "  node scripts/grok-bridge.mjs import [--source <claude-jsonl>] [--json]",
       "  node scripts/grok-bridge.mjs runs [run-id] [--all] [--wait] [--timeout-ms <ms>] [--json]",
       "  node scripts/grok-bridge.mjs show [run-id] [--json]",
       "  node scripts/grok-bridge.mjs stop [run-id] [--json]",
-      "  node scripts/grok-bridge.mjs land [run-id] [--preview|--discard] [--json]"
+      "  node scripts/grok-bridge.mjs land [run-id] [--preview|--discard] [--json]",
+      "",
+      "Every subcommand accepts --help / -h for its own usage."
     ].join("\n")
   );
+}
+
+const SUBCOMMAND_HELP = {
+  check: ["Usage: node scripts/grok-bridge.mjs check [--json]", "Probe Node + CLI availability and auth."],
+  doctor: ["Usage: node scripts/grok-bridge.mjs doctor [--json]", "Deeper diagnostics (HOME, state, stale runs)."],
+  models: [
+    "Usage: node scripts/grok-bridge.mjs models [--json]",
+    "List models from the configured CLI. Hyper may exit non-zero on a successful listing;",
+    "output that names models is treated as success. Billing routes are inferred from id prefix."
+  ],
+  "verify-plan": [
+    "Usage: node scripts/grok-bridge.mjs verify-plan [--verify <command>]... [--no-verify] [--cwd|-C <dir>] [--json]",
+    "Print the resolved verify plan without running anything."
+  ],
+  "trust-config": [
+    "Usage: node scripts/grok-bridge.mjs trust-config [--revoke] [--cwd|-C <dir>] [--json]",
+    "Trust or revoke .grok-build.json executable keys for this workspace."
+  ],
+  prune: [
+    "Usage: node scripts/grok-bridge.mjs prune [--apply] [--include-unlanded] [--json]",
+    "Reap abandoned runs and finished worktrees."
+  ],
+  review: [
+    "Usage: node scripts/grok-bridge.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <low|medium|high>]",
+    "Read-only review of local git state."
+  ],
+  critique: [
+    "Usage: node scripts/grok-bridge.mjs critique [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <low|medium|high>] [focus text]",
+    "Structured design/risk critique."
+  ],
+  run: [
+    "Usage: node scripts/grok-bridge.mjs run [options] [prompt]",
+    "Delegate a task. Default is read-only; pass --write to allow edits.",
+    "See `node scripts/grok-bridge.mjs help` for the full flag list."
+  ],
+  import: ["Usage: node scripts/grok-bridge.mjs import [--source <claude-jsonl>] [--json]"],
+  runs: [
+    "Usage: node scripts/grok-bridge.mjs runs [run-id] [--all] [--wait] [--timeout-ms <ms>] [--json]",
+    "`runs --json` emits schemaVersion 2 (with legacy running/latestFinished/recent keys for one minor version)."
+  ],
+  show: ["Usage: node scripts/grok-bridge.mjs show [run-id] [--json]", "Print a finished run's result plus a BRIDGE-RESULT trailer."],
+  stop: ["Usage: node scripts/grok-bridge.mjs stop [run-id] [--json]"],
+  land: ["Usage: node scripts/grok-bridge.mjs land [run-id] [--preview|--discard] [--json]"]
+};
+
+function printSubcommandHelp(subcommand) {
+  const lines = SUBCOMMAND_HELP[subcommand];
+  if (lines) {
+    console.log(lines.join("\n"));
+    return;
+  }
+  printUsage();
+}
+
+function wantsHelp(argv) {
+  return argv.some((token) => token === "--help" || token === "-h");
 }
 
 function normalizeVerifyCommands(raw) {
@@ -716,7 +793,10 @@ function addUsage(a, b) {
     reasoningTokens: numeric(a.reasoningTokens) + numeric(b.reasoningTokens),
     totalTokens: numeric(a.totalTokens) + numeric(b.totalTokens),
     costUsd: numeric(a.costUsd) + numeric(b.costUsd),
-    numTurns: numeric(a.numTurns) + numeric(b.numTurns)
+    numTurns: numeric(a.numTurns) + numeric(b.numTurns),
+    // Served model from the latest turn wins - provider can remap mid-run.
+    resolvedModel: b.resolvedModel ?? a.resolvedModel ?? null,
+    modelUsage: b.modelUsage ?? a.modelUsage ?? undefined
   };
 }
 
@@ -1947,8 +2027,131 @@ function ensureGrokAvailable(cwd) {
   }
 }
 
+/**
+ * Project a job into the runs --json v2 row shape.
+ * Hydrates missing fields from jobs/<id>.json when the index never mirrored them.
+ */
+function projectRunJsonRow(job, storedJob = null) {
+  const record = { ...job, ...(storedJob ?? {}) };
+  const worktree = record.worktree ?? null;
+  const usage = record.usage ?? storedJob?.usage ?? storedJob?.result?.usage ?? null;
+  return {
+    id: record.id,
+    status: record.status,
+    displayStatus: record.displayStatus ?? record.status,
+    alive: Boolean(record.alive),
+    abandoned: Boolean(record.abandoned),
+    kind: record.kind ?? null,
+    kindLabel: record.kindLabel ?? resolveJobKindLabel(record.kind, record.jobClass),
+    title: record.title ?? null,
+    write: record.write ?? null,
+    verified: record.verified ?? storedJob?.verified ?? storedJob?.result?.verified ?? null,
+    stopReason: record.stopReason ?? storedJob?.stopReason ?? storedJob?.result?.stopReason ?? null,
+    toolCallCount: record.toolCallCount ?? storedJob?.toolCallCount ?? storedJob?.result?.toolCallCount ?? null,
+    changedFileCount:
+      record.changedFileCount ??
+      storedJob?.changedFileCount ??
+      storedJob?.result?.changedFiles?.total ??
+      worktree?.changedFileCount ??
+      null,
+    isolation: {
+      active: Boolean(worktree?.path),
+      worktree: worktree?.path ?? null,
+      branch: worktree?.branch ?? null,
+      breached: Boolean(worktree?.breached || record.isolationBreached)
+    },
+    usage,
+    model: record.model ?? storedJob?.model ?? null,
+    resolvedModel: record.resolvedModel ?? storedJob?.resolvedModel ?? usage?.resolvedModel ?? null,
+    elapsed: record.elapsed ?? null,
+    duration: record.duration ?? null,
+    threadId: record.threadId ?? null,
+    logFile: record.logFile ?? null,
+    createdAt: record.createdAt ?? null,
+    completedAt: record.completedAt ?? null
+  };
+}
+
+function hydrateJobFromStored(workspaceRoot, job) {
+  if (!job?.id) {
+    return job;
+  }
+  // Index may predate the mirror fields; fill gaps from the job file without
+  // overwriting values the index already has.
+  const stored = readStoredJob(workspaceRoot, job.id);
+  if (!stored) {
+    return job;
+  }
+  const fill = [
+    "usage",
+    "resolvedModel",
+    "stopReason",
+    "write",
+    "verified",
+    "changedFileCount",
+    "toolCallCount",
+    "worktree",
+    "grokVersion",
+    "model"
+  ];
+  const next = { ...job };
+  for (const key of fill) {
+    if (next[key] == null && stored[key] != null) {
+      next[key] = stored[key];
+    }
+  }
+  if (next.usage == null && stored.result?.usage != null) {
+    next.usage = stored.result.usage;
+  }
+  if (next.stopReason == null && stored.result?.stopReason != null) {
+    next.stopReason = stored.result.stopReason;
+  }
+  if (next.toolCallCount == null && stored.result?.toolCallCount != null) {
+    next.toolCallCount = stored.result.toolCallCount;
+  }
+  if (next.changedFileCount == null && stored.result?.changedFiles?.total != null) {
+    next.changedFileCount = stored.result.changedFiles.total;
+  }
+  if (next.verified == null && stored.result?.verified != null) {
+    next.verified = stored.result.verified;
+  }
+  return next;
+}
+
 function renderStatusPayload(report, asJson) {
-  return asJson ? report : renderStatusReport(report);
+  if (!asJson) {
+    return renderStatusReport(report);
+  }
+  // schemaVersion 2 is the structured shape. Legacy top-level running /
+  // latestFinished / recent keys stay for one minor version (also under compat).
+  const workspaceRoot = report.workspaceRoot;
+  const running = (report.running ?? []).map((job) =>
+    projectRunJsonRow(hydrateJobFromStored(workspaceRoot, job), readStoredJob(workspaceRoot, job.id))
+  );
+  const latestFinished = report.latestFinished
+    ? projectRunJsonRow(
+        hydrateJobFromStored(workspaceRoot, report.latestFinished),
+        readStoredJob(workspaceRoot, report.latestFinished.id)
+      )
+    : null;
+  const recent = (report.recent ?? []).map((job) =>
+    projectRunJsonRow(hydrateJobFromStored(workspaceRoot, job), readStoredJob(workspaceRoot, job.id))
+  );
+  return {
+    schemaVersion: 2,
+    workspaceRoot,
+    sessionRuntime: report.sessionRuntime,
+    runs: [...running, ...(latestFinished ? [latestFinished] : []), ...recent],
+    compat: {
+      running,
+      latestFinished,
+      recent
+    },
+    // Deprecated top-level aliases — remove after one minor version.
+    running,
+    latestFinished,
+    recent
+  };
 }
 
 function isActiveJobStatus(status) {
@@ -2040,11 +2243,13 @@ async function executeReviewRun(request) {
     });
   }
 
+  // Review/critique are always read-only. Same YOLO+deny shape as delegate
+  // read-only runs — plan+sandbox made Grep return empty bodies (see
+  // buildHeadlessPermissionOptions).
   const result = await runHeadlessAgent(context.repoRoot, {
     prompt,
     agent: "explore",
-    permissionMode: "plan",
-    sandbox: "read-only",
+    ...buildHeadlessPermissionOptions(false),
     model: request.model,
     effort: request.effort,
     // Structured critique must stay "json": --json-schema implies it. The plain
@@ -2490,6 +2695,54 @@ async function executeTaskRun(request) {
   const dirtyBeforeRun = write && !created ? porcelainChangeEntries(runCwd) : null;
   const dirtyBeforeRunPaths = dirtyBeforeRun ? new Set(dirtyBeforeRun.keys()) : null;
 
+  // Run header: first lines a user (or log) sees, in fixed order, before the
+  // agent streams. Budgets only when a cap is set so an uncapped run stays quiet.
+  const availability = getGrokAvailability(request.cwd);
+  const cliBrand = availability.brand ?? detectCliBrand(availability.detail);
+  const headerLines = [
+    `CLI: ${cliBrand.label} ${availability.detail ?? "unknown"} (${availability.binary ?? "grok"})`,
+    `Model: ${request.model ? String(request.model) : "default"}`,
+    created
+      ? `Isolation: ACTIVE (worktree ${created.worktreePath}, branch ${created.branchName}, base ${String(created.baseSha ?? "").slice(0, 7)})`
+      : `Isolation: INACTIVE (writing directly to ${workspaceRoot})`
+  ];
+  for (const line of headerLines) {
+    request.onProgress?.({ message: line, phase: "starting" });
+  }
+  if (verifyPlan || verifyCommands.length > 0) {
+    const planLines = [];
+    // Reuse the same wording the status trailer prints.
+    if (verifyCommands.length > 0) {
+      const label = verifyPlan?.source ?? "unknown";
+      planLines.push(`Verify plan (${label}):`);
+      for (const command of verifyCommands) {
+        planLines.push(`  ${command}`);
+      }
+    } else if (verifyPlan?.disabled) {
+      planLines.push("Verify plan: disabled for this run (--no-verify).");
+    }
+    for (const line of planLines) {
+      request.onProgress?.({ message: line, phase: "starting" });
+    }
+  }
+  const budgetBits = [];
+  if (maxDurationSeconds != null) {
+    budgetBits.push(`max-duration=${maxDurationSeconds}s`);
+  }
+  if (maxTurns != null) {
+    budgetBits.push(`max-turns=${maxTurns}`);
+  }
+  if (maxCostUsd != null) {
+    budgetBits.push(`max-cost=$${maxCostUsd}`);
+  }
+  if (budgetBits.length > 0) {
+    request.onProgress?.({ message: `Budgets: ${budgetBits.join(", ")}`, phase: "starting" });
+  }
+
+  // Permission shape: write runs YOLO; read-only runs YOLO + deny Edit/Write/
+  // NotebookEdit and never pass plan/sandbox (see buildHeadlessPermissionOptions).
+  const permissionOptions = buildHeadlessPermissionOptions(write);
+
   const firstAgent = await runHeadlessAgentWithDurationBudget(
     runCwd,
     {
@@ -2497,9 +2750,7 @@ async function executeTaskRun(request) {
       resumeSessionId,
       model: request.model,
       effort: request.effort,
-      alwaysApprove: write,
-      permissionMode: write ? undefined : "plan",
-      sandbox: write ? undefined : "read-only",
+      ...permissionOptions,
       maxTurns,
       // The one thing that makes a delegate run return an answer rather than a
       // narration transcript. Only on the FIRST turn: a fix turn given the same
@@ -2735,19 +2986,10 @@ async function executeTaskRun(request) {
           resumeSessionId: result.threadId,
           model: request.model,
           effort: request.effort,
-          // Mirror the ORIGINAL run's write policy exactly. This used to be
-          // alwaysApprove:true unconditionally with no permissionMode/sandbox
-          // at all, so a run started read-only (permissionMode:"plan",
-          // sandbox:"read-only") got escalated to full write approval on its
-          // very first verify failure - and since isolation only applies to
-          // write runs, that write happened directly in the user's real
-          // working tree, not a worktree, despite the user asking for
-          // read-only. A read-only run with --verify still specified simply
-          // cannot fix anything (sandboxed), so it correctly re-fails and the
-          // run reports completed-unverified instead.
-          alwaysApprove: write,
-          permissionMode: write ? undefined : "plan",
-          sandbox: write ? undefined : "read-only",
+          // Mirror the ORIGINAL run's write policy exactly. Read-only stays
+          // YOLO+deny (not plan/sandbox); write stays YOLO. Escalating a
+          // read-only verify fix to full write used to edit the real tree.
+          ...buildHeadlessPermissionOptions(write),
           maxTurns,
           cwd: runCwd,
           outputFormat: "streaming-json",
@@ -2858,11 +3100,73 @@ async function executeTaskRun(request) {
   const unknownEventTypes = [
     ...new Set(agentResults.flatMap((entry) => entry?.unknownEventTypes ?? []))
   ].sort();
+  // Sum tool calls across turns when every turn reported a number; if any turn
+  // left the count unknown (null), the aggregate is unknown rather than a
+  // partial sum that under-counts.
+  let toolCallCount = null;
+  if (agentResults.every((entry) => entry?.toolCallCount == null)) {
+    toolCallCount = null;
+  } else if (agentResults.some((entry) => entry?.toolCallCount == null)) {
+    // At least one turn counted; treat missing turns as 0 only when siblings
+    // had a real count (same session, same CLI vocabulary).
+    toolCallCount = agentResults.reduce(
+      (sum, entry) => sum + (Number.isFinite(Number(entry?.toolCallCount)) ? Number(entry.toolCallCount) : 0),
+      0
+    );
+  } else {
+    toolCallCount = agentResults.reduce((sum, entry) => sum + Number(entry.toolCallCount), 0);
+  }
+  const stopReason = timedOut ? "max-duration" : (result.stopReason ?? null);
+  const resolvedModel =
+    cumulativeUsage?.resolvedModel ??
+    agentResults.map((entry) => entry?.resolvedModel ?? entry?.usage?.resolvedModel).filter(Boolean).at(-1) ??
+    null;
+  // Once known, surface the served model on the header path via a late progress
+  // line so logs show "requested -> served" without rewriting the opening lines.
+  if (resolvedModel && request.model && String(resolvedModel) !== String(request.model)) {
+    request.onProgress?.({
+      message: `Model: ${request.model} -> ${resolvedModel}`,
+      phase: "finalizing"
+    });
+  } else if (resolvedModel && !request.model) {
+    request.onProgress?.({
+      message: `Model: default -> ${resolvedModel}`,
+      phase: "finalizing"
+    });
+  }
+  const changedFileCount =
+    changedFiles?.total != null
+      ? Number(changedFiles.total)
+      : worktree?.changedFileCount != null
+        ? Number(worktree.changedFileCount)
+        : write
+          ? null
+          : null;
   const failureMessage = timedOut
     ? `Run timed out after ${maxDurationSeconds}s (--max-duration).`
     : result.status === 0
       ? ""
       : result.stderr || "";
+  // Pre-compute the honest status so Verified: n/a lines can reference it in
+  // the same rendered trailer the user sees at the end of a foreground run.
+  // Only a measured 0 trips completed-noop; a failed/absent manifest stays null
+  // so we do not invent "changed nothing" for a run we could not inspect.
+  const effectiveChangedFileCount =
+    changedFileCount != null
+      ? changedFileCount
+      : changedFiles && Number.isFinite(Number(changedFiles.total))
+        ? Number(changedFiles.total)
+        : null;
+  const terminalStatus = decideCompletionStatus({
+    timedOut,
+    exitStatus: timedOut ? 1 : result.status,
+    stopReason,
+    toolCallCount,
+    changedFileCount: effectiveChangedFileCount,
+    write,
+    verified,
+    hadWork: Boolean(prompt)
+  });
   const rendered = timedOut
     ? `${failureMessage}\n${rawOutput ? `\n${rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`}` : ""}`
     : renderTaskResult(
@@ -2884,6 +3188,11 @@ async function executeTaskRun(request) {
           write,
           verified,
           verifyNote,
+          status: terminalStatus,
+          stopReason,
+          usage: cumulativeUsage ?? null,
+          model: request.model ?? null,
+          resolvedModel,
           // Which command(s) tripped an exit-0 output-failure marker, and what
           // matched - the only evidence available without reading --json for
           // a command whose exit code alone says it passed. Computed here
@@ -2952,7 +3261,11 @@ async function executeTaskRun(request) {
     status: exitStatus,
     threadId: result.threadId,
     usage: cumulativeUsage ?? null,
-    stopReason: timedOut ? "max-duration" : (result.stopReason ?? null),
+    stopReason,
+    toolCallCount,
+    changedFileCount: effectiveChangedFileCount,
+    model: request.model ?? null,
+    resolvedModel,
     rawOutput,
     // The full narration across every turn, kept alongside the answer so
     // nothing is lost by rawOutput now preferring the answer. This is what a
@@ -3022,7 +3335,13 @@ async function executeTaskRun(request) {
     worktree,
     grokVersion,
     verify,
-    usage: cumulativeUsage ?? null
+    usage: cumulativeUsage ?? null,
+    stopReason,
+    toolCallCount,
+    changedFileCount: effectiveChangedFileCount,
+    model: request.model ?? null,
+    resolvedModel,
+    hadWork: Boolean(prompt)
   };
 }
 
@@ -3293,6 +3612,10 @@ async function handleReviewCommand(argv, config) {
   const workspaceRoot = resolveCommandWorkspace(options);
   const model = options.model ? String(options.model).trim() : null;
   const effort = normalizeReasoningEffort(options.effort);
+  const billingGate = assertModelBillingAllowed(model, process.env);
+  if (!billingGate.allowed) {
+    throw new Error(billingGate.message);
+  }
   const focusText = positionals.join(" ").trim();
   const target = resolveReviewTarget(cwd, {
     base: options.base,
@@ -3466,6 +3789,12 @@ async function handleTask(argv) {
   // been validated by the schema.
   const model = options.model ? String(options.model).trim() : (settings.model ?? null);
   const effort = normalizeReasoningEffort(options.effort) ?? settings.effort ?? null;
+  // Pay-per-token models (openai/*) require an explicit opt-in so a typo does
+  // not silently burn metered budget.
+  const billingGate = assertModelBillingAllowed(model, process.env);
+  if (!billingGate.allowed) {
+    throw new Error(billingGate.message);
+  }
   const isolate = resolveIsolateOption(options, write, settings.isolate);
   const verifyCommands = settings.verify;
   const verifyPlan = {
@@ -4106,12 +4435,15 @@ function handleResult(argv) {
   const reference = positionals[0] ?? "";
   const { workspaceRoot, job } = resolveResultJob(cwd, reference);
   const storedJob = readStoredJob(workspaceRoot, job.id);
+  // Hydrate index gaps from the job file so show never prints null for usage
+  // that was only stored on jobs/<id>.json.
+  const hydrated = hydrateJobFromStored(workspaceRoot, job);
   const payload = {
-    job,
+    job: hydrated,
     storedJob
   };
 
-  outputCommandResult(payload, renderStoredJobResult(job, storedJob), options.json);
+  outputCommandResult(payload, renderStoredJobResult(hydrated, storedJob), options.json);
 }
 
 function handleTaskResumeCandidate(argv) {
@@ -4245,10 +4577,76 @@ async function handleCancel(argv) {
   outputCommandResult(payload, renderCancelReport({ ...nextJob, ...payload }), options.json);
 }
 
+function handleModels(argv) {
+  if (wantsHelp(argv)) {
+    printSubcommandHelp("models");
+    return;
+  }
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json"]
+  });
+  const cwd = resolveCommandCwd(options);
+  const listed = listGrokModels(cwd);
+  if (!listed.ok) {
+    const message = listed.error || "models failed";
+    if (options.json) {
+      outputResult(
+        {
+          schemaVersion: 1,
+          ok: false,
+          binary: listed.binary,
+          brand: listed.brand,
+          error: message,
+          defaultModel: listed.defaultModel,
+          models: listed.models
+        },
+        true
+      );
+    } else {
+      process.stderr.write(`${message}\n`);
+    }
+    process.exitCode = 1;
+    return;
+  }
+
+  const payload = {
+    schemaVersion: 1,
+    binary: listed.binary,
+    brand: listed.brand,
+    defaultModel: listed.defaultModel,
+    models: listed.models
+  };
+
+  if (options.json) {
+    outputResult(payload, true);
+    return;
+  }
+
+  const lines = [
+    `CLI: ${listed.brand?.label ?? "Grok Build"} (${listed.binary})`,
+    listed.defaultModel ? `Default model: ${listed.defaultModel}` : "Default model: (none reported)",
+    "",
+    "Available models:"
+  ];
+  for (const model of listed.models) {
+    const mark = model.default ? " (default)" : "";
+    lines.push(`  - ${model.id}  [${model.billing}]${mark}`);
+  }
+  console.log(lines.join("\n"));
+}
+
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
-  if (!subcommand || subcommand === "help" || subcommand === "--help") {
+  if (!subcommand || subcommand === "help" || subcommand === "--help" || subcommand === "-h") {
     printUsage();
+    return;
+  }
+
+  // Subcommand --help short-circuits before any argument validation so
+  // `run --help` does not warn about unknown --help then error on a missing prompt.
+  if (wantsHelp(argv)) {
+    printSubcommandHelp(subcommand);
     return;
   }
 
@@ -4258,6 +4656,9 @@ async function main() {
       break;
     case "doctor":
       await handleDoctor(argv);
+      break;
+    case "models":
+      handleModels(argv);
       break;
     case "verify-plan":
       await handleVerifyPlan(argv);

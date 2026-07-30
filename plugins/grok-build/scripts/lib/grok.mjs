@@ -128,6 +128,107 @@ function buildAuthStatus(fields = {}) {
   };
 }
 
+/**
+ * Infer how a model id is billed from its provider prefix.
+ * openai-codex/* is ChatGPT-subscription routing; openai/* is metered;
+ * nvidia/* needs a provider key; bare xAI ids (and xai-direct/*) are default.
+ */
+export function inferModelBillingRoute(modelId) {
+  const id = String(modelId ?? "").trim();
+  if (!id) {
+    return { route: "default", billing: "default" };
+  }
+  if (id.startsWith("openai-codex/")) {
+    return { route: "openai-codex", billing: "subscription" };
+  }
+  if (id.startsWith("openai/")) {
+    return { route: "openai", billing: "pay-per-token" };
+  }
+  if (id.startsWith("nvidia/")) {
+    return { route: "nvidia", billing: "provider-key" };
+  }
+  if (id.startsWith("xai-direct/")) {
+    return { route: "xai-direct", billing: "default" };
+  }
+  return { route: "default", billing: "default" };
+}
+
+/**
+ * Parse `<binary> models` stdout into structured model rows.
+ * Hyper exits 255 on a successful listing; callers must not require status 0.
+ *
+ * @param {string} stdout
+ * @returns {{ defaultModel: string|null, models: Array<{id: string, route: string, billing: string, default: boolean}> }}
+ */
+export function parseModelsOutput(stdout) {
+  const text = String(stdout ?? "");
+  const lines = text.split(/\r?\n/);
+  let defaultModel = null;
+  const ids = [];
+  const seen = new Set();
+
+  for (const line of lines) {
+    const defaultMatch = line.match(/^\s*Default model:\s*(.+?)\s*$/i);
+    if (defaultMatch) {
+      defaultModel = defaultMatch[1].trim();
+      continue;
+    }
+    // Bullet / dashed list lines under "Available models:"
+    const bullet = line.match(/^\s*[-*•]\s+(\S+)\s*$/);
+    if (bullet) {
+      const id = bullet[1].trim();
+      if (id && !seen.has(id)) {
+        seen.add(id);
+        ids.push(id);
+      }
+      continue;
+    }
+    // Indented bare id (some CLIs print two-space indented names without a dash)
+    const indented = line.match(/^\s{2,}(\S+)\s*$/);
+    if (indented && /available models/i.test(text)) {
+      const id = indented[1].trim();
+      if (id && !seen.has(id) && id !== defaultModel) {
+        // Avoid grabbing section headers
+        if (/^(available|default|you are|logged)/i.test(id)) {
+          continue;
+        }
+        seen.add(id);
+        ids.push(id);
+      }
+    }
+  }
+
+  if (defaultModel && !seen.has(defaultModel)) {
+    ids.unshift(defaultModel);
+    seen.add(defaultModel);
+  }
+
+  const models = ids.map((id) => {
+    const { route, billing } = inferModelBillingRoute(id);
+    return {
+      id,
+      route,
+      billing,
+      default: Boolean(defaultModel && id === defaultModel)
+    };
+  });
+
+  return { defaultModel, models };
+}
+
+/**
+ * True when stdout looks like a successful models listing even if exit != 0.
+ * Hyper returns 255 with a full list; treating that as auth-failure made every
+ * Hyper user look logged out.
+ */
+export function modelsOutputLooksSuccessful(stdout) {
+  const text = String(stdout ?? "");
+  if (!text.trim()) {
+    return false;
+  }
+  return /available models|default model|logged in/i.test(text);
+}
+
 export function runModelsProbe(cwd, options = {}) {
   const binary = options.binary ?? resolveGrokBinary(options.env ?? process.env);
   const result = runGrok(["models"], {
@@ -154,7 +255,9 @@ export function runModelsProbe(cwd, options = {}) {
     });
   }
 
-  if (result.status !== 0) {
+  const stdout = (result.stdout || "").trim();
+  // Hyper exits 255 on a successful listing. Status alone is not auth signal.
+  if (result.status !== 0 && !modelsOutputLooksSuccessful(stdout)) {
     const detail = (result.stderr || result.stdout || `exit ${result.status}`).trim();
     return buildAuthStatus({
       available: true,
@@ -164,7 +267,16 @@ export function runModelsProbe(cwd, options = {}) {
     });
   }
 
-  const stdout = (result.stdout || "").trim();
+  if (!stdout && result.status !== 0) {
+    const detail = (result.stderr || `exit ${result.status}`).trim();
+    return buildAuthStatus({
+      available: true,
+      loggedIn: false,
+      detail: detail || "grok models failed; not logged in or not ready",
+      source: "models-probe"
+    });
+  }
+
   const loggedInHint = /logged in|available models|default model/i.test(stdout);
   return buildAuthStatus({
     available: true,
@@ -176,6 +288,98 @@ export function runModelsProbe(cwd, options = {}) {
     authMethod: "grok-cli",
     verified: true
   });
+}
+
+/**
+ * Run `<binary> models` and return structured rows.
+ * Non-zero exit is success when the listing body is present (Hyper exits 255).
+ */
+export function listGrokModels(cwd, options = {}) {
+  const binary = options.binary ?? resolveGrokBinary(options.env ?? process.env);
+  const availability = getGrokAvailability(cwd, { ...options, binary });
+  const result = runGrok(["models"], {
+    cwd,
+    env: options.env,
+    binary
+  });
+
+  if (result.error && /** @type {NodeJS.ErrnoException} */ (result.error).code === "ENOENT") {
+    return {
+      ok: false,
+      binary,
+      brand: availability.brand,
+      error: "binary not found",
+      status: result.status,
+      defaultModel: null,
+      models: []
+    };
+  }
+  if (result.error) {
+    return {
+      ok: false,
+      binary,
+      brand: availability.brand,
+      error: result.error.message,
+      status: result.status,
+      defaultModel: null,
+      models: []
+    };
+  }
+
+  const stdout = result.stdout || "";
+  const parsed = parseModelsOutput(stdout);
+  const ok = result.status === 0 || modelsOutputLooksSuccessful(stdout) || parsed.models.length > 0;
+  if (!ok) {
+    return {
+      ok: false,
+      binary,
+      brand: availability.brand,
+      error: (result.stderr || stdout || `exit ${result.status}`).trim() || "models failed",
+      status: result.status,
+      defaultModel: parsed.defaultModel,
+      models: parsed.models,
+      raw: stdout
+    };
+  }
+
+  return {
+    ok: true,
+    binary,
+    brand: availability.brand,
+    status: result.status,
+    defaultModel: parsed.defaultModel,
+    models: parsed.models,
+    raw: stdout
+  };
+}
+
+/**
+ * Refuse a run that targets a pay-per-token model unless the user opted in.
+ * Subscription / default / provider-key routes are not gated.
+ *
+ * @param {string|null|undefined} modelId
+ * @param {NodeJS.ProcessEnv} [env]
+ * @returns {{ allowed: boolean, billing: string, message?: string }}
+ */
+export function assertModelBillingAllowed(modelId, env = process.env) {
+  if (modelId == null || !String(modelId).trim()) {
+    return { allowed: true, billing: "default" };
+  }
+  const { billing, route } = inferModelBillingRoute(modelId);
+  if (billing !== "pay-per-token") {
+    return { allowed: true, billing, route };
+  }
+  if (String(env?.GROK_BUILD_ALLOW_PAY_PER_TOKEN ?? "") === "1") {
+    return { allowed: true, billing, route };
+  }
+  return {
+    allowed: false,
+    billing,
+    route,
+    message:
+      `Model \`${String(modelId).trim()}\` is billed pay-per-token (${route}). ` +
+      `Set GROK_BUILD_ALLOW_PAY_PER_TOKEN=1 to allow it, or pick a subscription/default model.`
+  };
 }
 
 export function getGrokAuthStatus(cwd, options = {}) {
@@ -338,6 +542,57 @@ function writePromptFile(directory, prompt) {
   return filePath;
 }
 
+/**
+ * Deny rules for a read-only headless run.
+ *
+ * Hyper evaluates --deny before --always-approve, so YOLO + these denies is the
+ * only combination that both (a) lets Grep/Read/Glob actually return bodies and
+ * (b) still blocks writes. See buildReadOnlyHeadlessPermissions.
+ */
+export const READ_ONLY_DENY_RULES = Object.freeze([
+  "Edit(**)",
+  "Write(**)",
+  "NotebookEdit(**)"
+]);
+
+/**
+ * Permission flags for a headless run.
+ *
+ * Read-only used to pass `--permission-mode plan` and `--sandbox read-only`.
+ * Measured on Hyper:
+ * 1. A tool call that is not pre-approved returns an EMPTY result body with no
+ *    error (plan / auto / explicit --allow all do this). The model then reports
+ *    "no matches" for a string that is present - every read-only run was blind.
+ * 2. `--sandbox read-only` additionally breaks Grep on Windows even with
+ *    `--always-approve`. Hyper's sandbox enforcement is unix-only
+ *    (`#[cfg(all(feature = "enforce", unix))]`), so on Windows it confines
+ *    nothing and still costs correctness.
+ * 3. `--deny` rules beat `--always-approve`, so YOLO + deny Edit/Write/NotebookEdit
+ *    is both readable and non-writing.
+ *
+ * Do not "fix" this back to plan + read-only sandbox without re-measuring.
+ *
+ * @param {boolean} write
+ * @returns {{ alwaysApprove: boolean, denyRules?: string[], allowRules?: string[], permissionMode?: string, sandbox?: string }}
+ */
+export function buildHeadlessPermissionOptions(write) {
+  if (write) {
+    return { alwaysApprove: true };
+  }
+  return {
+    alwaysApprove: true,
+    denyRules: [...READ_ONLY_DENY_RULES]
+  };
+}
+
+function normalizeRuleList(value) {
+  if (value == null) {
+    return [];
+  }
+  const list = Array.isArray(value) ? value : [value];
+  return list.map((entry) => String(entry).trim()).filter(Boolean);
+}
+
 export function buildHeadlessArgs(prompt, options = {}) {
   const leading = [];
 
@@ -365,6 +620,15 @@ export function buildHeadlessArgs(prompt, options = {}) {
   }
   if (options.alwaysApprove) {
     trailing.push("--always-approve");
+  }
+  // Repeated --deny / --allow. Order does not matter for Hyper (deny wins over
+  // YOLO regardless), but each rule is its own argv pair and must be counted
+  // in the budget like every other flag.
+  for (const rule of normalizeRuleList(options.denyRules)) {
+    trailing.push("--deny", rule);
+  }
+  for (const rule of normalizeRuleList(options.allowRules)) {
+    trailing.push("--allow", rule);
   }
   if (options.model) {
     trailing.push("--model", options.model);
@@ -632,6 +896,9 @@ export function runHeadlessAgent(cwd, options = {}) {
         messages: result ? result.messages : null,
         usage: result?.usage ?? null,
         stopReason: result?.stopReason ?? null,
+        // null when the stream never proved it speaks tools - not the same as 0.
+        toolCallCount: result?.toolCallCount ?? null,
+        resolvedModel: result?.usage?.resolvedModel ?? null,
         unknownEventTypes: result?.unknownTypes ?? [],
         // False only when a streaming run's events were all unrecognized, i.e.
         // when the four text fields above are raw stdout rather than a parsed

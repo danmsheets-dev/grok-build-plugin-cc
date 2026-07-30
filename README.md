@@ -52,13 +52,14 @@ Read-only review of local git state:
 /grok-build:review --wait --model grok-build --effort high
 ```
 
-Runs:
+Runs (read-only):
 
 ```bash
-grok -p <prompt> --agent explore --permission-mode plan --sandbox read-only --cwd <ws> --output-format plain
+grok -p <prompt> --agent explore --always-approve --deny Edit(**) --deny Write(**) --deny NotebookEdit(**) --cwd <ws> --output-format streaming-json
 ```
 
 Optional: pass `--model` / `--effort` (`low`|`medium`|`high`). If omitted, Grok chooses defaults.
+Pay-per-token models (`openai/*`) require `GROK_BUILD_ALLOW_PAY_PER_TOKEN=1`.
 
 ### `/grok-build:critique`
 
@@ -86,7 +87,7 @@ Write policy layering:
 
 | Layer | Default |
 | --- | --- |
-| Bridge `run` CLI | **Read-only** (`--permission-mode plan` + `--sandbox read-only`) unless you pass `--write` |
+| Bridge `run` CLI | **Read-only** (`--always-approve` + `--deny Edit/Write/NotebookEdit`) unless you pass `--write` |
 | Delegate agent / skill | Adds `--write` by policy (write-capable delegate) unless the user asks for read-only |
 
 - Direct `node …/grok-bridge.mjs run "…"` is therefore read-only unless `--write` is passed.
@@ -113,7 +114,12 @@ List active and recent plugin-owned runs:
 ```text
 /grok-build:runs
 /grok-build:runs <run-id> --wait
+/grok-build:runs --json
 ```
+
+`runs --json` emits **schemaVersion 2** (`runs[]` with usage, isolation, stopReason,
+toolCallCount, etc.). The legacy top-level keys `running`, `latestFinished`, and `recent`
+are still present for one minor version (also under `compat`); prefer `runs` + `compat`.
 
 ### `/grok-build:show`
 
@@ -123,6 +129,9 @@ Show stored output for a finished run:
 /grok-build:show
 /grok-build:show <run-id>
 ```
+
+Every show result ends with a machine-readable `===BRIDGE-RESULT===` trailer (status,
+isolation, usage, land hint).
 
 ### `/grok-build:stop`
 
@@ -139,7 +148,8 @@ Kills every distinct pid among `agentPid` (detached grok child) and `bridgePid` 
 
 | Variable | Purpose |
 | --- | --- |
-| `GROK_BINARY` | Optional override for the `grok` executable |
+| `GROK_BINARY` | Optional override for the `grok` executable (e.g. Hyper) |
+| `GROK_BUILD_ALLOW_PAY_PER_TOKEN` | Set to `1` to allow `openai/*` pay-per-token models |
 | `GROK_CC_SESSION_ID` | Claude session id (set by SessionStart hook) |
 | `GROK_CC_TRANSCRIPT_PATH` | Claude transcript path (set by SessionStart hook) |
 | `CLAUDE_PLUGIN_ROOT` | Plugin install root (host) |

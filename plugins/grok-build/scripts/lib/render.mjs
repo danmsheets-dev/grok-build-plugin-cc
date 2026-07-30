@@ -134,22 +134,55 @@ function formatTokenCount(value) {
   return Number(value ?? 0).toLocaleString("en-US");
 }
 
-export function formatUsageLine(usage) {
+/**
+ * Compact token count for dense usage lines (151.0k, 1.7M).
+ * Small values stay plain so unit tests and short runs stay readable.
+ */
+function formatCompactTokenCount(value) {
+  const n = Number(value ?? 0);
+  if (!Number.isFinite(n)) {
+    return "0";
+  }
+  const abs = Math.abs(n);
+  if (abs >= 1_000_000) {
+    return `${(n / 1_000_000).toFixed(1)}M`;
+  }
+  if (abs >= 10_000) {
+    return `${(n / 1_000).toFixed(1)}k`;
+  }
+  return formatTokenCount(n);
+}
+
+/**
+ * @param {object|null|undefined} usage
+ * @param {{ model?: string|null, resolvedModel?: string|null, compact?: boolean }} [options]
+ */
+export function formatUsageLine(usage, options = {}) {
   if (!usage || typeof usage !== "object") {
     return null;
   }
+  const formatCount = options.compact ? formatCompactTokenCount : formatTokenCount;
   const cached = Number(usage.cachedInputTokens ?? 0);
   const inputPart = cached > 0
-    ? `${formatTokenCount(usage.inputTokens)} in (${formatTokenCount(cached)} cached)`
-    : `${formatTokenCount(usage.inputTokens)} in`;
+    ? `${formatCount(usage.inputTokens)} in (${formatCount(cached)} cached)`
+    : `${formatCount(usage.inputTokens)} in`;
 
-  const parts = [`Tokens: ${inputPart} / ${formatTokenCount(usage.outputTokens)} out`];
+  const parts = [`Tokens: ${inputPart} / ${formatCount(usage.outputTokens)} out`];
   if (Number.isFinite(Number(usage.numTurns)) && Number(usage.numTurns) > 0) {
     const turns = Number(usage.numTurns);
     parts.push(`${turns} ${turns === 1 ? "turn" : "turns"}`);
   }
   if (usage.costUsd != null && Number.isFinite(Number(usage.costUsd))) {
     parts.push(`$${Number(usage.costUsd).toFixed(4)}`);
+  }
+  const requested = options.model ?? usage.model ?? null;
+  const served = options.resolvedModel ?? usage.resolvedModel ?? null;
+  if (requested || served) {
+    if (requested && served && String(requested) !== String(served)) {
+      parts.push(`model ${requested} -> ${served}`);
+    } else {
+      parts.push(`model ${served || requested}`);
+    }
   }
   return parts.join(" · ");
 }
@@ -194,6 +227,11 @@ export function formatUsageTotals(jobs) {
       : `${formatTokenCount(inputTokens)} in`;
 
   return `Session totals: ${runs} runs - ${inputPart} / ${formatTokenCount(outputTokens)} out - $${costUsd.toFixed(4)}`;
+}
+
+/** Alias for session-total callers; same implementation as formatUsageTotals. */
+export function summarizeSessionUsage(jobs) {
+  return formatUsageTotals(jobs);
 }
 
 function pushJobDetails(lines, job, options = {}) {
@@ -587,6 +625,26 @@ function pushRunDiagnosticLines(lines, meta, rawOutput) {
   }
 }
 
+/**
+ * Statuses where "Verified: yes" would be a lie even if the verify loop passed:
+ * nothing was proven because the run did no work, saw nothing, or stopped early.
+ */
+const VERIFIED_NA_STATUSES = new Set(["completed-noop", "completed-blind", "completed-truncated"]);
+
+function verifiedNaLine(status, stopReason) {
+  if (status === "completed-noop") {
+    return "Verified: n/a - the run changed no files, so verification proves nothing.";
+  }
+  if (status === "completed-blind") {
+    return "Verified: n/a - the agent completed no successful tool calls; treat this run as blind.";
+  }
+  if (status === "completed-truncated") {
+    const reason = stopReason && String(stopReason).trim() ? String(stopReason).trim() : "early stop";
+    return `Verified: n/a - the run stopped early (${reason}).`;
+  }
+  return null;
+}
+
 export function buildTaskStatusLines(meta = {}, rawOutput = "") {
   const lines = [];
 
@@ -607,7 +665,23 @@ export function buildTaskStatusLines(meta = {}, rawOutput = "") {
     );
   }
 
-  if (meta.verified === true) {
+  const usageLine = formatUsageLine(meta.usage, {
+    model: meta.model,
+    resolvedModel: meta.resolvedModel ?? meta.usage?.resolvedModel,
+    compact: true
+  });
+  if (usageLine) {
+    lines.push(usageLine);
+  }
+
+  const naLine = VERIFIED_NA_STATUSES.has(meta.status)
+    ? verifiedNaLine(meta.status, meta.stopReason)
+    : null;
+  if (naLine) {
+    // Never render Verified: yes for noop/blind/truncated - even when the
+    // verify loop happened to return true, it proved nothing about the work.
+    lines.push(naLine);
+  } else if (meta.verified === true) {
     lines.push(`Verified: yes${meta.verifyNote ? ` (${meta.verifyNote})` : ""}`);
   } else if (meta.verified === false) {
     // The note used to be dropped entirely on this branch, so a run that
@@ -788,15 +862,105 @@ export function renderJobStatusReport(job, options = {}) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
+/**
+ * Structured trailer every `show` path appends so a machine (or a hurried human)
+ * can read status/isolation/usage without scraping prose.
+ */
+export function buildBridgeResultBlock(job = {}, storedJob = null) {
+  const record = { ...job, ...(storedJob ?? {}) };
+  const status = record.status ?? "unknown";
+  const stopReason = record.stopReason ?? record.result?.stopReason ?? null;
+  const verified = record.verified ?? record.result?.verified ?? null;
+
+  let verifiedLabel = "n/a";
+  if (VERIFIED_NA_STATUSES.has(status)) {
+    verifiedLabel = "n/a";
+  } else if (verified === true) {
+    verifiedLabel = "yes";
+  } else if (verified === false) {
+    verifiedLabel = "no";
+  }
+
+  const worktree = record.worktree ?? null;
+  let isolation = "INACTIVE (workspaceRoot)";
+  if (worktree?.path) {
+    isolation = `ACTIVE (worktree ${worktree.path}, branch ${worktree.branch ?? "unknown"})`;
+  }
+  if (worktree?.breached || record.isolationBreached) {
+    isolation = "breached";
+  }
+
+  const changedFileCount =
+    record.changedFileCount ??
+    record.result?.changedFiles?.total ??
+    worktree?.changedFileCount ??
+    null;
+  const changedFilesLabel =
+    changedFileCount == null
+      ? "unknown"
+      : changedFileCount === 0
+        ? "none"
+        : String(changedFileCount);
+
+  const toolCallCount = record.toolCallCount ?? record.result?.toolCallCount ?? null;
+  const toolCallsLabel = toolCallCount == null ? "unknown" : String(toolCallCount);
+
+  const usage = record.usage ?? record.result?.usage ?? null;
+  const usageLine =
+    formatUsageLine(usage, {
+      model: record.model,
+      resolvedModel: record.resolvedModel ?? usage?.resolvedModel,
+      compact: true
+    }) ?? "none";
+
+  const verify = record.verify ?? record.result?.verify ?? null;
+  let verifyLabel = "none";
+  if (verify && typeof verify === "object") {
+    const planSource = verify.plan?.source ?? verify.source ?? null;
+    const note = verify.note ?? null;
+    const verdict =
+      verified === true ? "passed" : verified === false ? "failed" : VERIFIED_NA_STATUSES.has(status) ? "n/a" : "n/a";
+    verifyLabel = [planSource ? `source=${planSource}` : null, note, `verdict=${verdict}`]
+      .filter(Boolean)
+      .join("; ");
+  } else if (VERIFIED_NA_STATUSES.has(status)) {
+    verifyLabel = verifiedNaLine(status, stopReason) ?? "n/a";
+  }
+
+  const logFile = record.logFile ?? null;
+  const lines = [
+    "===BRIDGE-RESULT===",
+    `status: ${status}`,
+    `stopReason: ${stopReason && String(stopReason).trim() ? stopReason : "none"}`,
+    `verified: ${verifiedLabel}`,
+    `isolation: ${isolation}`,
+    `changed files: ${changedFilesLabel}`,
+    `tool calls: ${toolCallsLabel}`,
+    `usage: ${usageLine}`,
+    `verify: ${verifyLabel}`,
+    `log: ${logFile ?? "none"}`
+  ];
+  if (worktree?.path) {
+    lines.push(`land: /grok-build:land ${record.id ?? job.id}`);
+  }
+  lines.push("===END-BRIDGE-RESULT===");
+  return lines.join("\n");
+}
+
+function appendBridgeResult(output, job, storedJob) {
+  const base = output.endsWith("\n") ? output : `${output}\n`;
+  return `${base}\n${buildBridgeResultBlock(job, storedJob)}\n`;
+}
+
 export function renderStoredJobResult(job, storedJob) {
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
   const resumeCommand = threadId ? `grok -r ${threadId}` : null;
   if (isStructuredReviewStoredResult(storedJob) && storedJob?.rendered) {
     const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
-    if (!threadId) {
-      return output;
-    }
-    return `${output}\nGrok session ID: ${threadId}\nResume in Grok: ${resumeCommand}\n`;
+    const withSession = threadId
+      ? `${output}\nGrok session ID: ${threadId}\nResume in Grok: ${resumeCommand}\n`
+      : output;
+    return appendBridgeResult(withSession, job, storedJob);
   }
 
   // The delimited report first when the model honoured the contract, because
@@ -812,18 +976,18 @@ export function renderStoredJobResult(job, storedJob) {
     "";
   if (rawOutput) {
     const output = rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
-    if (!threadId) {
-      return output;
-    }
-    return `${output}\nGrok session ID: ${threadId}\nResume in Grok: ${resumeCommand}\n`;
+    const withSession = threadId
+      ? `${output}\nGrok session ID: ${threadId}\nResume in Grok: ${resumeCommand}\n`
+      : output;
+    return appendBridgeResult(withSession, job, storedJob);
   }
 
   if (storedJob?.rendered) {
     const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
-    if (!threadId) {
-      return output;
-    }
-    return `${output}\nGrok session ID: ${threadId}\nResume in Grok: ${resumeCommand}\n`;
+    const withSession = threadId
+      ? `${output}\nGrok session ID: ${threadId}\nResume in Grok: ${resumeCommand}\n`
+      : output;
+    return appendBridgeResult(withSession, job, storedJob);
   }
 
   const lines = [
@@ -842,7 +1006,10 @@ export function renderStoredJobResult(job, storedJob) {
     lines.push(`Summary: ${job.summary}`);
   }
 
-  const storedUsageLine = formatUsageLine(storedJob?.usage ?? job.usage);
+  const storedUsageLine = formatUsageLine(storedJob?.usage ?? job.usage, {
+    model: storedJob?.model ?? job.model,
+    resolvedModel: storedJob?.resolvedModel ?? job.resolvedModel
+  });
   if (storedUsageLine) {
     lines.push(storedUsageLine);
   }
@@ -855,7 +1022,7 @@ export function renderStoredJobResult(job, storedJob) {
     lines.push("", "No captured result payload was stored for this job.");
   }
 
-  return `${lines.join("\n").trimEnd()}\n`;
+  return appendBridgeResult(`${lines.join("\n").trimEnd()}\n`, job, storedJob);
 }
 
 export function renderCancelReport(job) {
