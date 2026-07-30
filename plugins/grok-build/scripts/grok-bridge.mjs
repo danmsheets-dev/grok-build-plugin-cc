@@ -910,6 +910,58 @@ function normalizeDoctorCheck(check) {
   return { ...check, status, ok: status !== "fail" };
 }
 
+/**
+ * Renders one line of attacker-influenced text - a withheld or just-trusted
+ * config's verify/tools/env command, an unknown JSON key echoed into a
+ * warning - for a terminal without letting it act as one.
+ *
+ * C0 and C1 control bytes (0x00-0x1F, 0x7F-0x9F) are rewritten as visible
+ * `\xNN` rather than dropped: the user should see that the file contains
+ * them, not have them silently disappear. This specifically defeats ESC
+ * (0x1B, which starts every ANSI escape sequence a hostile file could use to
+ * repaint the terminal or hide part of the command it wants trusted) and
+ * bare CR/LF (which could otherwise fake an extra report line). A hard length
+ * cap stops one line from scrolling a whole report off-screen.
+ *
+ * Render time ONLY. Trust is hashed over the file's exact original bytes
+ * (see hashProjectConfig) and those same unmutated bytes are what a verify
+ * command hands to sh -c / cmd /c - running either of those through this
+ * function first would decouple what was hashed/executed from what this
+ * prints, which is a worse bug than the display issue it would "fix".
+ */
+const DISPLAY_CONTROL_CHAR_PATTERN = /[\x00-\x1f\x7f-\x9f]/g;
+const DISPLAY_LINE_LIMIT = 400;
+
+function escapeForDisplay(value) {
+  const text = String(value ?? "");
+  const escaped = text.replace(
+    DISPLAY_CONTROL_CHAR_PATTERN,
+    (ch) => `\\x${ch.charCodeAt(0).toString(16).padStart(2, "0")}`
+  );
+  return escaped.length > DISPLAY_LINE_LIMIT
+    ? `${escaped.slice(0, DISPLAY_LINE_LIMIT)}... [truncated, ${escaped.length} chars]`
+    : escaped;
+}
+
+/**
+ * Flattens a config's executable-key values into one display list, in the
+ * same shape whether they are still withheld (doctor, before trust) or were
+ * just unlocked (trust-config, right after granting it). `tools` and `env`
+ * reach a shell exactly like `verify` does - see EXECUTABLE_KEYS's comment in
+ * project-config.mjs - so a report that only lists `verify` gives a false
+ * all-clear for a config whose only executable keys are `tools`/`env`.
+ */
+function describeExecutableKeyCommands({ verify, tools, env } = {}) {
+  const commands = [...(verify ?? [])];
+  for (const [tool, binary] of Object.entries(tools ?? {})) {
+    commands.push(`tools.${tool} = ${binary}`);
+  }
+  for (const [name, value] of Object.entries(env ?? {})) {
+    commands.push(`env.${name} = ${value}`);
+  }
+  return commands;
+}
+
 function renderDoctorReport(report) {
   const lines = [
     "# Grok Build Doctor",
@@ -928,14 +980,18 @@ function renderDoctorReport(report) {
     // machine execute, so paraphrasing or truncating it would defeat the
     // whole trust gate.
     for (const command of check.commands ?? []) {
-      lines.push(`    ${command}`);
+      lines.push(`    ${escapeForDisplay(command)}`);
     }
     // A warn carries `ok: true`, so the fix line has to be selected on the
     // status level. Gating it on `!check.ok` (as this did before levels
     // existed) would print the problem and silently withhold the remedy,
     // which is the least useful half of the two.
     if ((status === "fail" || status === "warn") && check.fix) {
-      lines.push(`    Fix: ${check.fix}`);
+      // Most `fix` strings are static advice this codebase wrote, but the
+      // project-config warn branch's fix is `loaded.warnings.join("; ")`,
+      // which can contain an attacker-chosen JSON key straight out of an
+      // untrusted, repo-tracked file - escape it same as the commands above.
+      lines.push(`    Fix: ${escapeForDisplay(check.fix)}`);
     }
   }
 
@@ -972,6 +1028,20 @@ function buildProjectConfigCheck(workspaceRoot) {
 
   const withheld = Object.keys(loaded.untrusted);
   if (withheld.length === 0) {
+    // A dropped or unknown key (an invalid maxCostUsd, a typo'd key name)
+    // costs the user something real - a spend cap they believe is armed, or
+    // a setting they think took effect - even though nothing here is
+    // executable. Reporting `ok` unconditionally would be an affirmatively
+    // false "no executable keys" all-clear over a file this loader partially
+    // rejected.
+    if (loaded.warnings.length > 0) {
+      return {
+        name: "project config",
+        status: "warn",
+        detail: `${PROJECT_CONFIG_FILENAME} loaded with ${loaded.warnings.length} warning(s) - see verify-plan for detail`,
+        fix: loaded.warnings.join("; ")
+      };
+    }
     const suffix = loaded.trusted ? " (trusted)" : "";
     return {
       name: "project config",
@@ -981,13 +1051,7 @@ function buildProjectConfigCheck(workspaceRoot) {
     };
   }
 
-  const commands = [...(loaded.untrusted.verify ?? [])];
-  for (const [tool, binary] of Object.entries(loaded.untrusted.tools ?? {})) {
-    commands.push(`tools.${tool} = ${binary}`);
-  }
-  for (const [name, value] of Object.entries(loaded.untrusted.env ?? {})) {
-    commands.push(`env.${name} = ${value}`);
-  }
+  const commands = describeExecutableKeyCommands(loaded.untrusted);
 
   return {
     name: "project config",
@@ -1578,6 +1642,13 @@ function renderVerifyPlan(payload) {
   for (const message of payload.config.errors) {
     lines.push("", message);
   }
+  // Warnings (a dropped/invalid field, an unknown key) were previously
+  // recorded on `loadProjectConfig`'s result and never printed anywhere, so a
+  // discarded maxCostUsd or a typo'd key name looked identical to a fully
+  // honoured config.
+  for (const message of payload.config.warnings) {
+    lines.push("", escapeForDisplay(message));
+  }
   if (payload.config.withheld.length > 0) {
     lines.push(
       "",
@@ -1620,10 +1691,15 @@ function renderTrustConfigResult(payload) {
   }
 
   const lines = [`Trusted ${payload.path} (sha256 ${payload.hash.slice(0, 12)}).`];
-  if (payload.verify.length > 0) {
+  // verify/tools/env are ALL executable keys (EXECUTABLE_KEYS in
+  // project-config.mjs) - a config whose only executable keys are `tools`/
+  // `env` used to fall through this branch entirely and receive a receipt
+  // identical to trusting an inert file.
+  const commands = describeExecutableKeyCommands(payload);
+  if (commands.length > 0) {
     lines.push("", "Runs in this workspace may now execute:");
-    for (const command of payload.verify) {
-      lines.push(`  ${command}`);
+    for (const command of commands) {
+      lines.push(`  ${escapeForDisplay(command)}`);
     }
   }
   lines.push(
@@ -1670,9 +1746,12 @@ async function handleTrustConfig(argv) {
         ? `there is no ${PROJECT_CONFIG_FILENAME} in this workspace`
         : `${PROJECT_CONFIG_FILENAME} could not be read`,
     // Reported from the pre-trust view, which is the set of keys this call
-    // actually unlocked.
+    // actually unlocked. All three - verify, tools, AND env - are
+    // EXECUTABLE_KEYS; omitting any of them here would understate what this
+    // grant just unlocked.
     verify: result.loaded.untrusted.verify ?? [],
     tools: result.loaded.untrusted.tools ?? {},
+    env: result.loaded.untrusted.env ?? {},
     errors: result.loaded.errors
   };
   outputCommandResult(payload, renderTrustConfigResult(payload), options.json);

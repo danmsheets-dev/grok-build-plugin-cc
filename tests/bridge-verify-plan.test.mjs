@@ -5,7 +5,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { buildBoundedVerifyFixPrompt, main } from "../plugins/grok-build/scripts/grok-bridge.mjs";
-import { PROJECT_CONFIG_FILENAME } from "../plugins/grok-build/scripts/lib/project-config.mjs";
+import { PROJECT_CONFIG_FILENAME, hashProjectConfig } from "../plugins/grok-build/scripts/lib/project-config.mjs";
 import { makeTempDir } from "./helpers.mjs";
 
 const BRIDGE = path.resolve(
@@ -243,6 +243,111 @@ test("doctor is quiet about a project with no config file", async () => {
   const check = payload.checks.find((entry) => entry.name === "project config");
   assert.equal(check.ok, true);
   assert.match(check.detail, /no \.grok-build\.json/);
+});
+
+test("doctor's withheld report and trust-config's receipt cover tools/env, not just verify", async () => {
+  // verify, tools, AND env are all EXECUTABLE_KEYS (project-config.mjs) -
+  // env because it can steer PATH/LD_PRELOAD/NODE_OPTIONS to choose which
+  // binary a later verify command actually runs. A config whose only
+  // executable keys are tools/env used to produce a withheld-report and a
+  // trust receipt identical to an inert file's.
+  const root = makeProject({
+    [PROJECT_CONFIG_FILENAME]: JSON.stringify({
+      tools: { godot: "/opt/godot/godot" },
+      env: { MY_PAT: "shhh" }
+    })
+  });
+  const pluginDataDir = makeTempDir("grok-build-trust-env-tools-");
+
+  const doctorText = await runBridge(["doctor", "--cwd", root], { pluginDataDir });
+  assert.match(doctorText, /tools\.godot = \/opt\/godot\/godot/);
+  assert.match(doctorText, /env\.MY_PAT = shhh/);
+
+  const doctorJson = await runBridgeJson(["doctor", "--cwd", root], { pluginDataDir });
+  const check = doctorJson.checks.find((entry) => entry.name === "project config");
+  assert.equal(check.ok, false);
+  assert.deepEqual(check.commands, ["tools.godot = /opt/godot/godot", "env.MY_PAT = shhh"]);
+
+  const trustText = await runBridge(["trust-config", "--cwd", root], { pluginDataDir });
+  assert.match(trustText, /Runs in this workspace may now execute/);
+  assert.match(trustText, /tools\.godot = \/opt\/godot\/godot/);
+  assert.match(trustText, /env\.MY_PAT = shhh/);
+
+  const trustJson = await runBridgeJson(["trust-config", "--cwd", root], { pluginDataDir });
+  assert.deepEqual(trustJson.tools, { godot: "/opt/godot/godot" });
+  assert.deepEqual(trustJson.env, { MY_PAT: "shhh" });
+});
+
+test("a control character in an untrusted config is escaped for display but stays byte-identical to what is hashed and would be executed", async () => {
+  // Render time ONLY: sanitizing on load would change the bytes later handed
+  // to sh -c / cmd /c while the trust hash still covers the unmutated file,
+  // decoupling what was hashed from what runs.
+  const ESC = "\x1b";
+  const evilVerify = `echo ${ESC}[31mHACKED${ESC}[0m`;
+  const root = makeProject({
+    [PROJECT_CONFIG_FILENAME]: JSON.stringify({ verify: [evilVerify] })
+  });
+  const pluginDataDir = makeTempDir("grok-build-ansi-data-");
+
+  const doctorText = await runBridge(["doctor", "--cwd", root], { pluginDataDir });
+  assert.ok(!doctorText.includes(ESC), "the raw ESC byte must never reach the terminal");
+  assert.ok(doctorText.includes("\\x1b[31mHACKED\\x1b[0m"), "the control bytes must still be visible, escaped");
+
+  const doctorJson = await runBridgeJson(["doctor", "--cwd", root], { pluginDataDir });
+  const check = doctorJson.checks.find((entry) => entry.name === "project config");
+  assert.deepEqual(check.commands, [evilVerify], "the JSON payload must stay untouched");
+
+  const rawFile = fs.readFileSync(path.join(root, PROJECT_CONFIG_FILENAME), "utf8");
+  const expectedHash = hashProjectConfig(rawFile);
+
+  const trustText = await runBridge(["trust-config", "--cwd", root], { pluginDataDir });
+  assert.ok(!trustText.includes(ESC));
+  assert.ok(trustText.includes("\\x1b[31mHACKED\\x1b[0m"));
+
+  const trustJson = await runBridgeJson(["trust-config", "--cwd", root], { pluginDataDir });
+  assert.equal(trustJson.hash, expectedHash, "trust must be recorded against the file's exact original bytes");
+  assert.deepEqual(trustJson.verify, [evilVerify], "the value a future run hands to a shell must stay untouched");
+
+  const planJson = await runBridgeJson(["verify-plan", "--cwd", root], { pluginDataDir });
+  assert.deepEqual(planJson.commands, [evilVerify], "what actually runs must be byte-identical to the file");
+});
+
+test("dropped or unknown project-config fields are reported as warnings, not silently discarded", async () => {
+  const root = makeProject({
+    [PROJECT_CONFIG_FILENAME]: JSON.stringify({
+      verify: "npm run check", // wrong shape (must be an array) - dropped, not withheld
+      verifyAttemps: 5, // typo'd key name - unknown
+      maxCostUsd: "not-a-number" // wrong shape - dropped; a silently-discarded
+      // spend cap is a cap the user believes is armed
+    })
+  });
+  const pluginDataDir = makeTempDir("grok-build-warnings-data-");
+
+  const doctorJson = await runBridgeJson(["doctor", "--cwd", root], { pluginDataDir });
+  const check = doctorJson.checks.find((entry) => entry.name === "project config");
+  assert.notEqual(check.status, "ok", "a partially-rejected config must not report an unqualified ok");
+  assert.equal(check.ok, true, "a warning alone is advice, not a failure - it must not flip the doctor to fail");
+
+  const planText = await runBridge(["verify-plan", "--cwd", root], { pluginDataDir });
+  assert.match(planText, /unknown key "verifyAttemps"/);
+  assert.match(planText, /verify: expected an array of command strings/);
+  assert.match(planText, /maxCostUsd: expected a positive number of dollars/);
+});
+
+test("doctor's Fix line for a warning also escapes an attacker-controlled key name", async () => {
+  // buildProjectConfigCheck's warn branch puts the raw joined warnings text
+  // into `fix`, and an unknown key's name comes straight from an untrusted,
+  // repo-tracked file - it needs the same treatment as the commands list.
+  const ESC = "\x1b";
+  const root = makeProject({
+    [PROJECT_CONFIG_FILENAME]: JSON.stringify({ [`evil${ESC}[31mKey`]: true })
+  });
+  const pluginDataDir = makeTempDir("grok-build-warn-fix-ansi-");
+
+  const doctorText = await runBridge(["doctor", "--cwd", root], { pluginDataDir });
+  assert.ok(!doctorText.includes(ESC), "the raw ESC byte must never reach the terminal, even in the Fix line");
+  assert.match(doctorText, /Fix: /, "the warn branch must still print a fix line");
+  assert.ok(doctorText.includes("\\x1b[31mKey"), "the control byte must still be visible, escaped");
 });
 
 test("--verify-timeout is reported by verify-plan instead of the derived floor", async () => {

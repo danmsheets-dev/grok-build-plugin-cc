@@ -45,8 +45,10 @@ export const TRUST_STATE_KEY = "verifyTrustHash";
  * string that a shell executes. `env` is here for the same reason even though
  * it looks inert - a config that sets PATH (or LD_PRELOAD, or NODE_OPTIONS)
  * chooses which binary every subsequent verify command actually runs, which is
- * arbitrary code execution by a longer route. Nothing consumes `env` yet, so
- * gating it costs nothing today and closes the hole before it opens.
+ * arbitrary code execution by a longer route. `env` is consumed by
+ * grok-bridge.mjs, which layers `settings.env` (the trust-gated block) under
+ * `--env` before building the run's environment - see the comment on
+ * `envOverrides` there.
  */
 export const EXECUTABLE_KEYS = Object.freeze(["verify", "tools", "env"]);
 
