@@ -20,10 +20,11 @@ What isolation **does not** guarantee:
 
 - **`--no-isolate` turns it off**, and then the agent edits your tree directly, as before.
 - **Read-only runs are not isolated** and do not need to be — they cannot write.
-  As of 0.5.0 they use `--always-approve` plus `--deny Edit(**)` / `Write(**)` /
-  `NotebookEdit(**)` (deny beats YOLO). They do **not** use `--permission-mode plan` or
-  `--sandbox read-only`: those returned empty tool bodies (and Windows Grep false zeros)
-  while Hyper's sandbox is unix-only anyway.
+  As of 0.5.0 they keep `--permission-mode plan` and `--sandbox read-only` **and** add
+  `--deny Edit(**)` / `Write(**)` / `NotebookEdit(**)`. The sandbox is kernel-enforced
+  only on unix (Hyper compiles it out on Windows), so the deny rules are the half that
+  holds everywhere — measured, they are evaluated before `--always-approve` and they
+  also refuse a shell command that writes to a denied path.
 - **A worktree is not a sandbox.** The agent still runs with your permissions and can
   reach anything on the machine outside the repository. Isolation protects your *working
   tree*, not your filesystem.
@@ -307,7 +308,7 @@ A run also reports what it did to the disk and how it was captured:
 ## Changelog (0.5.0)
 
 - Honest terminal statuses: `completed-truncated`, `completed-noop`, `completed-blind`, plus existing `completed-unverified` / `timed-out`.
-- Read-only runs use YOLO + deny Edit/Write/NotebookEdit (no plan/sandbox).
+- Read-only runs add `--deny Edit/Write/NotebookEdit` on top of plan + read-only sandbox, so writes are refused on Windows too.
 - Usage, served model, stopReason, and tool/file counts mirrored into the run index; `runs --json` is schemaVersion 2.
 - `show` always appends `===BRIDGE-RESULT===`; run header prints CLI, model, isolation, verify plan.
 - New `models [--json]` subcommand; pay-per-token models need `GROK_BUILD_ALLOW_PAY_PER_TOKEN=1`.

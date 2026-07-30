@@ -162,23 +162,24 @@ test("buildHeadlessArgs emits repeated --deny and --allow rules", () => {
   assert.equal(args[args.indexOf("--allow") + 1], "Read(**)");
 });
 
-test("read-only permission options are YOLO + deny, never plan/sandbox", () => {
+test("read-only permission options keep plan/sandbox and add the deny rules", () => {
   const readOnly = buildHeadlessPermissionOptions(false);
-  assert.equal(readOnly.alwaysApprove, true);
+  // plan + read-only carry the intent and are kernel-enforced on unix; the deny
+  // rules are the half that is enforced on Windows too, where the sandbox crate
+  // is compiled out. Never approve tools on a read-only run.
+  assert.equal(readOnly.permissionMode, "plan");
+  assert.equal(readOnly.sandbox, "read-only");
+  assert.equal(readOnly.alwaysApprove, undefined);
   assert.deepEqual(readOnly.denyRules, [...READ_ONLY_DENY_RULES]);
-  assert.equal(readOnly.permissionMode, undefined);
-  assert.equal(readOnly.sandbox, undefined);
 
   const write = buildHeadlessPermissionOptions(true);
   assert.equal(write.alwaysApprove, true);
   assert.equal(write.denyRules, undefined);
 
   const args = buildHeadlessArgs("probe", { ...readOnly, platform: "linux" });
-  assert.ok(args.includes("--always-approve"));
-  assert.ok(!args.includes("--permission-mode"));
-  assert.ok(!args.includes("--sandbox"));
-  assert.ok(!args.includes("plan"));
-  assert.ok(!args.includes("read-only"));
+  assert.ok(!args.includes("--always-approve"));
+  assert.equal(args[args.indexOf("--permission-mode") + 1], "plan");
+  assert.equal(args[args.indexOf("--sandbox") + 1], "read-only");
   for (const rule of READ_ONLY_DENY_RULES) {
     assert.ok(args.includes(rule), `missing deny rule ${rule}`);
   }

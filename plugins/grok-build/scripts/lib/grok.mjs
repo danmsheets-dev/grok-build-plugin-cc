@@ -543,11 +543,16 @@ function writePromptFile(directory, prompt) {
 }
 
 /**
- * Deny rules for a read-only headless run.
+ * Deny rules applied to a read-only headless run.
  *
- * Hyper evaluates --deny before --always-approve, so YOLO + these denies is the
- * only combination that both (a) lets Grep/Read/Glob actually return bodies and
- * (b) still blocks writes. See buildReadOnlyHeadlessPermissions.
+ * These are belt and braces over `--permission-mode plan`, not a replacement for
+ * it. Measured on Hyper 0.2.114-r5: a deny rule is evaluated BEFORE
+ * `--always-approve`, and it covers the shell as well as the edit tools - a
+ * `run_terminal_command` that redirects into a denied path is refused with
+ * `Denied by permission policy: deny rule on edit matching "<glob>"`. That makes
+ * deny the only write-blocking mechanism that actually holds on Windows, where
+ * the OS sandbox is compiled out entirely
+ * (`xai-grok-sandbox`: `#[cfg(all(feature = "enforce", unix))]`).
  */
 export const READ_ONLY_DENY_RULES = Object.freeze([
   "Edit(**)",
@@ -558,29 +563,32 @@ export const READ_ONLY_DENY_RULES = Object.freeze([
 /**
  * Permission flags for a headless run.
  *
- * Read-only used to pass `--permission-mode plan` and `--sandbox read-only`.
- * Measured on Hyper:
- * 1. A tool call that is not pre-approved returns an EMPTY result body with no
- *    error (plan / auto / explicit --allow all do this). The model then reports
- *    "no matches" for a string that is present - every read-only run was blind.
- * 2. `--sandbox read-only` additionally breaks Grep on Windows even with
- *    `--always-approve`. Hyper's sandbox enforcement is unix-only
- *    (`#[cfg(all(feature = "enforce", unix))]`), so on Windows it confines
- *    nothing and still costs correctness.
- * 3. `--deny` rules beat `--always-approve`, so YOLO + deny Edit/Write/NotebookEdit
- *    is both readable and non-writing.
+ * Read-only keeps `--permission-mode plan` (portable intent) and
+ * `--sandbox read-only` (kernel-enforced on unix, inert on Windows) and ADDS the
+ * deny rules above, which are the half that is enforced everywhere.
  *
- * Do not "fix" this back to plan + read-only sandbox without re-measuring.
+ * Measured, so that the next reader does not have to re-derive it:
+ * - Read/Glob/Bash all work fine under bare `--permission-mode plan` and under
+ *   `--sandbox read-only` with no `--always-approve`. An unapproved headless
+ *   tool call is NOT silently swallowed, which an earlier revision of this
+ *   comment claimed.
+ * - Hyper's `grep` tool, however, returns an EMPTY body for a pattern that is
+ *   present, on Windows, under every permission combination including
+ *   `--always-approve`. The tool result comes back ~2ms after dispatch, i.e.
+ *   before ripgrep could have run, while the same bundled ripgrep finds the
+ *   match when invoked directly. That is a Hyper defect, not a permission
+ *   problem, and no flag here can work around it - do not try.
  *
  * @param {boolean} write
- * @returns {{ alwaysApprove: boolean, denyRules?: string[], allowRules?: string[], permissionMode?: string, sandbox?: string }}
+ * @returns {{ alwaysApprove?: boolean, denyRules?: string[], allowRules?: string[], permissionMode?: string, sandbox?: string }}
  */
 export function buildHeadlessPermissionOptions(write) {
   if (write) {
     return { alwaysApprove: true };
   }
   return {
-    alwaysApprove: true,
+    permissionMode: "plan",
+    sandbox: "read-only",
     denyRules: [...READ_ONLY_DENY_RULES]
   };
 }
@@ -621,9 +629,9 @@ export function buildHeadlessArgs(prompt, options = {}) {
   if (options.alwaysApprove) {
     trailing.push("--always-approve");
   }
-  // Repeated --deny / --allow. Order does not matter for Hyper (deny wins over
-  // YOLO regardless), but each rule is its own argv pair and must be counted
-  // in the budget like every other flag.
+  // Repeated --deny / --allow. Order does not matter for Hyper - a deny is
+  // evaluated before --always-approve either way - but each rule is its own
+  // argv pair and must be counted in the budget like every other flag.
   for (const rule of normalizeRuleList(options.denyRules)) {
     trailing.push("--deny", rule);
   }

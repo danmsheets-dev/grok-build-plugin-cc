@@ -2243,8 +2243,9 @@ async function executeReviewRun(request) {
     });
   }
 
-  // Review/critique are always read-only. Same YOLO+deny shape as delegate
-  // read-only runs — plan+sandbox made Grep return empty bodies (see
+  // Review/critique are always read-only, and take the same permission shape as
+  // a read-only delegate run: plan + read-only sandbox for intent and unix
+  // enforcement, plus deny rules that also hold on Windows (see
   // buildHeadlessPermissionOptions).
   const result = await runHeadlessAgent(context.repoRoot, {
     prompt,
@@ -2739,8 +2740,9 @@ async function executeTaskRun(request) {
     request.onProgress?.({ message: `Budgets: ${budgetBits.join(", ")}`, phase: "starting" });
   }
 
-  // Permission shape: write runs YOLO; read-only runs YOLO + deny Edit/Write/
-  // NotebookEdit and never pass plan/sandbox (see buildHeadlessPermissionOptions).
+  // Permission shape: write runs approve every tool; read-only runs get plan +
+  // read-only sandbox AND deny rules on Edit/Write/NotebookEdit, because the
+  // sandbox is inert on Windows (see buildHeadlessPermissionOptions).
   const permissionOptions = buildHeadlessPermissionOptions(write);
 
   const firstAgent = await runHeadlessAgentWithDurationBudget(
@@ -2986,9 +2988,8 @@ async function executeTaskRun(request) {
           resumeSessionId: result.threadId,
           model: request.model,
           effort: request.effort,
-          // Mirror the ORIGINAL run's write policy exactly. Read-only stays
-          // YOLO+deny (not plan/sandbox); write stays YOLO. Escalating a
-          // read-only verify fix to full write used to edit the real tree.
+          // Mirror the ORIGINAL run's write policy exactly. Escalating a
+          // read-only verify fix to a write run used to edit the real tree.
           ...buildHeadlessPermissionOptions(write),
           maxTurns,
           cwd: runCwd,
