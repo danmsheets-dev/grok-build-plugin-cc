@@ -154,6 +154,24 @@ function firstLine(text) {
     .find(Boolean);
 }
 
+/**
+ * A completed assistant message can be arbitrarily long - a single turn of a
+ * long agentic run routinely runs to several KB of narration. That full body
+ * used to travel as the progress `message` itself, which a foreground run
+ * writes to stderr as the run streams (see createProgressReporter in
+ * tracked-jobs.mjs) - and the SAME text then reappears verbatim as the run's
+ * own stdout result a moment later. One foreground terminal, the whole
+ * transcript printed twice. Only this short preview goes out as `message` now;
+ * the full body still reaches the durable log file, in full, exactly once,
+ * via the `logTitle`/`logBody` progress fields consumeLine sets alongside it.
+ */
+function shortenForProgress(text, limit = 200) {
+  const first = String(text ?? "")
+    .split(/\r?\n/)
+    .find(Boolean) ?? "";
+  return first.length <= limit ? first : `${first.slice(0, limit - 3)}...`;
+}
+
 function emitProgress(onProgress, message, phase = null, extra = {}) {
   if (!onProgress || !message) {
     return;
@@ -468,10 +486,17 @@ export function runHeadlessAgent(cwd, options = {}) {
       }
       const outcome = transcript.accept(event);
       if (outcome.messageCompleted) {
-        emitProgress(options.onProgress, outcome.messageCompleted, outcome.phase ?? lastPhase, {
-          threadId: sessionId,
-          agentPid
-        });
+        emitProgress(
+          options.onProgress,
+          shortenForProgress(outcome.messageCompleted),
+          outcome.phase ?? lastPhase,
+          {
+            threadId: sessionId,
+            agentPid,
+            logTitle: "Assistant message",
+            logBody: outcome.messageCompleted
+          }
+        );
       }
       if (outcome.phase && outcome.phase !== lastPhase) {
         lastPhase = outcome.phase;

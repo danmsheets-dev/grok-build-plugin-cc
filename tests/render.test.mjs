@@ -141,6 +141,25 @@ test("run status shows last activity for an active run", () => {
   assert.match(output, /Last activity: 8s ago/);
 });
 
+test("runs --wait says so when the wait itself timed out", () => {
+  // Regression: waitTimedOut was computed but never reached the renderer -
+  // `grep waitTimedOut` matched exactly one line in the whole bridge script.
+  // A run that outlived `runs --wait` reported no differently from one merely
+  // polled once.
+  const job = { id: "run-2", status: "running", kindLabel: "delegate", title: "Grok Build Delegate" };
+
+  const timedOut = renderJobStatusReport(job, { waitTimedOut: true, timeoutMs: 240000 });
+  assert.match(timedOut, /wait timed out/i);
+  assert.match(timedOut, /--timeout-ms/);
+  assert.match(timedOut, /running/);
+
+  const notTimedOut = renderJobStatusReport(job, { waitTimedOut: false, timeoutMs: 240000 });
+  assert.doesNotMatch(notTimedOut, /wait timed out/i);
+
+  const noOptions = renderJobStatusReport(job);
+  assert.doesNotMatch(noOptions, /wait timed out/i);
+});
+
 test("an abandoned run is displayed as abandoned, not running", () => {
   // Regression: enrichJob computed liveness but the renderer read job.status, so
   // a dead run still displayed as running — the exact failure this was built to fix.

@@ -47,6 +47,11 @@ Command selection:
 - `--effort`: accepted values are `low`, `medium`, `high`.
 - `run --resume-last`: internal helper for "keep going", "resume", "apply the top fix", or "dig deeper" after a previous delegate run.
 
+Passthrough flags (forward verbatim, never fold into the task text):
+- `--verify` (repeatable — forward every occurrence), `--verify-attempts`, `--verify-ignore` (repeatable), `--verify-timeout`, `--baseline-timeout`, `--verify-max-buffer`, `--no-verify`, `--no-verify-baseline`, `--env` (repeatable), `--blender-sandbox`, `--no-isolate`, `--max-duration`, `--max-turns`, `--max-cost`.
+- Strip each one out of the preserved task text before writing it to the prompt file, exactly like `--model`/`--effort`/`--resume`/`--fresh` are already stripped.
+- `--prompt-file` is not on this list — it is the delivery mechanism for the task text itself, not a flag a user types into a delegate request.
+
 Verification (the bridge handles it; do not construct it yourself):
 - The bridge resolves the verify plan server-side and runs the commands itself. Do not add `--verify`, do not call `verify-plan`, and do not make a second Bash call to work out what should be verified.
 - Game engines are the one place where a passing exit code is not evidence. `godot --headless --import` prints `SCRIPT ERROR:` for a GDScript that does not parse and exits **0**; `blender -b --python x.py` exits **0** when the script raises. The bridge scans output for those markers, so a run reported `completed-unverified` on an exit-0 command is correct, not a bridge bug — return it unchanged.

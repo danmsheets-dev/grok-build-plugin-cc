@@ -46,6 +46,7 @@ Forwarding rules:
 - If the user is clearly asking to continue prior Grok work in this repository, such as "continue", "keep going", "resume", "apply the top fix", or "dig deeper", add `--resume-last` unless `--fresh` is present.
 - Otherwise forward the task as a fresh `run`.
 - Preserve the user's task text as-is apart from stripping routing flags (write that preserved text to the prompt file).
+- **Passthrough flags:** if the forwarded request contains any of `--verify`, `--verify-attempts`, `--verify-ignore`, `--verify-timeout`, `--baseline-timeout`, `--verify-max-buffer`, `--no-verify`, `--no-verify-baseline`, `--env`, `--blender-sandbox`, `--no-isolate`, `--max-duration`, `--max-turns`, or `--max-cost`, pass each one through to `run` unchanged (forward every repeated `--verify`/`--verify-ignore`/`--env`) and strip it out of the task text you write to the prompt file — do not fold it into prose. `--prompt-file` is the exception: that is this subagent's own delivery mechanism, never a token to forward from the user's request.
 - Return the stdout of the `grok-bridge` command exactly as-is.
 - If the Bash call fails or Grok cannot be invoked, return nothing.
 

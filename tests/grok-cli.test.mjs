@@ -5,7 +5,7 @@ import assert from "node:assert/strict";
 
 import { resolveExecutable } from "../plugins/grok-build/scripts/lib/which.mjs";
 
-import { buildEnv, installFakeGrok } from "./fake-grok-fixture.mjs";
+import { FAKE_GROK_LONG_TURN_TEXT, buildEnv, installFakeGrok } from "./fake-grok-fixture.mjs";
 import { makeTempDir, run } from "./helpers.mjs";
 import {
   PROMPT_ARGV_BUDGET_POSIX,
@@ -130,6 +130,46 @@ test("runHeadlessAgent reports agentPid from the spawned child", async () => {
   assert.equal(typeof result.agentPid, "number");
   assert.ok(result.agentPid > 0);
   assert.ok(progressEvents.some((event) => event?.agentPid === result.agentPid));
+});
+
+test("a long assistant message is shortened in progress but kept whole in the log", async () => {
+  // Regression: the full body of a completed message went out as the progress
+  // `message` itself, which a foreground run prints to stderr as it streams -
+  // and the same text then reappeared verbatim as the run's own stdout result
+  // a moment later. One terminal, the whole transcript printed twice.
+  const binDir = makeTempDir();
+  installFakeGrok(binDir, "long-turn");
+  const env = buildEnv(binDir);
+  const cwd = makeTempDir();
+  const events = [];
+
+  const result = await runHeadlessAgent(cwd, {
+    prompt: "do the long task",
+    env,
+    onProgress: (event) => events.push(event)
+  });
+
+  assert.equal(result.status, 0);
+  // The transcript/log channel is unaffected: the full body still comes back
+  // as the run's answer.
+  assert.equal(result.finalMessage, FAKE_GROK_LONG_TURN_TEXT);
+
+  for (const event of events) {
+    const message = typeof event === "string" ? event : event?.message;
+    if (message) {
+      assert.ok(
+        message.length <= 200,
+        `progress message exceeded the 200-char preview budget: ${message.length} chars`
+      );
+    }
+  }
+
+  const logged = events.find(
+    (event) => event && typeof event === "object" && event.logTitle === "Assistant message"
+  );
+  assert.ok(logged, "expected one progress event carrying the full body as a log block");
+  assert.equal(logged.logBody, FAKE_GROK_LONG_TURN_TEXT);
+  assert.ok(logged.message.length < FAKE_GROK_LONG_TURN_TEXT.length, "the preview must be shorter than the full body");
 });
 
 test("buildReviewPrompt includes target and focus", () => {

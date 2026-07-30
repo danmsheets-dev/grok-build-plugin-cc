@@ -754,7 +754,7 @@ export function renderStatusReport(report) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-export function renderJobStatusReport(job) {
+export function renderJobStatusReport(job, options = {}) {
   const lines = ["# Grok Build Run Status", ""];
   pushJobDetails(lines, job, {
     showElapsed: job.status === "queued" || job.status === "running",
@@ -764,6 +764,16 @@ export function renderJobStatusReport(job) {
     showResultHint: true,
     showReviewHint: true
   });
+  // `runs --wait` gave up on a run that is still queued/running - not the same
+  // thing as the run itself timing out, and worth saying explicitly: without
+  // this the report reads identically to a run that was merely polled once.
+  if (options.waitTimedOut) {
+    const seconds = Math.max(0, Math.round(Number(options.timeoutMs ?? 0) / 1000));
+    lines.push(
+      "",
+      `Wait timed out after ${seconds}s — the run is still \`${job.status}\`. Re-run with --timeout-ms <ms> to wait longer.`
+    );
+  }
   return `${lines.join("\n").trimEnd()}\n`;
 }
 

@@ -24,12 +24,14 @@ What isolation **does not** guarantee:
   reach anything on the machine outside the repository. Isolation protects your *working
   tree*, not your filesystem. `grok --sandbox` owns that, not this plugin.
 - **Heavyweight directories are linked, not copied.** `node_modules`, `.venv`, `venv`,
-  `target` and `vendor` are junctioned (Windows) or symlinked (POSIX) from your repo so
-  the verify command can run. **Writes through those links reach your real directories.**
-  Godot's import cache (`.godot`, `.import`) is linked too, so the run header says so:
-  **close the Godot editor before a run verifies**, or the editor and the headless run
-  are writing the same cache. To opt out, set `GROK_BUILD_LINK_GODOT_CACHE=0` or put
-  `{"provision": {"copy": true}}` in `.grok-build.json` — the worktree then gets a
+  `target`, `vendor`, `.tox`, `__pypackages__`, `.next`, `.nuxt`, `.svelte-kit`,
+  `.turbo`, `.parcel-cache`, and Godot's import cache (`.godot`, `.import`) are
+  junctioned (Windows) or symlinked (POSIX) from your repo so the verify command can
+  run without redoing work the checkout deliberately reuses. **Writes through those
+  links reach your real directories.** For Godot's cache specifically, the run header
+  says so: **close the Godot editor before a run verifies**, or the editor and the
+  headless run are writing the same cache. To opt out, set `GROK_BUILD_LINK_GODOT_CACHE=0`
+  or put `{"provision": {"copy": true}}` in `.grok-build.json` — the worktree then gets a
   private cold cache seeded with only the small state files, and the first verify
   re-imports. `.godot/imported` is never copied; it is the multi-gigabyte part.
 - **A worktree holds the only copy of unlanded work.** `/grok-build:prune` removes
@@ -77,6 +79,25 @@ commands and the agent.
   `addon_utils.enable("<module>", default_set=False, persistent=True)`.
 - `.grok-build/` is excluded from the run's commit, so the linked copy of the add-on
   can never be committed twice.
+
+### `--env` and secrets
+
+`--env KEY=VALUE` (repeatable) sets a variable for the verify commands **and** the agent —
+the only lever Blender gives you for "use this add-on directory", and often the quickest way
+to hand a build script a license key or a private registry token. Know where that value
+goes before you use it that way:
+
+- A **foreground** run only ever holds the value in that process's own environment.
+- A **`--background`** run is different: the whole resolved request — including every
+  `--env` value, in plaintext — is written to `<stateDir>/jobs/<run-id>.json` so the
+  detached worker can read it back and start the process with it. That file is not
+  encrypted. The redaction that hides a sensitive-looking key (one ending in `token`,
+  `secret`, `key`, `password`, `passwd`, `credential`, or `pat`) applies only to what a run
+  *displays* — the run header and `--json` output — not to the queued request a background
+  job actually needs to execute.
+- Do not pass a long-lived credential through `--env` on a `--background` run unless you
+  trust the plugin's state directory (and anything that backs it up) as much as you trust
+  your shell's own environment.
 
 ## Verification
 
@@ -143,6 +164,39 @@ blender --background --factory-startup --python-exit-code 1 --python tests/run_t
 import addon_utils
 addon_utils.enable("my_addon", default_set=False, persistent=True)
 ```
+
+### Ecosystem recipes
+
+These are the exact commands the bridge runs by default once it detects your project's
+ecosystem — useful if you want to type your own `--verify` instead, or just to know what a
+bare `/grok-build:delegate` in a Godot or Blender repo actually verifies.
+
+| Ecosystem | Default verify commands |
+| --- | --- |
+| Godot 4 | `godot --headless --path . --import` then `godot --headless --path . --quit-after 1` |
+| Godot 3 | `godot --no-window --path . --editor --quit` — Godot 3 predates both `--headless` and `--quit-after` |
+| Blender, with a `blender_manifest.toml` | `blender --command extension validate <manifest>` (4.2+ only, which is exactly where the subcommand exists) |
+| Blender, with a test script | `blender --background --factory-startup --python-exit-code 1 --python <script>` |
+| Blender, neither of the above | a background smoke start, enough to catch a broken install or a GUI-only build that cannot start headless |
+
+A detected GUT suite adds `godot --headless --path . -s addons/gut/gut_cmdln.gd -gexit`; a
+detected gdUnit4 suite adds the equivalent `GdUnitCmdTool.gd` invocation. None of this
+requires you to write anything: the ecosystem is detected from `project.godot`,
+`blender_manifest.toml`, an `__init__.py` carrying `bl_info`, or a root/depth-1 `*.blend`,
+and your own `--verify` or a trusted `.grok-build.json`'s `verify` always wins over these
+defaults (see below).
+
+### Windows: use the console build
+
+A GUI-subsystem Godot or Blender build writes nothing to a captured pipe on Windows, which
+silently defeats every output-pattern check above — a `SCRIPT ERROR:` on screen and an exit-0
+result look, to the bridge, identical to a clean run. `/grok-build:doctor` catches this
+**empirically** (it runs the binary and checks whether anything came back on stdout or
+stderr at all) rather than by filename, and the fix is the same either way: use the console
+build that ships in the same archive — `Godot_v4.x-stable_win64_console.exe` — and point
+`tools.godot` in `.grok-build.json`, or `GROK_BUILD_GODOT_BIN`, at it. The bridge also
+prefers a `*_console.exe` next to whatever binary it resolves, automatically, whenever one
+exists on disk.
 
 ### Where the verify plan comes from
 
@@ -303,5 +357,10 @@ Terminal status is claimed under a lock, and `cancelled` always wins: a run you 
 | `GROK_CC_TRANSCRIPT_PATH` | Claude transcript path, set by the SessionStart hook |
 | `CLAUDE_PLUGIN_DATA` | Plugin data root; run state lives under `.../state` |
 | `HOME` / `GROK_HOME` | Required by `grok` subcommands |
+| `GROK_BUILD_GODOT_BIN` / `GODOT_BIN` | Override the resolved `godot` executable. `tools.godot` in `.grok-build.json` outranks both (once trusted) |
+| `GROK_BUILD_BLENDER_BIN` / `BLENDER_BIN` | Override the resolved `blender` executable, same precedence as above |
+| `GROK_BUILD_LINK_GODOT_CACHE=0` | Copy Godot's small cache state files into the worktree instead of linking `.godot`/`.import` — see "What isolation does and does not guarantee" |
+| `GROK_BUILD_MIN_FREE_BYTES` | Moves the 512 MB free-space floor a checkout refuses to start under; `0` disables the check |
+| `GROK_VERIFY_MAX_OUTPUT_BYTES` | Overrides the default 32 MB verify-output ring (see `--verify-max-buffer`, which is the per-run form of this) |
 
 State falls back to `$TMPDIR/grok-cc-runs` when `CLAUDE_PLUGIN_DATA` is unset.

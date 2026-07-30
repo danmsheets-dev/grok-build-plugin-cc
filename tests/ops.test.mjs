@@ -18,7 +18,9 @@ import { createWorktree } from "../plugins/grok-build/scripts/lib/worktree.mjs";
 import {
   buildEcosystemChecks,
   normalizeDoctorCheck,
-  renderDoctorReport
+  renderDoctorReport,
+  RUN_PASSTHROUGH_FLAGS,
+  TASK_VALUE_OPTIONS
 } from "../plugins/grok-build/scripts/grok-bridge.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -30,6 +32,33 @@ function pluginDataEnv(pluginDataDir, binDir, extra = {}) {
     CLAUDE_PLUGIN_DATA: pluginDataDir,
     ...extra
   });
+}
+
+test("help exits 0 and names every run flag added this release", () => {
+  // Regression: printUsage's run line stopped at --resume-last/--model/--effort
+  // and never grew past it as --verify, --env, --blender-sandbox and the rest
+  // of TASK_VALUE_OPTIONS were added - so `node grok-bridge.mjs help`, the
+  // bridge's own advertised interface, silently omitted most of what `run`
+  // actually accepts.
+  const result = run("node", [SCRIPT, "help"], { env: buildEnv(makeTempDir()) });
+  assert.equal(result.status, 0, result.stderr);
+
+  for (const flag of RUN_PASSTHROUGH_FLAGS) {
+    assert.match(result.stdout, new RegExp(escapeRegExp(flag)), `help output is missing ${flag}`);
+  }
+  // The value-taking options not covered by RUN_PASSTHROUGH_FLAGS (it excludes
+  // --model/--effort/--cwd/--prompt-file deliberately - see the constant's own
+  // doc comment) still have to appear somewhere in the usage line.
+  for (const option of TASK_VALUE_OPTIONS) {
+    assert.match(result.stdout, new RegExp(`--${escapeRegExp(option)}\\b`), `help output is missing --${option}`);
+  }
+  assert.match(result.stdout, /-C <dir>/, "the -C alias must be documented");
+  assert.match(result.stdout, /completed-unverified/, "help must say what an unverified run reports as");
+  assert.match(result.stdout, /verify-plan/);
+});
+
+function escapeRegExp(text) {
+  return String(text).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function withPluginData(pluginDataDir, fn) {

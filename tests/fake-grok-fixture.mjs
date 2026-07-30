@@ -4,6 +4,12 @@ import process from "node:process";
 
 import { writeExecutable } from "./helpers.mjs";
 
+// The exact body the `long-turn` scenario emits as its one completed message.
+// Shared as a constant, rather than re-typed in every test that uses the
+// scenario, so a test asserting on the full logged body cannot drift from
+// what the fake binary actually sent.
+export const FAKE_GROK_LONG_TURN_TEXT = "A".repeat(400);
+
 /**
  * Install a fake `grok` binary that responds to version/models/-p/import for hermetic tests.
  *
@@ -18,9 +24,13 @@ import { writeExecutable } from "./helpers.mjs";
  * - `writes-files` creates whatever FAKE_GROK_WRITE_FILES names (a JSON object
  *   of repo-relative path -> contents), so a write run has real changes to
  *   report.
+ * - `long-turn` emits a single completed message far longer than any progress
+ *   preview should be (400 chars, no newlines), so a test can assert the
+ *   preview is shortened while the full body still reaches the log via
+ *   `logBody`.
  *
  * @param {string} binDir directory that will be prepended to PATH
- * @param {"default"|"not-logged-in"|"fail-print"|"import-ok"|"reporting"|"silent-fix"|"streaming-alien"|"writes-files"} scenario
+ * @param {"default"|"not-logged-in"|"fail-print"|"import-ok"|"reporting"|"silent-fix"|"streaming-alien"|"writes-files"|"long-turn"} scenario
  */
 export function installFakeGrok(binDir, scenario = "default") {
   fs.mkdirSync(binDir, { recursive: true });
@@ -153,6 +163,16 @@ if (isPrint || hasFlag("-r") || hasFlag("--resume") || hasFlag("-c") || hasFlag(
     // and common: the fix prompt asks for an edit and a re-run, not an essay.
     if (scenario === "silent-fix" && /The verify command .* failed/.test(prompt)) {
       emit({ type: "thought", data: "re-running the failing command" });
+      emit(endEvent);
+      process.exit(0);
+    }
+
+    // One completed message, deliberately much longer than any progress
+    // preview should ever be and with no newlines to shorten at. Real shape:
+    // a turn of narration that runs to several KB.
+    if (scenario === "long-turn") {
+      emit({ type: "thought", data: "working" });
+      emit({ type: "text", data: ${JSON.stringify(FAKE_GROK_LONG_TURN_TEXT)} });
       emit(endEvent);
       process.exit(0);
     }

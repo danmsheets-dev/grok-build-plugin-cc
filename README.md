@@ -157,8 +157,6 @@ npm test
 
 Tests use Node's built-in test runner and a fake `grok` binary on `PATH`. Runtime code uses Node stdlib only.
 
-Version: `0.2.0`.
-
 ## License
 
 Apache-2.0. See `LICENSE` and `NOTICE`.

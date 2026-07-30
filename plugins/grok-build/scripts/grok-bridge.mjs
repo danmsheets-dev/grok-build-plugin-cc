@@ -155,14 +155,23 @@ function printUsage() {
       "Usage:",
       "  node scripts/grok-bridge.mjs check [--json]",
       "  node scripts/grok-bridge.mjs doctor [--json]",
-      "  node scripts/grok-bridge.mjs verify-plan [--verify <command>] [--no-verify] [--json]",
-      "  node scripts/grok-bridge.mjs trust-config [--revoke] [--json]",
+      "  node scripts/grok-bridge.mjs verify-plan [--verify <command>]... [--no-verify] [--cwd|-C <dir>] [--json]",
+      "  node scripts/grok-bridge.mjs trust-config [--revoke] [--cwd|-C <dir>] [--json]",
       "  node scripts/grok-bridge.mjs prune [--apply] [--include-unlanded] [--json]",
       "  node scripts/grok-bridge.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <low|medium|high>]",
       "  node scripts/grok-bridge.mjs critique [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <low|medium|high>] [focus text]",
-      "  node scripts/grok-bridge.mjs run [--background] [--write] [--resume-last|--resume|--fresh] [--model <model>] [--effort <low|medium|high>] [prompt]",
+      "  node scripts/grok-bridge.mjs run [--background] [--write] [--isolate|--no-isolate] [--resume-last|--resume|--fresh]",
+      "      [--model <model>] [--effort <low|medium|high>]",
+      "      [--verify <command>]... [--verify-attempts <n>] [--verify-timeout <seconds>] [--baseline-timeout <seconds>]",
+      "      [--verify-max-buffer <megabytes>] [--verify-ignore <regex>]... [--no-verify] [--no-verify-baseline]",
+      "      [--env KEY=VALUE]... [--blender-sandbox]",
+      "      [--max-duration <seconds>] [--max-turns <n>] [--max-cost <usd>]",
+      "      [--prompt-file <path>] [--cwd|-C <dir>] [--json] [prompt]",
+      "    Verify commands run in THE BRIDGE, never the agent, so a run cannot claim success without",
+      "    having passed. A run whose verification never passes is reported completed-unverified, never",
+      "    as success. See `verify-plan` to preview the resolved plan without running it.",
       "  node scripts/grok-bridge.mjs import [--source <claude-jsonl>] [--json]",
-      "  node scripts/grok-bridge.mjs runs [run-id] [--all] [--json]",
+      "  node scripts/grok-bridge.mjs runs [run-id] [--all] [--wait] [--timeout-ms <ms>] [--json]",
       "  node scripts/grok-bridge.mjs show [run-id] [--json]",
       "  node scripts/grok-bridge.mjs stop [run-id] [--json]",
       "  node scripts/grok-bridge.mjs land [run-id] [--preview|--discard] [--json]"
@@ -3217,6 +3226,44 @@ export const TASK_VALUE_OPTIONS = Object.freeze([
   "max-cost"
 ]);
 
+/**
+ * Bridge flags a user may type directly into `/grok-build:delegate` that MUST
+ * reach the forwarded `run` invocation unchanged - never folded into the
+ * natural-language task text as prose, the same way `--model`/`--effort` are
+ * already stripped out before the remainder becomes the prompt. This is the
+ * single source of truth for that contract: `tests/commands.test.mjs` walks
+ * every entry here against all three delegate surfaces
+ * (`commands/delegate.md`, `agents/grok-delegate.md`,
+ * `skills/grok-delegate-runtime/SKILL.md`) and fails if one goes undocumented,
+ * so a flag added to `TASK_VALUE_OPTIONS`/`handleTask`'s `booleanOptions` and
+ * forgotten here is caught before it ships as a flag the delegate path
+ * silently swallows.
+ *
+ * Deliberately excluded:
+ * - `--model` / `--effort` / `--cwd` - already documented and handled as
+ *   runtime-selection flags in the delegate surfaces, not part of this list.
+ * - `--prompt-file` - the SUBAGENT's own prompt-delivery mechanism
+ *   (agents/grok-delegate.md), never a flag a user types.
+ * - `--isolate` - a no-op on the delegate path, which always forces `--write`;
+ *   only `--no-isolate` is meaningful there.
+ */
+export const RUN_PASSTHROUGH_FLAGS = Object.freeze([
+  "--verify",
+  "--verify-attempts",
+  "--verify-ignore",
+  "--verify-timeout",
+  "--baseline-timeout",
+  "--verify-max-buffer",
+  "--no-verify",
+  "--no-verify-baseline",
+  "--env",
+  "--blender-sandbox",
+  "--no-isolate",
+  "--max-duration",
+  "--max-turns",
+  "--max-cost"
+]);
+
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: [...TASK_VALUE_OPTIONS],
@@ -3818,7 +3865,20 @@ async function handleStatus(argv) {
           pollIntervalMs: options["poll-interval-ms"]
         })
       : buildSingleJobSnapshot(cwd, reference);
-    outputCommandResult(snapshot, renderJobStatusReport(snapshot.job), options.json);
+    // waitForSingleJobSnapshot already computes waitTimedOut/timeoutMs (grep
+    // finds exactly one other reference to waitTimedOut in this file, the
+    // assignment) - only buildSingleJobSnapshot's plain path never wanted
+    // them. Passing snapshot.job alone here dropped both silently, so
+    // `runs --wait` on a run that outlived the wait reported nothing
+    // different from a run still merely queued.
+    outputCommandResult(
+      snapshot,
+      renderJobStatusReport(snapshot.job, {
+        waitTimedOut: snapshot.waitTimedOut,
+        timeoutMs: snapshot.timeoutMs
+      }),
+      options.json
+    );
     return;
   }
 
