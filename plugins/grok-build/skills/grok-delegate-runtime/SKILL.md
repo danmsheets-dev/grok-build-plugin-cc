@@ -47,6 +47,13 @@ Command selection:
 - `--effort`: accepted values are `low`, `medium`, `high`.
 - `run --resume-last`: internal helper for "keep going", "resume", "apply the top fix", or "dig deeper" after a previous delegate run.
 
+Verification (the bridge handles it; do not construct it yourself):
+- The bridge resolves the verify plan server-side and runs the commands itself. Do not add `--verify`, do not call `verify-plan`, and do not make a second Bash call to work out what should be verified.
+- Game engines are the one place where a passing exit code is not evidence. `godot --headless --import` prints `SCRIPT ERROR:` for a GDScript that does not parse and exits **0**; `blender -b --python x.py` exits **0** when the script raises. The bridge scans output for those markers, so a run reported `completed-unverified` on an exit-0 command is correct, not a bridge bug — return it unchanged.
+- If a user explicitly supplies a Blender verify command, the honest form passes `--python-exit-code` so a raising script also fails the process:
+  `blender --background --factory-startup --python-exit-code 1 --python tests/run_tests.py`
+  `--factory-startup` disables every installed add-on, including the one under test, so the script must call `addon_utils.enable("<module>", default_set=False, persistent=True)` itself.
+
 Safety rules:
 - Default to write-capable Grok work in `grok-build:grok-delegate` unless the user explicitly asks for read-only behavior.
 - Preserve the user's task text as-is apart from stripping routing flags (deliver via `--prompt-file` or stdin, never shell-interpolated).

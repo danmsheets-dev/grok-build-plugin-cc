@@ -6,11 +6,15 @@ import test from "node:test";
 import { makeTempDir } from "./helpers.mjs";
 import { startHeartbeat } from "../plugins/grok-build/scripts/lib/tracked-jobs.mjs";
 import {
+  OUTPUT_FAILURE_PATTERNS,
   classifyVerifyFailure,
   compareFailureSignatures,
+  compileUserPatterns,
   deriveVerifyTimeoutMs,
+  detectOutputFailures,
   normalizeFailureText,
   probeBaselines,
+  resolveOutputFailurePatterns,
   resolveVerifyMaxBufferBytes,
   resolveVerifyTimeoutMs,
   runVerifyCommand,
@@ -658,4 +662,358 @@ test("deriveVerifyTimeoutMs honours an explicit cap and multiplier", () => {
   // A cap below the floor degrades to the floor rather than producing a
   // timeout shorter than the minimum.
   assert.equal(deriveVerifyTimeoutMs(500_000, { capMs: 1000 }), 120_000);
+});
+
+/* --------------------------------------------------------------------------
+ * Item 8 - output-pattern failure detection (both engines exit 0 while broken)
+ * ----------------------------------------------------------------------- */
+
+// A real-shaped slice of `godot --headless --import` on a project with one
+// unparseable script: the error, its `at:` continuation line, and a warning
+// that must NOT count.
+const GODOT_IMPORT_OUTPUT = [
+  "Godot Engine v4.2.2.stable.official - https://godotengine.org",
+  'SCRIPT ERROR: Parse Error: Identifier "velcoity" not declared in the current scope.',
+  "          at: GDScript::reload (res://player.gd:12)",
+  "WARNING: Attempting to parse a resource with an unknown UID.",
+  "     at: ResourceLoader::load (core/io/resource_loader.cpp:283)"
+].join("\n");
+
+test("detectOutputFailures picks the Godot error line and leaves the warning alone", () => {
+  const matched = detectOutputFailures(GODOT_IMPORT_OUTPUT, OUTPUT_FAILURE_PATTERNS.godot);
+  assert.equal(matched.length, 1, `expected exactly one match, got ${JSON.stringify(matched)}`);
+  assert.match(matched[0].line, /^SCRIPT ERROR: Parse Error:/);
+  assert.equal(matched[0].id, "godot-script-error");
+});
+
+test("detectOutputFailures never treats a Godot warning as a failure", () => {
+  // Turning a green run red is the same class of bug as reporting a red run
+  // green, and Godot 4 is extremely free with warnings.
+  const warnings = [
+    "WARNING: Parse Error recovered, continuing.",
+    "SCRIPT WARNING: Unused variable: velocity",
+    "     at: GDScript::reload (res://player.gd:12)"
+  ].join("\n");
+  assert.deepEqual(detectOutputFailures(warnings, OUTPUT_FAILURE_PATTERNS.godot), []);
+});
+
+test("the bare ERROR: and override.cfg markers are config opt-ins, not Godot defaults", () => {
+  // Godot 4 emits ERROR: for benign driver / plugin / leaked-ObjectDB
+  // conditions on plenty of machines, and "Cannot open file '" fires for an
+  // optional override.cfg. Shipping either as a default turns healthy runs red.
+  const benign = [
+    "ERROR: Cannot create RenderingDevice, falling back to compatibility renderer.",
+    "     at: initialize (drivers/vulkan/rendering_context_driver_vulkan.cpp:100)",
+    "Cannot open file 'res://override.cfg'."
+  ].join("\n");
+  assert.deepEqual(detectOutputFailures(benign, OUTPUT_FAILURE_PATTERNS.godot), []);
+
+  // ...but a project clean enough to afford them can add them itself.
+  const optedIn = resolveOutputFailurePatterns("godot", ["^\\s*ERROR:"]);
+  const matched = detectOutputFailures(benign, optedIn);
+  assert.equal(matched.length, 1);
+  assert.match(matched[0].line, /^ERROR: Cannot create RenderingDevice/);
+});
+
+test("detectOutputFailures matches Blender's anchored python-failure marker only", () => {
+  const failed = [
+    "Read blend: /home/dev/scene.blend",
+    "Error: Python script failed, look above for details"
+  ].join("\n");
+  const matched = detectOutputFailures(failed, OUTPUT_FAILURE_PATTERNS.blender);
+  assert.equal(matched.length, 1);
+  assert.equal(matched[0].id, "blender-python-script-failed");
+
+  // No bare /^Traceback/ marker ships: a suite that deliberately prints a
+  // traceback while passing would start failing.
+  const passingWithTraceback = [
+    "Traceback (most recent call last):",
+    '  File "tests/run_tests.py", line 9, in <module>',
+    "ok - 12 tests passed"
+  ].join("\n");
+  assert.deepEqual(detectOutputFailures(passingWithTraceback, OUTPUT_FAILURE_PATTERNS.blender), []);
+});
+
+test("detectOutputFailures counts a line that trips two patterns once", () => {
+  // "SCRIPT ERROR: Parse Error: ..." matches both godot-script-error and
+  // godot-parse-error. It is one failure, not two.
+  const matched = detectOutputFailures(
+    "SCRIPT ERROR: Parse Error: bad token",
+    OUTPUT_FAILURE_PATTERNS.godot
+  );
+  assert.equal(matched.length, 1);
+});
+
+test("detectOutputFailures with no patterns is a no-op", () => {
+  assert.deepEqual(detectOutputFailures(GODOT_IMPORT_OUTPUT, []), []);
+  assert.deepEqual(detectOutputFailures(GODOT_IMPORT_OUTPUT, undefined), []);
+});
+
+test("a command that prints SCRIPT ERROR and exits 0 does not pass verification", async () => {
+  // The headline Godot/Blender correctness bug: runVerifyCommand returned
+  // `ok: status === 0`, so `godot --headless --import` reporting an
+  // unparseable script - and exiting 0 anyway, as it does - was recorded as a
+  // clean verification of a broken project.
+  //
+  // Driven through a temp script rather than `node -e` so no layer of cmd.exe
+  // or /bin/sh quoting has to survive the double quotes in the payload.
+  const dir = makeTempDir("grok-output-pattern-");
+  const script = path.join(dir, "godot-like.cjs");
+  fs.writeFileSync(
+    script,
+    'console.log("SCRIPT ERROR: Parse Error: Identifier not declared");\nprocess.exit(0);\n',
+    "utf8"
+  );
+
+  const failed = await runVerifyCommand(`node "${script}"`, dir, {
+    outputFailurePatterns: OUTPUT_FAILURE_PATTERNS.godot
+  });
+  assert.equal(failed.ok, false);
+  assert.equal(failed.exitCode, 0, "the process really did exit 0 - that is the whole point");
+  assert.equal(failed.failureSource, "output-pattern");
+  assert.equal(failed.matchedLines.length, 1);
+  assert.match(failed.matchedLines[0], /^SCRIPT ERROR:/);
+
+  // The matched lines are NOT appended to the output: they are already in it,
+  // and echoing them would double-count rawCount in summarizeFailures.
+  assert.equal(failed.output.match(/SCRIPT ERROR:/g).length, 1);
+
+  // Same command, no pattern set: an exit-0 command passes, exactly as before.
+  const passed = await runVerifyCommand(`node "${script}"`, dir);
+  assert.equal(passed.ok, true);
+  assert.equal(passed.exitCode, 0);
+  assert.equal(passed.failureSource, undefined);
+});
+
+test("a command that prints Blender's python-failure marker and exits 0 does not pass either", async () => {
+  const dir = makeTempDir("grok-output-pattern-blender-");
+  const script = path.join(dir, "blender-like.cjs");
+  fs.writeFileSync(
+    script,
+    'console.log("Error: Python script failed, look above for details");\nprocess.exit(0);\n',
+    "utf8"
+  );
+
+  const failed = await runVerifyCommand(`node "${script}"`, dir, {
+    outputFailurePatterns: OUTPUT_FAILURE_PATTERNS.blender
+  });
+  assert.equal(failed.ok, false);
+  assert.equal(failed.exitCode, 0);
+  assert.equal(failed.failureSource, "output-pattern");
+
+  const passed = await runVerifyCommand(`node "${script}"`, dir);
+  assert.equal(passed.ok, true);
+});
+
+test("output patterns are only consulted on a zero exit", async () => {
+  // A non-zero exit is already a failure; relabelling its source would
+  // overwrite the more specific attribution the baseline comparison derives.
+  const dir = makeTempDir("grok-output-pattern-nonzero-");
+  const script = path.join(dir, "loud-failure.cjs");
+  fs.writeFileSync(script, 'console.log("SCRIPT ERROR: x");\nprocess.exit(3);\n', "utf8");
+
+  const result = await runVerifyCommand(`node "${script}"`, dir, {
+    outputFailurePatterns: OUTPUT_FAILURE_PATTERNS.godot
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.exitCode, 3);
+  assert.equal(result.failureSource, undefined);
+});
+
+test("probeBaselines records an exit-0 output failure that was already there", async () => {
+  // Without this, the first post-agent pass would blame the agent for a
+  // SCRIPT ERROR the project shipped with. Item 8 is only safe because the
+  // probe measures with the same pattern set.
+  const seen = [];
+  const baselines = await probeBaselines(["godot --headless --import"], "/repo", {
+    outputFailurePatterns: OUTPUT_FAILURE_PATTERNS.godot,
+    runVerifyCommandImpl: async (_command, _cwd, options) => {
+      seen.push(options.outputFailurePatterns);
+      return {
+        ok: false,
+        exitCode: 0,
+        timedOut: false,
+        failureSource: "output-pattern",
+        matchedLines: ["SCRIPT ERROR: Parse Error: x"],
+        output: "exit_code: 0\nstdout:\nSCRIPT ERROR: Parse Error: x"
+      };
+    }
+  });
+
+  assert.equal(seen[0], OUTPUT_FAILURE_PATTERNS.godot, "the probe must use the same pattern set");
+  assert.equal(baselines[0].ok, false);
+  assert.equal(baselines[0].outputFailure, true);
+  assert.equal(baselines[0].signature.length, 1);
+});
+
+test("resolveOutputFailurePatterns extends the ecosystem set and ignores an unknown one", () => {
+  assert.deepEqual(resolveOutputFailurePatterns(null, []), []);
+  assert.deepEqual(resolveOutputFailurePatterns("rust", []), []);
+  assert.equal(
+    resolveOutputFailurePatterns("godot", []).length,
+    OUTPUT_FAILURE_PATTERNS.godot.length
+  );
+  assert.equal(
+    resolveOutputFailurePatterns("Blender", ["^custom failure"]).length,
+    OUTPUT_FAILURE_PATTERNS.blender.length + 1
+  );
+});
+
+/* --------------------------------------------------------------------------
+ * Item 9 - signature robustness
+ * ----------------------------------------------------------------------- */
+
+test("rawCountComparison:'ignore' tolerates Godot's per-frame error spam", () => {
+  // Godot re-prints the same runtime error once PER FRAME, so a run that idles
+  // three frames longer than the baseline reports more occurrences of an
+  // identical error set - a regression that never happened.
+  const ignored = compareFailureSignatures(["x"], ["x"], {
+    currentRawCount: 121,
+    baselineRawCount: 118,
+    rawCountComparison: "ignore"
+  });
+  assert.equal(ignored.outcome, "unchanged-from-baseline");
+});
+
+test("rawCountComparison defaults to 'strict' and still catches a hidden regression", () => {
+  // Pins the existing behaviour: 'strict' is the default, and passing it
+  // explicitly changes nothing. Everything that does not opt in keeps the
+  // occurrence-count check.
+  const explicit = compareFailureSignatures(["x"], ["x"], {
+    currentRawCount: 121,
+    baselineRawCount: 118,
+    rawCountComparison: "strict"
+  });
+  assert.equal(explicit.outcome, "more-failures-same-signature");
+
+  const omitted = compareFailureSignatures(["x"], ["x"], {
+    currentRawCount: 121,
+    baselineRawCount: 118
+  });
+  assert.equal(omitted.outcome, "more-failures-same-signature");
+});
+
+test("classifyVerifyFailure forwards rawCountComparison to the comparison", () => {
+  const current = { signature: ["parse error"], rawCount: 121 };
+  const baseline = { ok: true, signature: ["parse error"], rawCount: 118, timedOut: false };
+
+  const strict = classifyVerifyFailure(current, baseline);
+  assert.equal(strict.blamed, true);
+  assert.equal(strict.reason, "more-failures-same-signature");
+
+  const lenient = classifyVerifyFailure(current, baseline, { rawCountComparison: "ignore" });
+  assert.equal(lenient.blamed, false);
+  assert.equal(lenient.reason, "unchanged-from-baseline");
+});
+
+test("summarizeFailures treats a bare carriage return as a line break", () => {
+  // Generic hardening, not a fix for any one tool: anything that draws a
+  // progress indicator by rewriting the current line emits bare CRs, and a
+  // \r?\n split folds the whole run into ONE line whose normalized form
+  // differs on every invocation - so it never compares equal to its baseline.
+  const chunks = [];
+  for (let index = 0; index < 50; index += 1) {
+    chunks.push(`Fra:${index} Mem:31.44M | Compositing | Tile 1-${index}`);
+  }
+  chunks.push("AssertionError: expected 3 objects");
+  const output = `exit_code: 1\nstderr:\n${chunks.join("\r")}`;
+
+  const summary = summarizeFailures(output);
+  assert.equal(summary.signature.length, 1);
+  assert.doesNotMatch(
+    summary.signature[0],
+    /compositing/i,
+    "the progress chunks must not be glued onto the failure id"
+  );
+  assert.match(summary.signature[0], /assertionerror/);
+});
+
+test("a pathological failure line is capped, and capped AFTER normalization", () => {
+  // Slicing the RAW line first can cut a Windows path mid-token and defeat the
+  // path rules entirely, so the cap has to run last.
+  const noisy = `AssertionError: C:\\Users\\dev\\repo\\src\\math.test.js:42:10 ${"x".repeat(10_000)}`;
+  const summary = summarizeFailures(`exit_code: 1\nstderr:\n${noisy}`);
+
+  assert.equal(summary.signature.length, 1);
+  assert.ok(
+    summary.signature[0].length <= 512,
+    `expected a capped id, got ${summary.signature[0].length} chars`
+  );
+  assert.match(summary.signature[0], /src\/math\.test\.js/, "the path rules ran before the slice");
+  assert.doesNotMatch(summary.signature[0], /users\/dev/);
+  assert.doesNotMatch(summary.signature[0], /42:10/);
+});
+
+test("summarizeFailures drops ignored lines before they can count as failures", () => {
+  const output = [
+    "exit_code: 1",
+    "stderr:",
+    "ERROR: Cannot create RenderingDevice, falling back",
+    "AssertionError: expected 3 objects"
+  ].join("\n");
+
+  const unfiltered = summarizeFailures(output);
+  assert.equal(unfiltered.signature.length, 2);
+  assert.equal(unfiltered.rawCount, 2);
+
+  const filtered = summarizeFailures(output, {
+    ignorePatterns: [/Cannot create RenderingDevice/]
+  });
+  assert.equal(filtered.signature.length, 1);
+  // Before looksLikeFailure, so an ignored line never reaches rawCount either.
+  assert.equal(filtered.rawCount, 1);
+  assert.match(filtered.signature[0], /assertionerror/);
+});
+
+test("compileUserPatterns drops an invalid regex with a warning instead of throwing", () => {
+  // These arrive from --verify-ignore and from .grok-build.json, i.e. from a
+  // human typing a regex. One bad character must cost the pattern, not the run.
+  const warnings = [];
+  const compiled = compileUserPatterns(["(unclosed", "\\bok\\b", "   ", null], {
+    onWarning: (message) => warnings.push(message)
+  });
+
+  assert.equal(compiled.length, 1);
+  assert.equal(compiled[0].source, "\\bok\\b");
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /invalid verify pattern/);
+});
+
+test("compileUserPatterns is total for empty and missing input", () => {
+  assert.deepEqual(compileUserPatterns(undefined), []);
+  assert.deepEqual(compileUserPatterns([]), []);
+});
+
+/* --------------------------------------------------------------------------
+ * Item 10 - --no-verify-baseline
+ * ----------------------------------------------------------------------- */
+
+test("classifyVerifyFailure treats a deliberately skipped baseline as strict", () => {
+  // "We could not look" and "we chose not to look" have opposite correct
+  // behaviours. A skipped baseline blames the run; it is emphatically NOT an
+  // infrastructure outcome, or --no-verify-baseline would silently stop the
+  // fix loop from ever running.
+  const verdict = classifyVerifyFailure(
+    { signature: ["assertionerror: x"], rawCount: 1 },
+    { ok: null, signature: [], rawCount: 0, timedOut: false, baselineSkipped: true }
+  );
+  assert.equal(verdict.blamed, true);
+  assert.equal(verdict.reason, "baseline-skipped");
+  assert.notEqual(verdict.infrastructure, true);
+  assert.notEqual(verdict.fatal, true);
+});
+
+test("a skipped baseline still yields to a genuine infrastructure fault", () => {
+  // The command never ran at all - that is not the user's strictness choice.
+  const skipped = { ok: null, signature: [], rawCount: 0, timedOut: false, baselineSkipped: true };
+  const notRunnable = classifyVerifyFailure({ signature: [], rawCount: 0 }, skipped, {
+    commandNotFound: true
+  });
+  assert.equal(notRunnable.reason, "verify-command-not-runnable");
+  assert.equal(notRunnable.blamed, false);
+
+  const timedOut = classifyVerifyFailure({ signature: [], rawCount: 0 }, skipped, {
+    timedOut: true
+  });
+  assert.equal(timedOut.reason, "verify-timed-out");
 });

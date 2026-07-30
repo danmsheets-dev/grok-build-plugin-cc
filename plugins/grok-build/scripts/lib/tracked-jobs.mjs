@@ -111,11 +111,49 @@ export function createJobRecord(base, options = {}) {
   };
 }
 
-export function createJobProgressUpdater(workspaceRoot, jobId) {
+/**
+ * Fold a progress event into the job record.
+ *
+ * Two jobs, not one. Transition fields (phase, threadId, turnId, agentPid,
+ * usage) are patched only when they actually change - patching an unchanged
+ * phase on every streamed token would rewrite the job file hundreds of times a
+ * minute. But `lastEventAt` is not a transition: it is the "this run is still
+ * alive" clock the status renderer and the stale-run sweeper read, and it used
+ * to be reachable ONLY through a transition patch. A long, healthy, single-
+ * phase stretch - a fifteen-minute Godot import, a chatty agent turn that never
+ * changes phase - therefore aged without bound while producing events the whole
+ * time. So a no-transition event still refreshes it, throttled to at most once
+ * per `minRefreshMs`.
+ *
+ * `nowImpl` / `patchImpl` are injected rather than faked with timers because
+ * node:test's t.mock.timers needs Node >= 20.4 and package.json pins >= 18.18.
+ *
+ * @param {string} workspaceRoot
+ * @param {string} jobId
+ * @param {{
+ *   minRefreshMs?: number,
+ *   nowImpl?: () => number,
+ *   patchImpl?: typeof patchJobIfActive
+ * }} [options]
+ */
+export function createJobProgressUpdater(workspaceRoot, jobId, options = {}) {
   let lastPhase = null;
   let lastThreadId = null;
   let lastTurnId = null;
   let lastAgentPid = null;
+  const minRefreshMs = Number.isFinite(Number(options.minRefreshMs))
+    ? Math.max(0, Number(options.minRefreshMs))
+    : 5000;
+  const nowImpl = options.nowImpl ?? Date.now;
+  const patchImpl = options.patchImpl ?? patchJobIfActive;
+  // -Infinity, not 0: the very first event of a run must refresh, whatever
+  // the clock happens to read.
+  let lastRefreshAt = -Infinity;
+
+  const readNow = () => {
+    const value = Number(nowImpl());
+    return Number.isFinite(value) ? value : lastRefreshAt;
+  };
 
   return (event) => {
     const normalized = normalizeProgressEvent(event);
@@ -151,12 +189,20 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       changed = true;
     }
 
+    const now = readNow();
+
     if (!changed) {
+      if (now - lastRefreshAt < minRefreshMs) {
+        return;
+      }
+      lastRefreshAt = now;
+      patchImpl(workspaceRoot, jobId, { lastEventAt: nowIso() });
       return;
     }
 
+    lastRefreshAt = now;
     patch.lastEventAt = nowIso();
-    patchJobIfActive(workspaceRoot, jobId, patch);
+    patchImpl(workspaceRoot, jobId, patch);
   };
 }
 

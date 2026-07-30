@@ -11,6 +11,7 @@ import {
   generateJobId,
   listJobs,
   resolveJobFile,
+  resolveJobLogFile,
   resolveStateDir,
   upsertJob,
   writeJobFile
@@ -836,4 +837,232 @@ test("an explicit --verify-timeout is what each verify command actually gets", (
   assert.ok(payload.verify.timeouts.baselineTimeoutMs >= 900000);
   assert.equal(payload.verify.results[0].timeoutMs, 1_800_000);
   assert.equal(payload.verify.results[0].timeoutSource, "explicit");
+});
+
+test("the verify phase is reported as progress, not inferred from agent chatter", () => {
+  // The bridge runs the verify commands itself, so the agent emits no
+  // "running command:" line for them and inferLegacyJobPhase has nothing to
+  // pattern-match on. A fifteen-minute Godot import used to leave the log
+  // completely silent about what the run was doing.
+  const repo = makeTempDir("grok-verify-progress-");
+  const binDir = makeTempDir("grok-verify-progress-bin-");
+  const pluginDataDir = makeTempDir("grok-verify-progress-data-");
+  installFakeGrok(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run(
+    "node",
+    [SCRIPT, "run", "--json", "--verify", "node -e process.exit(0)", "do something"],
+    {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir)
+    }
+  );
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.verified, true);
+
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  try {
+    const jobs = listJobs(repo);
+    assert.ok(jobs.length >= 1);
+    const log = fs.readFileSync(resolveJobLogFile(repo, jobs[0].id), "utf8");
+    assert.match(log, /Verify baseline:/, "the probe must announce itself before it runs");
+    assert.match(log, /Verify attempt 1\//, "each attempt must be logged as it starts");
+    assert.match(log, /Verify passed in \d+ms:/, "each attempt must report its outcome");
+  } finally {
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
+});
+
+test("--no-verify-baseline skips the probe and makes verification strict", () => {
+  // A command that is red before the run and red after is normally NOT the
+  // agent's fault, and the run reports verified:true with a note. Opting out
+  // of the baseline says "treat every failure as mine", which has to be
+  // recorded as a deliberate choice rather than as an unknown baseline.
+  const repo = makeTempDir("grok-no-baseline-");
+  const binDir = makeTempDir("grok-no-baseline-bin-");
+  const pluginDataDir = makeTempDir("grok-no-baseline-data-");
+  installFakeGrok(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const alwaysRed = "node -e process.exit(1)";
+
+  const withBaseline = run(
+    "node",
+    [SCRIPT, "run", "--json", "--verify", alwaysRed, "do something"],
+    { cwd: repo, env: pluginDataEnv(pluginDataDir, binDir) }
+  );
+  assert.equal(withBaseline.status, 0, withBaseline.stderr || withBaseline.stdout);
+  const measured = JSON.parse(withBaseline.stdout);
+  assert.equal(measured.verified, true, "a pre-existing failure is not this run's");
+  assert.equal(measured.verify.results[0].attribution, "baseline-already-failing");
+  assert.equal(measured.verify.baselineSkipped, false);
+
+  const withoutBaseline = run(
+    "node",
+    [SCRIPT, "run", "--json", "--no-verify-baseline", "--verify", alwaysRed, "do something"],
+    { cwd: repo, env: pluginDataEnv(pluginDataDir, binDir) }
+  );
+  assert.equal(withoutBaseline.status, 0, withoutBaseline.stderr || withoutBaseline.stdout);
+  const strict = JSON.parse(withoutBaseline.stdout);
+  assert.equal(strict.verified, false, "with nothing measured, every failure counts");
+  assert.equal(strict.verify.baselineSkipped, true);
+  assert.equal(strict.verify.baselineProbeMs, null, "no probe ran, so there is nothing to report");
+  assert.equal(strict.verify.baselines[0].baselineSkipped, true);
+  assert.equal(strict.verify.baselines[0].ok, null, "nothing was measured, so ok has no answer");
+  assert.equal(strict.verify.results[0].attribution, "baseline-skipped");
+  assert.equal(strict.verify.results[0].failureSource, "agent");
+});
+
+test("a Godot project's exit-0 SCRIPT ERROR is a verification failure", () => {
+  // The headline engine bug end to end: godot --headless --import prints
+  // SCRIPT ERROR for an unparseable script and exits 0, so exit-code-only
+  // detection reported a broken project as verified. Hermetic - the pattern
+  // set is chosen from project.godot, and the "engine" is a node script.
+  const repo = makeTempDir("grok-godot-exit0-");
+  const binDir = makeTempDir("grok-godot-exit0-bin-");
+  const pluginDataDir = makeTempDir("grok-godot-exit0-data-");
+  installFakeGrok(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(
+    path.join(repo, "project.godot"),
+    'config_version=5\n\n[application]\n\nconfig/name="Demo"\n',
+    "utf8"
+  );
+  // Clean on its first (baseline) invocation, broken afterwards - so the
+  // failure is genuinely attributable to the run rather than pre-existing.
+  fs.writeFileSync(
+    path.join(repo, "engine.cjs"),
+    [
+      "const fs = require('fs');",
+      "const marker = '.gvmarker';",
+      "if (fs.existsSync(marker)) {",
+      "  console.log('SCRIPT ERROR: Parse Error: Identifier not declared');",
+      "} else {",
+      "  fs.writeFileSync(marker, '1');",
+      "}",
+      "process.exit(0);",
+      ""
+    ].join("\n"),
+    "utf8"
+  );
+  run("git", ["add", "."], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run(
+    "node",
+    [SCRIPT, "run", "--json", "--verify", "node engine.cjs", "do something"],
+    { cwd: repo, env: pluginDataEnv(pluginDataDir, binDir) }
+  );
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.verify.plan.ecosystem, "godot", "project.godot must select the pattern set");
+  assert.equal(payload.verified, false, "an exit-0 SCRIPT ERROR can never mean verified");
+
+  const entry = payload.verify.results[0];
+  assert.equal(entry.exitCode, 0, "the command really did exit 0 - that is the whole bug");
+  assert.equal(entry.ok, false);
+  assert.equal(entry.outputFailure, true);
+  assert.match(entry.matchedLines[0], /^SCRIPT ERROR:/);
+  assert.equal(entry.failureSource, "agent");
+});
+
+test("the same exit-0 output passes in a project with no engine ecosystem", () => {
+  // The discriminator for the test above: nothing about the output changed,
+  // only which ecosystem was detected. A repo with no engine marker gets no
+  // output patterns, so exit 0 still means pass - unchanged from 0.3.x.
+  const repo = makeTempDir("grok-no-ecosystem-exit0-");
+  const binDir = makeTempDir("grok-no-ecosystem-exit0-bin-");
+  const pluginDataDir = makeTempDir("grok-no-ecosystem-exit0-data-");
+  installFakeGrok(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  fs.writeFileSync(
+    path.join(repo, "engine.cjs"),
+    "console.log('SCRIPT ERROR: Parse Error: Identifier not declared');\nprocess.exit(0);\n",
+    "utf8"
+  );
+  run("git", ["add", "."], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run(
+    "node",
+    [SCRIPT, "run", "--json", "--verify", "node engine.cjs", "do something"],
+    { cwd: repo, env: pluginDataEnv(pluginDataDir, binDir) }
+  );
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.verify.plan.ecosystem, null);
+  assert.equal(payload.verified, true);
+  assert.equal(payload.verify.results[0].outputFailure, false);
+});
+
+test("--verify-ignore reaches the stored request under --background", () => {
+  // Compiled RegExps do not survive the JSON round trip into the job file, so
+  // the request has to carry the raw pattern strings. A pattern that reached
+  // only the foreground path would silently do nothing for exactly the
+  // long-running runs it matters most to.
+  const repo = makeTempDir("grok-verify-ignore-bg-");
+  const binDir = makeTempDir("grok-verify-ignore-bg-bin-");
+  const pluginDataDir = makeTempDir("grok-verify-ignore-bg-data-");
+  installFakeGrok(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run(
+    "node",
+    [
+      SCRIPT,
+      "run",
+      "--background",
+      "--json",
+      "--no-verify-baseline",
+      "--verify",
+      "node -e process.exit(0)",
+      "--verify-ignore",
+      "Cannot create RenderingDevice",
+      "--verify-ignore",
+      "leaked instance",
+      "do something"
+    ],
+    { cwd: repo, env: pluginDataEnv(pluginDataDir, binDir) }
+  );
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const launch = JSON.parse(result.stdout);
+  assert.ok(launch.jobId, "a background launch must report its job id");
+
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  try {
+    const stored = JSON.parse(fs.readFileSync(resolveJobFile(repo, launch.jobId), "utf8"));
+    assert.deepEqual(stored.request.verifyIgnorePatterns, [
+      "Cannot create RenderingDevice",
+      "leaked instance"
+    ]);
+    assert.equal(stored.request.noVerifyBaseline, true);
+  } finally {
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
 });

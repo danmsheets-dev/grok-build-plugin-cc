@@ -51,6 +51,53 @@ so a run cannot claim success without it having passed.
 - A command that prints more than the output budget is **not** a failure: the first 64 KB and
   the last 256 KB are kept, the middle is replaced by an `...[elided N bytes of output]...`
   marker, and the command's real exit code is what counts.
+- `--no-verify-baseline` skips the pre-run measurement. That makes verification **strict**:
+  with nothing measured, every failure — pre-existing or not — is treated as this run's.
+
+### Exit code 0 does not mean the project works
+
+Godot and Blender both report a broken project on stdout and exit **0** anyway.
+`godot --headless --import` prints `SCRIPT ERROR:` for a GDScript that does not parse and still
+exits 0; `blender -b --python x.py` exits 0 when the script raises. So the bridge also scans
+verify output for a small set of failure markers, chosen per detected ecosystem:
+
+| Ecosystem | Matched by default |
+| --- | --- |
+| Godot | `SCRIPT ERROR:`, `USER SCRIPT ERROR:`, `USER ERROR:`, `Parse Error`, `Failed to load script `, `Error importing '`, `Failed to instantiate scene` |
+| Blender | `Error: Python script failed` (anchored at line start) |
+
+`WARNING:` and `SCRIPT WARNING:` never match. A bare `ERROR:` and `Cannot open file '` are
+deliberately **not** defaults — Godot 4 emits both for entirely benign conditions, and turning a
+healthy run red is the same class of bug as reporting a broken one green. Add them yourself with
+`verifyFailurePatterns` in `.grok-build.json` if your project is clean enough to afford it.
+
+The same measurement runs at baseline, so a project that was already printing `SCRIPT ERROR`
+before the run started is not blamed on the agent.
+
+Two more knobs for noisy engines:
+
+- `--verify-ignore <regex>` (repeatable, or `verifyIgnorePatterns` in the config) drops matching
+  output lines before they can count as failures at all.
+- Godot re-prints the same runtime error **once per frame**, so for Godot projects the occurrence
+  *count* is ignored and only the deduped set of distinct errors is compared. A genuinely new
+  error is still caught; a run that simply idled a few frames longer is not reported as a
+  regression.
+
+#### Blender: make the exit code honest too
+
+For a Blender test script, pass `--python-exit-code` so a raising script also fails the process:
+
+```
+blender --background --factory-startup --python-exit-code 1 --python tests/run_tests.py
+```
+
+`--factory-startup` disables **every** installed add-on, including the one you are testing, so
+`run_tests.py` has to enable it itself:
+
+```python
+import addon_utils
+addon_utils.enable("my_addon", default_set=False, persistent=True)
+```
 
 ### Where the verify plan comes from
 
@@ -112,6 +159,8 @@ clone cannot ship its own trust record, and any later edit to the file withdraws
 | `--verify <cmd>` | Command that must pass before the run counts as done (repeatable) |
 | `--verify-attempts <n>` | Fix-and-recheck cycles allowed (default 2) |
 | `--no-verify` | Run nothing, even when a config or ecosystem plan exists |
+| `--no-verify-baseline` | Skip the pre-run baseline probe. Makes verification strict: every failure counts as this run's |
+| `--verify-ignore <regex>` | Drop matching output lines before they count as failures (repeatable) |
 | `--verify-timeout <seconds>` | Budget for each verify command. Used verbatim; without it the budget is derived from the measured baseline (4x, floored at 120s, capped at 900s) |
 | `--baseline-timeout <seconds>` | Budget for the pre-run baseline probe. Only ever raises the 900s default |
 | `--verify-max-buffer <megabytes>` | How much verify output to keep. Output over the budget is not an error: the head and tail are kept and the middle is elided |

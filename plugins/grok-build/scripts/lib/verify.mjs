@@ -23,6 +23,164 @@ const NOT_RUNNABLE = [
 ];
 
 /**
+ * Game engines report a broken project on stdout and still exit 0.
+ *
+ * `godot --headless --import` prints `SCRIPT ERROR:` for a GDScript that does
+ * not parse and exits 0 anyway; `blender -b --python x.py` exits 0 when the
+ * script raises unless `--python-exit-code` is passed. Exit-code-only success
+ * detection therefore reports a broken project as verified, which is the exact
+ * lie the whole verification story exists to prevent.
+ *
+ * The sets below are deliberately NARROW. Two Godot markers that look obvious
+ * are excluded on purpose and are available as `verifyFailurePatterns` opt-ins
+ * in `.grok-build.json` instead:
+ *
+ *   - a bare `/^\s*ERROR:/m` — Godot 4 emits `ERROR:` for benign driver,
+ *     plugin, and leaked-ObjectDB conditions on plenty of machines, so
+ *     shipping it as a default turns healthy runs red;
+ *   - `Cannot open file '` — fires for an optional `override.cfg`.
+ *
+ * Turning a green run red is the same class of bug as reporting a red run
+ * green, so anything that is not unambiguously a failure stays out.
+ *
+ * `WARNING:` and `SCRIPT WARNING:` must never match: every pattern here is
+ * either anchored to a line start before the word ERROR or names a phrase that
+ * only appears on a failure line.
+ *
+ * Blender ships exactly ONE marker, anchored and versioned. A bare
+ * `/^Traceback/` was rejected: a suite that deliberately prints tracebacks
+ * while passing would start failing. One reviewer measured that even this
+ * string does not appear on their Blender 5.2 install, which is fine — a
+ * pattern that never fires costs nothing, and config carries the rest.
+ */
+export const OUTPUT_FAILURE_PATTERNS = Object.freeze({
+  godot: Object.freeze([
+    { id: "godot-script-error", re: /^\s*SCRIPT ERROR:/ },
+    { id: "godot-user-script-error", re: /^\s*USER SCRIPT ERROR:/ },
+    { id: "godot-user-error", re: /^\s*USER ERROR:/ },
+    { id: "godot-parse-error", re: /\bParse Error\b/ },
+    { id: "godot-script-load-failed", re: /Failed to load script / },
+    { id: "godot-import-failed", re: /Error importing '/ },
+    { id: "godot-scene-instantiate-failed", re: /Failed to instantiate scene/ }
+  ]),
+  blender: Object.freeze([
+    {
+      id: "blender-python-script-failed",
+      re: /^Error: Python script failed(?:, look above for details| - exiting)/
+    }
+  ])
+});
+
+/**
+ * A warning is never a failure, whatever else the line happens to say.
+ *
+ * Enforced here rather than left to each pattern because the phrase-shaped
+ * markers (`Parse Error`, `Failed to load script `) are unanchored by
+ * necessity — Godot prints them behind several different prefixes — and Godot
+ * cheerfully emits lines like `WARNING: Parse Error recovered, continuing.`
+ * A single guard is both easier to reason about and impossible for a later
+ * pattern addition to forget.
+ */
+const OUTPUT_WARNING_LINE = /^(?:SCRIPT |USER |USER SCRIPT )?WARNING\b/;
+
+/**
+ * Which output lines trip a failure pattern.
+ *
+ * Applied line by line rather than to the whole blob so the caller learns
+ * WHICH line failed, not merely that something did — and so a `/m`-anchored
+ * pattern and an unanchored one behave the same way. A line that trips more
+ * than one pattern is reported once: a single `SCRIPT ERROR: Parse Error: ...`
+ * is one failure, not two.
+ *
+ * @param {string} output
+ * @param {{id: string, re: RegExp}[]|null|undefined} patterns
+ * @returns {{ id: string, line: string }[]}
+ */
+export function detectOutputFailures(output, patterns) {
+  const list = Array.isArray(patterns) ? patterns : [];
+  if (list.length === 0) {
+    return [];
+  }
+
+  const matched = [];
+  const seen = new Set();
+  // Same \r-tolerant split as summarizeFailures: a tool that reports progress
+  // with carriage returns would otherwise present its whole run as one line.
+  for (const raw of String(output ?? "").split(/\r\n|\r|\n/)) {
+    const line = raw.trim();
+    if (!line || OUTPUT_WARNING_LINE.test(line)) {
+      continue;
+    }
+    for (const entry of list) {
+      if (!entry?.re || !entry.re.test(line)) {
+        continue;
+      }
+      if (!seen.has(line)) {
+        seen.add(line);
+        matched.push({ id: String(entry.id ?? "custom"), line });
+      }
+      break;
+    }
+  }
+
+  return matched;
+}
+
+/**
+ * Compile user-supplied regex strings, warning-and-dropping the unusable ones.
+ *
+ * Never throws: these come from `--verify-ignore` and from `.grok-build.json`,
+ * i.e. from a human typing a regex, and one bad character must cost the
+ * pattern rather than the run. Mirrors the bridge's unknown-option handling.
+ *
+ * @param {Iterable<string>|null|undefined} rawPatterns
+ * @param {{ onWarning?: (message: string) => void, flags?: string }} [options]
+ * @returns {RegExp[]}
+ */
+export function compileUserPatterns(rawPatterns, options = {}) {
+  const compiled = [];
+  for (const raw of rawPatterns ?? []) {
+    const source = String(raw ?? "").trim();
+    if (!source) {
+      continue;
+    }
+    try {
+      compiled.push(new RegExp(source, options.flags ?? ""));
+    } catch (error) {
+      options.onWarning?.(
+        `ignoring invalid verify pattern ${JSON.stringify(source)}: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+  return compiled;
+}
+
+/**
+ * The output-failure pattern set for one run: the detected ecosystem's
+ * defaults, extended by whatever `verifyFailurePatterns` the project config
+ * adds (which is how the deliberately-excluded broad Godot markers are opted
+ * into).
+ *
+ * Takes the ecosystem as an **id string** rather than a descriptor because
+ * this is resolved inside the run, and a background run reads its request back
+ * out of a JSON file — a RegExp does not survive that trip, so only the
+ * ecosystem id and the raw pattern strings are ever serialized.
+ *
+ * @param {string|null|undefined} ecosystemId
+ * @param {string[]|null|undefined} extraPatterns
+ * @param {{ onWarning?: (message: string) => void }} [options]
+ */
+export function resolveOutputFailurePatterns(ecosystemId, extraPatterns, options = {}) {
+  const key = String(ecosystemId ?? "").trim().toLowerCase();
+  const base = OUTPUT_FAILURE_PATTERNS[key] ?? [];
+  const extra = compileUserPatterns(extraPatterns, { ...options, flags: "m" }).map((re, index) => ({
+    id: `config-pattern-${index + 1}`,
+    re
+  }));
+  return [...base, ...extra];
+}
+
+/**
  * Run a verify command string without shell:true so paths with spaces stay intact.
  * On win32 uses ComSpec/cmd.exe with /d /s /c; elsewhere /bin/sh -c.
  *
@@ -37,6 +195,7 @@ const NOT_RUNNABLE = [
  *   env?: NodeJS.ProcessEnv,
  *   timeoutMs?: number,
  *   maxOutputBytes?: number,
+ *   outputFailurePatterns?: {id: string, re: RegExp}[],
  *   runCommandImpl?: typeof runCommandAsync,
  *   platform?: string
  * }} [options]
@@ -46,6 +205,8 @@ const NOT_RUNNABLE = [
  *   timedOut: boolean,
  *   bufferExceeded?: boolean,
  *   commandNotFound?: boolean,
+ *   failureSource?: "output-pattern",
+ *   matchedLines?: string[],
  *   elidedBytes?: number,
  *   output: string
  * }>}
@@ -129,6 +290,13 @@ export async function runVerifyCommand(command, cwd, options = {}) {
   const commandNotFound =
     status !== 0 &&
     (status === 127 || NOT_RUNNABLE.some((re) => re.test(`${stdout}\n${stderr}`)));
+
+  // Only consulted on a zero exit: a non-zero status is already a failure, and
+  // re-labelling its source would overwrite the more specific attribution the
+  // classifier derives from the baseline comparison.
+  const outputFailures =
+    status === 0 ? detectOutputFailures(`${stdout}\n${stderr}`, options.outputFailurePatterns) : [];
+
   const parts = [`exit_code: ${status}`];
   if (stdout) {
     parts.push(`stdout:\n${stdout}`);
@@ -141,10 +309,17 @@ export async function runVerifyCommand(command, cwd, options = {}) {
   }
 
   return {
-    ok: status === 0,
+    ok: status === 0 && outputFailures.length === 0,
     exitCode: status,
     timedOut: false,
     commandNotFound,
+    // Deliberately NOT appended to `output`: the matched lines are already in
+    // it, and they already match summarizeFailures' \berror\b heuristic, so
+    // echoing them a second time would double-count rawCount and needlessly
+    // trip the more-failures-same-signature branch.
+    ...(outputFailures.length > 0
+      ? { failureSource: "output-pattern", matchedLines: outputFailures.map((entry) => entry.line) }
+      : {}),
     // How much of the middle the ring dropped, so a truncated capture is a
     // number in the run record rather than something only a reader of the
     // elision marker would notice. Zero for any command that stayed under the
@@ -165,7 +340,9 @@ export async function runVerifyCommand(command, cwd, options = {}) {
  * @param {{
  *   runVerifyCommandImpl?: typeof runVerifyCommand,
  *   timeoutMs?: number,
- *   maxOutputBytes?: number
+ *   maxOutputBytes?: number,
+ *   outputFailurePatterns?: {id: string, re: RegExp}[],
+ *   ignorePatterns?: RegExp[]
  * }} [options]
  * @returns {Promise<{
  *   command: string,
@@ -175,7 +352,8 @@ export async function runVerifyCommand(command, cwd, options = {}) {
  *   rawCount: number,
  *   timedOut: boolean,
  *   bufferExceeded: boolean,
- *   commandNotFound: boolean
+ *   commandNotFound: boolean,
+ *   outputFailure: boolean
  * }[]>}
  */
 export async function probeBaselines(commands, cwd, options = {}) {
@@ -184,21 +362,29 @@ export async function probeBaselines(commands, cwd, options = {}) {
 
   for (const command of commands ?? []) {
     const started = Date.now();
-    // The output budget has to match the post-agent pass. A baseline captured
-    // under a tighter bound records a shorter signature, and every failure the
-    // fuller capture then finds looks new.
+    // The output budget, the failure patterns, and the ignore list all have to
+    // match the post-agent pass. A baseline captured under a tighter bound (or
+    // without the pattern set that makes an exit-0 Godot import count as a
+    // failure) records a shorter signature, and every failure the fuller
+    // capture then finds looks new.
     const probe = await runVerifyCommandImpl(command, cwd, {
       timeoutMs: options.timeoutMs,
-      maxOutputBytes: options.maxOutputBytes
+      maxOutputBytes: options.maxOutputBytes,
+      outputFailurePatterns: options.outputFailurePatterns
     });
     const ms = Date.now() - started;
-    const summary = summarizeFailures(probe?.output);
+    const summary = summarizeFailures(probe?.output, { ignorePatterns: options.ignorePatterns });
     baselines.push({
       command,
       ok: Boolean(probe?.ok),
       ms,
       signature: summary.signature,
       rawCount: summary.rawCount,
+      // A project that was ALREADY printing SCRIPT ERROR before the agent
+      // started must be recorded as such, or the first post-agent run blames
+      // the agent for it. This is the flag that makes item 8 safe under
+      // --no-isolate.
+      outputFailure: probe?.failureSource === "output-pattern",
       // Every infrastructure flag the post-agent pass can raise has to be
       // mirrored here too. A baseline that timed out / overflowed its buffer /
       // never started is an unknown baseline, and classifyVerifyFailure can
@@ -260,13 +446,40 @@ export function normalizeFailureText(text) {
 }
 
 /**
+ * The longest a single signature id may be, applied AFTER normalizeFailureText.
+ *
+ * A pathological line (a minified bundle, a 10 000-character assertion diff)
+ * would otherwise be carried whole into the persisted run record, once for the
+ * baseline and once for every attempt. Truncating the RAW line instead would
+ * be wrong: the path rules above rewrite Windows and POSIX paths in place, and
+ * a pre-normalization slice can cut a path mid-token and defeat them entirely.
+ *
+ * Truncation can collapse two long failures that share a 512-character prefix
+ * onto one id. That is already guarded: rawCount counts occurrences before
+ * dedup, and compareFailureSignatures' more-failures-same-signature branch is
+ * exactly the case this creates.
+ */
+const MAX_SIGNATURE_ID_CHARS = 512;
+
+/**
  * Extract a comparable failure signature from verify command output.
  *
  * @param {string} output
- * @returns {{ signature: string[], failureCount: number }}
+ * @param {{ ignorePatterns?: RegExp[] }} [options] `ignorePatterns` drops a
+ *   line before it is ever considered a failure — the escape hatch for a tool
+ *   whose benign chatter contains the word "error".
+ * @returns {{ signature: string[], failureCount: number, rawCount: number }}
  */
-export function summarizeFailures(output) {
-  const lines = String(output ?? "").split(/\r?\n/);
+export function summarizeFailures(output, options = {}) {
+  // \r on its own is a line break here, not content. Defensive hardening
+  // rather than a fix for any one tool: anything that draws a progress
+  // indicator by rewriting the current line emits bare CRs, and a \r?\n split
+  // folds that entire run into ONE enormous "line" whose normalized form
+  // differs on every invocation - so the signature never compares equal to its
+  // own baseline. (Measured: Blender 5.2 background renders are 100% LF with
+  // zero CRs, so this is not a Blender fix.)
+  const lines = String(output ?? "").split(/\r\n|\r|\n/);
+  const ignorePatterns = Array.isArray(options.ignorePatterns) ? options.ignorePatterns : [];
   /** @type {string[]} */
   const ids = [];
 
@@ -285,6 +498,13 @@ export function summarizeFailures(output) {
       continue;
     }
 
+    // Before looksLikeFailure, not after: the point of an ignore pattern is
+    // that the line never counts as a failure at all, so it must not reach
+    // rawCount either.
+    if (ignorePatterns.some((re) => re.test(t))) {
+      continue;
+    }
+
     const looksLikeFailure =
       /\b(fail|error|assert|not ok|failed|exception|panic)\b/i.test(t) ||
       /^[A-Z][a-zA-Z]*Error\b/.test(t) ||
@@ -296,7 +516,7 @@ export function summarizeFailures(output) {
 
     const n = normalizeFailureText(t);
     if (n) {
-      ids.push(n);
+      ids.push(n.length > MAX_SIGNATURE_ID_CHARS ? n.slice(0, MAX_SIGNATURE_ID_CHARS) : n);
     }
   }
 
@@ -319,8 +539,18 @@ export function summarizeFailures(output) {
  *
  * @param {string[]|Iterable<string>|null|undefined} current
  * @param {string[]|Iterable<string>|null|undefined} baseline
+ * @param {{
+ *   currentRawCount?: number,
+ *   baselineRawCount?: number,
+ *   rawCountComparison?: "strict"|"ignore"
+ * }} [options] `rawCountComparison: "ignore"` disables the occurrence-count
+ *   check below. Godot re-prints the same runtime error once PER FRAME, so a
+ *   run that merely idles a few frames longer than the baseline reports
+ *   hundreds more occurrences of an identical error set - a regression that
+ *   never happened. The deduped-signature comparison still catches genuinely
+ *   new errors; only the count heuristic is surrendered.
  * @returns {{
- *   outcome: "new-failures"|"partial-progress"|"unchanged-from-baseline"|"incomparable",
+ *   outcome: "new-failures"|"partial-progress"|"unchanged-from-baseline"|"more-failures-same-signature"|"incomparable",
  *   newFailures: string[],
  *   remainingCount: number,
  *   baselineCount: number,
@@ -383,6 +613,7 @@ export function compareFailureSignatures(current, baseline, options = {}) {
   // would hide a real regression the agent introduced.
   const { currentRawCount, baselineRawCount } = options;
   if (
+    options.rawCountComparison !== "ignore" &&
     Number.isFinite(Number(currentRawCount)) &&
     Number.isFinite(Number(baselineRawCount)) &&
     Number(currentRawCount) > Number(baselineRawCount)
@@ -493,9 +724,15 @@ export function deriveVerifyTimeoutMs(baselineMs, options = {}) {
  *   rawCount: number,
  *   timedOut: boolean,
  *   bufferExceeded?: boolean,
- *   commandNotFound?: boolean
+ *   commandNotFound?: boolean,
+ *   baselineSkipped?: boolean
  * }|undefined|null} baselineEntry
- * @param {{ timedOut?: boolean, bufferExceeded?: boolean, commandNotFound?: boolean }} [options]
+ * @param {{
+ *   timedOut?: boolean,
+ *   bufferExceeded?: boolean,
+ *   commandNotFound?: boolean,
+ *   rawCountComparison?: "strict"|"ignore"
+ * }} [options]
  * @returns {{
  *   blamed: boolean,
  *   reason: string,
@@ -529,6 +766,16 @@ export function classifyVerifyFailure(current, baselineEntry, options = {}) {
     return { blamed: false, reason: "baseline-unknown" };
   }
 
+  if (baselineEntry?.baselineSkipped) {
+    // The user passed --no-verify-baseline: they chose not to measure what was
+    // already broken, which makes verification STRICT rather than unknown.
+    // Deliberately not folded into baseline-unknown / timedOut: "we could not
+    // look" and "we chose not to look" have opposite correct behaviours, and
+    // reusing timedOut:true to mean the second would make the run record lie
+    // about what happened.
+    return { blamed: true, reason: "baseline-skipped" };
+  }
+
   if (baselineEntry == null) {
     // No probe ran for this command (or it was not in the probed list). That
     // is honestly "we don't know", not "the agent broke it" - the old code
@@ -547,7 +794,8 @@ export function classifyVerifyFailure(current, baselineEntry, options = {}) {
 
   const comparison = compareFailureSignatures(current.signature, baselineEntry?.signature ?? [], {
     currentRawCount: current.rawCount,
-    baselineRawCount: baselineEntry?.rawCount
+    baselineRawCount: baselineEntry?.rawCount,
+    rawCountComparison: options.rawCountComparison
   });
 
   if (comparison.outcome === "unchanged-from-baseline") {

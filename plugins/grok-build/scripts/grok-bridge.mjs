@@ -77,8 +77,10 @@ import {
 } from "./lib/tracked-jobs.mjs";
 import {
   classifyVerifyFailure,
+  compileUserPatterns,
   deriveVerifyTimeoutMs,
   probeBaselines,
+  resolveOutputFailurePatterns,
   resolveVerifyMaxBufferBytes,
   resolveVerifyTimeoutMs,
   runVerifyCommand,
@@ -207,10 +209,19 @@ function resolveProjectRunPlan(workspaceRoot, cli = {}) {
  * ecosystem defaults through, while a value the user actually typed must win.
  */
 function cliSettingsFromTaskOptions(options = {}) {
+  // Same "absent is not empty" rule as --verify, and for the same reason: an
+  // empty array is a usable value as far as resolveRunSettings is concerned,
+  // so it would beat the config's list rather than deferring to it.
+  const cliIgnore =
+    options["verify-ignore"] === undefined
+      ? undefined
+      : normalizeVerifyCommands(options["verify-ignore"]);
+
   return {
     verify: options.verify === undefined ? undefined : normalizeVerifyCommands(options.verify),
     noVerify: Boolean(options["no-verify"]),
     verifyAttempts: options["verify-attempts"],
+    verifyIgnorePatterns: cliIgnore && cliIgnore.length > 0 ? cliIgnore : undefined,
     // The three CLI flags are typed in the units a human thinks in (seconds,
     // megabytes) while the config keys they share a precedence chain with are
     // stored in the units the runner uses. Converting here - rather than
@@ -1394,6 +1405,28 @@ async function executeTaskRun(request) {
   // silently do nothing under --background, which is exactly the long import
   // the flags exist for.
   const verifyTiming = normalizeVerifyTiming(request.verifyTiming);
+  // Compiled HERE rather than in handleTask, from raw strings carried in the
+  // request. A background run reads its request back out of a JSON file, and a
+  // RegExp serialises to `{}` - patterns compiled before the write would
+  // silently become no-ops for exactly the long-running runs they matter most
+  // to. Invalid patterns warn and drop, the same treatment an unknown option
+  // gets, because one bad character in a config regex must cost the pattern
+  // and not the run.
+  const warnAboutPattern = (message) => {
+    process.stderr.write(`Warning: ${message}\n`);
+    request.onProgress?.({ message: `Warning: ${message}` });
+  };
+  const outputFailurePatterns = resolveOutputFailurePatterns(
+    verifyPlan?.ecosystem,
+    request.verifyFailurePatterns,
+    { onWarning: warnAboutPattern }
+  );
+  const verifyIgnorePatterns = compileUserPatterns(request.verifyIgnorePatterns, {
+    onWarning: warnAboutPattern
+  });
+  // Godot re-prints the same runtime error once per frame, so occurrence
+  // counts are noise there and only the deduped signature can be trusted.
+  const rawCountComparison = verifyPlan?.ecosystem === "godot" ? "ignore" : "strict";
   const maxDurationSeconds = resolveMaxDurationSeconds(request.maxDurationSeconds);
   const maxTurns = resolveMaxTurns(request.maxTurns);
   const maxCostUsd = resolveMaxCostUsd(request.maxCostUsd);
@@ -1436,8 +1469,16 @@ async function executeTaskRun(request) {
   // has nothing it could possibly be blamed for, so the extra pass is pure
   // wall-clock cost. Everywhere else the cost is real (a full extra verify
   // pass) and is reported in the run's status block rather than hidden.
+  //
+  // --no-verify-baseline is the one way to opt out of paying for it. It does
+  // NOT mean "we don't know what was already broken" - it means the user chose
+  // not to look, which makes verification strict: every failure, pre-existing
+  // or not, is treated as this run's. Recorded explicitly rather than by
+  // leaving `baselines` empty, so classifyVerifyFailure can tell that case
+  // apart from a probe that never ran.
+  const baselineSkipped = Boolean(request.noVerifyBaseline);
   const shouldProbeBaselines =
-    verifyCommands.length > 0 && !(write === false && verifyAttempts === 0);
+    verifyCommands.length > 0 && !baselineSkipped && !(write === false && verifyAttempts === 0);
   // Only ever raised, never lowered: the generous default below is the floor
   // for the one measurement the whole attribution story rests on, and a user
   // who asked for more time for their engine's cold import meant the probe
@@ -1446,8 +1487,37 @@ async function executeTaskRun(request) {
     BASELINE_PROBE_TIMEOUT_MS,
     verifyTiming.baselineTimeoutMs ?? 0
   );
+  if (baselineSkipped && verifyCommands.length > 0) {
+    baselines = verifyCommands.map((command) => ({
+      command,
+      // null, not false: nothing was measured, so "did it pass?" has no answer.
+      ok: null,
+      ms: null,
+      signature: [],
+      rawCount: 0,
+      timedOut: false,
+      bufferExceeded: false,
+      commandNotFound: false,
+      outputFailure: false,
+      baselineSkipped: true
+    }));
+    request.onProgress?.({
+      phase: "verifying",
+      message: `Verify baseline: skipped (--no-verify-baseline); every failure counts as this run's`
+    });
+  }
+
   if (shouldProbeBaselines) {
     const probeStarted = Date.now();
+    // Emitted before the probe rather than after, so a run that spends fifteen
+    // minutes in a cold Godot import has a log line and a phase explaining what
+    // it is doing. Without this the phase column could only be guessed at by
+    // pattern-matching agent-emitted "running command:" lines, and the probe
+    // emits none of those - it is the bridge running the command, not the agent.
+    request.onProgress?.({
+      phase: "verifying",
+      message: `Verify baseline: measuring ${verifyCommands.length} command${verifyCommands.length === 1 ? "" : "s"} before the agent starts`
+    });
     // A generous cap, not the derived per-attempt timeout: this is the ONLY
     // chance to learn what was already broken before the agent touched
     // anything, and a cold-build ecosystem (Godot's first asset import,
@@ -1460,10 +1530,19 @@ async function executeTaskRun(request) {
       timeoutMs: baselineTimeoutMs,
       // Must match what the post-agent pass gets: a baseline captured under a
       // tighter output budget records a shorter signature, and every failure
-      // the fuller capture then finds looks new.
-      maxOutputBytes: verifyTiming.maxOutputBytes ?? undefined
+      // the fuller capture then finds looks new. Same reasoning for the
+      // pattern sets - a baseline measured WITHOUT the exit-0 output patterns
+      // would record a Godot project that was already printing SCRIPT ERROR as
+      // passing, and blame the agent for it the moment the real pass ran.
+      maxOutputBytes: verifyTiming.maxOutputBytes ?? undefined,
+      outputFailurePatterns,
+      ignorePatterns: verifyIgnorePatterns
     });
     baselineProbeMs = Date.now() - probeStarted;
+    request.onProgress?.({
+      phase: "verifying",
+      message: `Verify baseline: measured in ${baselineProbeMs}ms (${baselines.filter((entry) => entry.ok).length}/${baselines.length} already passing)`
+    });
   }
 
   const firstAgent = await runHeadlessAgentWithDurationBudget(
@@ -1533,11 +1612,25 @@ async function executeTaskRun(request) {
           baselineEntry,
           verifyTiming
         );
+        // attempt is 0-based and the loop runs verifyAttempts+1 times (one
+        // initial check plus that many fix-and-recheck cycles), so the number
+        // a user sees is 1-based over the real total.
+        request.onProgress?.({
+          phase: "verifying",
+          message: `Verify attempt ${attempt + 1}/${verifyAttempts + 1}: ${command}`
+        });
+        const commandStarted = Date.now();
         const outcome = await runVerifyCommand(command, runCwd, {
           timeoutMs,
-          maxOutputBytes: verifyTiming.maxOutputBytes ?? undefined
+          maxOutputBytes: verifyTiming.maxOutputBytes ?? undefined,
+          outputFailurePatterns
         });
-        const summary = summarizeFailures(outcome.output);
+        const commandMs = Date.now() - commandStarted;
+        request.onProgress?.({
+          phase: "verifying",
+          message: `Verify ${outcome.ok ? "passed" : "failed"} in ${commandMs}ms: ${command}`
+        });
+        const summary = summarizeFailures(outcome.output, { ignorePatterns: verifyIgnorePatterns });
         const entryResult = {
           command,
           ok: outcome.ok,
@@ -1555,6 +1648,14 @@ async function executeTaskRun(request) {
           // plain non-zero exit in the persisted record.
           bufferExceeded: Boolean(outcome.bufferExceeded),
           commandNotFound: Boolean(outcome.commandNotFound),
+          // Godot and Blender both exit 0 while broken, so a failure detected
+          // from the OUTPUT has to survive into the record - otherwise a
+          // `verified: false` on an exit-0 command is inexplicable after the
+          // fact. Kept separate from `failureSource` below, which answers a
+          // different question (who is to blame), not this one (how did we
+          // notice).
+          outputFailure: outcome.failureSource === "output-pattern",
+          matchedLines: outcome.matchedLines ?? [],
           failureSource: null,
           output: outcome.output,
           signature: summary.signature
@@ -1568,7 +1669,8 @@ async function executeTaskRun(request) {
         const classification = classifyVerifyFailure(summary, baselineEntry, {
           timedOut: outcome.timedOut,
           bufferExceeded: outcome.bufferExceeded,
-          commandNotFound: outcome.commandNotFound
+          commandNotFound: outcome.commandNotFound,
+          rawCountComparison
         });
         entryResult.attribution = classification.reason;
         if (classification.comparison) {
@@ -1631,6 +1733,14 @@ async function executeTaskRun(request) {
         verifyNote = "stopped by max-cost budget before verify re-invoke";
         break;
       }
+
+      // The one phase the log could never show before: an agent turn spent
+      // fixing a verify failure looks exactly like the original turn from the
+      // outside, and inferLegacyJobPhase has nothing to pattern-match on.
+      request.onProgress?.({
+        phase: "fixing",
+        message: `Verify fix turn ${attempt + 1}/${verifyAttempts}: ${firstBlamed.command}`
+      });
 
       const fixAgent = await runHeadlessAgentWithDurationBudget(
         runCwd,
@@ -1742,6 +1852,10 @@ async function executeTaskRun(request) {
     // an unexplained delay.
     baselineProbeMs,
     baselines,
+    // Whether the user opted out of measuring the baseline at all, which is
+    // what makes every recorded attribution in `results` strict rather than
+    // differential.
+    baselineSkipped,
     // The effective budget and where each half of it came from. `timeoutMs`
     // null means every command derived its own from its baseline, which is
     // recorded per result rather than here.
@@ -1873,6 +1987,9 @@ function buildTaskRequest({
   verifyPlan = null,
   verifyTiming = null,
   verifyAttempts = 2,
+  verifyFailurePatterns = [],
+  verifyIgnorePatterns = [],
+  noVerifyBaseline = false,
   maxDurationSeconds = null,
   maxTurns = null,
   maxCostUsd = null
@@ -1897,6 +2014,12 @@ function buildTaskRequest({
     // imports the flag exists to survive.
     verifyTiming,
     verifyAttempts,
+    // Raw pattern STRINGS, never compiled RegExps: this object is
+    // JSON-serialized into the job file for a background run, and a RegExp
+    // serializes to `{}`. executeTaskRun compiles them on the way back out.
+    verifyFailurePatterns,
+    verifyIgnorePatterns,
+    noVerifyBaseline,
     maxDurationSeconds,
     maxTurns,
     maxCostUsd
@@ -2090,6 +2213,11 @@ export const TASK_VALUE_OPTIONS = Object.freeze([
   "prompt-file",
   "verify",
   "verify-attempts",
+  // Repeatable. A regex whose matching output lines are dropped before they
+  // can count as failures at all - the escape hatch for a tool whose benign
+  // chatter says "error". No ecosystem ships a preset: a wrong ignore pattern
+  // hides real regressions silently, so this stays something a human types.
+  "verify-ignore",
   // Seconds / seconds / megabytes, in the units a user types. The verify
   // ceiling used to be a hardcoded 15 minutes with no way to move it, which is
   // well under a cold Godot import on a large project.
@@ -2104,7 +2232,7 @@ export const TASK_VALUE_OPTIONS = Object.freeze([
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: [...TASK_VALUE_OPTIONS],
-    repeatableOptions: ["verify"],
+    repeatableOptions: ["verify", "verify-ignore"],
     booleanOptions: [
       "json",
       "write",
@@ -2117,6 +2245,10 @@ async function handleTask(argv) {
       // or Blender repo has no way to say "run nothing" now that a plan is
       // resolved from the project rather than only from the flags they typed.
       "no-verify",
+      // Skip the pre-run probe and pay nothing for it - at the cost of making
+      // verification strict, since with nothing measured every failure is
+      // treated as this run's.
+      "no-verify-baseline",
       "no-isolate"
     ],
     aliasMap: {
@@ -2176,6 +2308,13 @@ async function handleTask(argv) {
     }
   };
   const verifyAttempts = resolveVerifyAttempts(settings.verifyAttempts);
+  // Carried as strings and compiled inside the run - see buildTaskRequest.
+  // verifyFailurePatterns has no CLI flag: it only ever EXTENDS the detected
+  // ecosystem's built-in set (with, for instance, Godot's deliberately-excluded
+  // bare `^ERROR:`), which is a per-project decision, not a per-invocation one.
+  const verifyFailurePatterns = settings.verifyFailurePatterns ?? [];
+  const verifyIgnorePatterns = settings.verifyIgnorePatterns ?? [];
+  const noVerifyBaseline = Boolean(options["no-verify-baseline"]);
   const maxDurationSeconds = resolveMaxDurationSeconds(settings.maxDurationSeconds);
   const maxTurns = resolveMaxTurns(settings.maxTurns);
   const maxCostUsd = resolveMaxCostUsd(settings.maxCostUsd);
@@ -2204,6 +2343,9 @@ async function handleTask(argv) {
         verifyPlan,
         verifyTiming,
         verifyAttempts,
+        verifyFailurePatterns,
+        verifyIgnorePatterns,
+        noVerifyBaseline,
         maxDurationSeconds,
         maxTurns,
         maxCostUsd
@@ -2231,6 +2373,9 @@ async function handleTask(argv) {
         verifyPlan,
         verifyTiming,
         verifyAttempts,
+        verifyFailurePatterns,
+        verifyIgnorePatterns,
+        noVerifyBaseline,
         maxDurationSeconds,
         maxTurns,
         maxCostUsd,

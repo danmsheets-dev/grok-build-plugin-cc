@@ -203,6 +203,33 @@ test("the README documents verification honestly", () => {
   assert.match(readme, /[Pp]ost-hoc/, "--max-cost must be described as post-hoc, not a hard cap");
 });
 
+test("the README documents the engines that exit 0 while broken", () => {
+  const readme = fs.readFileSync(path.join(PLUGIN_ROOT, "README.md"), "utf8");
+
+  // The highest-confidence half of item 8: a user pointing the bridge at
+  // Blender cannot get an honest verdict without this flag, and nothing in
+  // the docs said so.
+  assert.match(readme, /--python-exit-code/, "the Blender invocation must be spelled out");
+  assert.match(
+    readme,
+    /--factory-startup/,
+    "and the add-on it disables, or the test script silently tests nothing"
+  );
+  assert.match(readme, /addon_utils\.enable/, "the script has to re-enable the add-on itself");
+
+  // The default marker sets, and the two Godot markers deliberately left out.
+  assert.match(readme, /SCRIPT ERROR:/);
+  assert.match(readme, /verifyFailurePatterns/, "the opt-in escape hatch must be named");
+  assert.match(readme, /--verify-ignore/);
+});
+
+test("the delegate runtime skill warns that an engine exit code is not evidence", () => {
+  const skill = read(path.join("skills", "grok-delegate-runtime", "SKILL.md"));
+  assert.match(skill, /--python-exit-code/);
+  assert.match(skill, /exits \*\*0\*\*/, "the exit-0-while-broken behaviour must be stated");
+  assert.match(skill, /addon_utils\.enable/);
+});
+
 test("every command file is documented in the plugin README", () => {
   const readme = fs.readFileSync(path.join(PLUGIN_ROOT, "README.md"), "utf8");
   const commands = fs
