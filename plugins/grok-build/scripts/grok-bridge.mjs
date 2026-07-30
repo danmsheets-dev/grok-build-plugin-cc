@@ -351,8 +351,14 @@ function buildRunEnvironment(overrides) {
  * redactSecretsDeep: that function rewrites `KEY=value`-shaped strings, which
  * is the wrong shape here (these are already split into a map), and it would
  * both mangle innocent paths and miss a token stored under a key like MY_PAT.
+ *
+ * Matched anywhere in the key (delimited by `_` or a string boundary), not
+ * just as a suffix: `KEYSTORE_PASS`, `STEAM_PASS`, `SECRET_KEY_BASE`, and
+ * `SIGNING_KEY_ALIAS` are exactly the Android/Steam signing vocabulary that
+ * is --env's headline Godot use case, and a suffix-only match misses all four.
+ * `url` is deliberately left out - it would redact ordinary non-secret URLs.
  */
-const SENSITIVE_ENV_KEY_PATTERN = /(token|secret|key|password|passwd|credential|pat)$/i;
+const SENSITIVE_ENV_KEY_PATTERN = /(^|_)(token|secret|key|pass|passwd|password|passphrase|credential|cred|pat|dsn|auth)(_|$)/i;
 
 /**
  * The override map as it is safe to persist and show: keys verbatim, sensitive
@@ -361,7 +367,7 @@ const SENSITIVE_ENV_KEY_PATTERN = /(token|secret|key|password|passwd|credential|
  *
  * @param {Record<string, string>} overrides
  */
-function redactEnvForRecord(overrides) {
+export function redactEnvForRecord(overrides) {
   /** @type {Record<string, string>} */
   const record = {};
   for (const [key, value] of Object.entries(overrides)) {
@@ -3108,13 +3114,26 @@ export function enqueueBackgroundJob(cwd, job, request, options = {}) {
     logFile,
     request
   };
+  // The job FILE keeps `request` verbatim - the detached worker is re-spawned
+  // FROM this file (readStoredJob), so the real env values must survive the
+  // handoff. The shared index (state.json) is a different surface: it backs
+  // `runs --json` / `show --json`, which echo straight back into the Claude
+  // Code transcript, so only a redacted copy of `request` ever lands there.
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
-  upsertJob(job.workspaceRoot, queuedRecord);
+  upsertJob(job.workspaceRoot, {
+    ...queuedRecord,
+    request: { ...request, env: redactEnvForRecord(request.env ?? {}) }
+  });
 
   const spawnWorker = options.spawnWorker ?? spawnDetachedRunWorker;
   const child = spawnWorker(cwd, job.id);
   const workerPid = child?.pid ?? null;
   if (workerPid != null) {
+    // `request` here stays verbatim, unlike the upsertJob call above: this
+    // patch only reaches the job FILE (patchJobIfActive's index projection in
+    // state.mjs never carries a `request` key), so redacting it here would
+    // just overwrite the job file's real values with "[redacted]" and starve
+    // the detached worker of the env it needs to run.
     patchJobIfActive(job.workspaceRoot, job.id, {
       status: "queued",
       phase: "queued",

@@ -234,8 +234,15 @@ export function getSessionRuntimeStatus() {
 
 export function enrichJob(job, options = {}) {
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
+  // `request` (the queued env/prompt payload) is dropped here rather than
+  // merely redacted: nothing in render.mjs or the status/show payloads reads
+  // it, and buildStatusSnapshot/buildSingleJobSnapshot serialize this object
+  // straight to `--json` output. The detached worker never goes through
+  // enrichJob - it reads jobs/<id>.json directly via readStoredJob - so this
+  // cannot starve it of the real values.
+  const { request: _omittedRequest, ...jobWithoutRequest } = job;
   const enriched = {
-    ...job,
+    ...jobWithoutRequest,
     kindLabel: getJobTypeLabel(job),
     progressPreview:
       job.status === "queued" || job.status === "running" || job.status === "failed"

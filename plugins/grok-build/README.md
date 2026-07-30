@@ -91,10 +91,12 @@ goes before you use it that way:
 - A **`--background`** run is different: the whole resolved request — including every
   `--env` value, in plaintext — is written to `<stateDir>/jobs/<run-id>.json` so the
   detached worker can read it back and start the process with it. That file is not
-  encrypted. The redaction that hides a sensitive-looking key (one ending in `token`,
-  `secret`, `key`, `password`, `passwd`, `credential`, or `pat`) applies only to what a run
-  *displays* — the run header and `--json` output — not to the queued request a background
-  job actually needs to execute.
+  encrypted. The shared run index (`<stateDir>/state.json`) — which backs `runs --json`
+  and `show --json` — only ever gets a redacted copy of that request; a sensitive-looking
+  key (one containing `token`, `secret`, `key`, `pass`, `passwd`, `password`, `passphrase`,
+  `credential`, `cred`, `pat`, `dsn`, or `auth`, anywhere in the name, delimited by `_` or
+  a boundary) is replaced with `[redacted]` before it ever reaches the index or a run's
+  own display.
 - Do not pass a long-lived credential through `--env` on a `--background` run unless you
   trust the plugin's state directory (and anything that backs it up) as much as you trust
   your shell's own environment.

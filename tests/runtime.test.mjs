@@ -16,6 +16,7 @@ import {
   upsertJob,
   writeJobFile
 } from "../plugins/grok-build/scripts/lib/state.mjs";
+import { buildSingleJobSnapshot, buildStatusSnapshot, readStoredJob } from "../plugins/grok-build/scripts/lib/job-control.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "grok-build");
@@ -563,6 +564,134 @@ function readStoredJobFromDisk(workspaceRoot, jobId) {
   }
   return JSON.parse(fs.readFileSync(jobFile, "utf8"));
 }
+
+// D2: SENSITIVE_ENV_KEY_PATTERN must match the sensitive word anywhere in the
+// key (delimited by `_` or a boundary), not just as a suffix - the
+// Android/Steam signing vocabulary that is --env's headline Godot use case
+// (KEYSTORE_PASS, STEAM_PASS, SECRET_KEY_BASE, SIGNING_KEY_ALIAS) all put the
+// sensitive word in the middle of the name. It must also stop over-matching
+// names that merely end in the same letters (NODEJS_COMPAT, MONKEY).
+test("redactEnvForRecord catches signing-credential key spellings without over-matching lookalikes", async () => {
+  const { redactEnvForRecord } = await import("../plugins/grok-build/scripts/grok-bridge.mjs");
+
+  const shouldRedact = [
+    "KEYSTORE_PASS",
+    "ANDROID_KEYSTORE_PASSWORD",
+    "SECRET_KEY_BASE",
+    "STEAM_PASS",
+    "KEY_PASSPHRASE",
+    "SIGNING_KEY_ALIAS",
+    "SENTRY_DSN",
+    "XAI_API_KEY",
+    "MY_PAT"
+  ];
+  const shouldNotRedact = [
+    "NODEJS_COMPAT",
+    "MONKEY",
+    "WRANGLER_COMPAT",
+    // `url` is deliberately excluded: redacting it would hide ordinary,
+    // non-secret URLs the user would want to see in the run record.
+    "DATABASE_URL"
+  ];
+
+  const overrides = {};
+  for (const key of [...shouldRedact, ...shouldNotRedact]) {
+    overrides[key] = `value-for-${key}`;
+  }
+  const record = redactEnvForRecord(overrides);
+
+  for (const key of shouldRedact) {
+    assert.equal(record[key], "[redacted]", `expected ${key} to be redacted`);
+  }
+  for (const key of shouldNotRedact) {
+    assert.equal(record[key], `value-for-${key}`, `expected ${key} to pass through unredacted`);
+  }
+});
+
+// D1+D2 shared regression test. A background --env value must survive intact
+// in the job file the detached worker reads (jobs/<id>.json), and must be
+// redacted everywhere the state index is ever displayed back to the user:
+// listJobs (state.json), buildStatusSnapshot, and buildSingleJobSnapshot -
+// all reachable from `runs --json` / `show --json`, which echo straight back
+// into the Claude Code transcript.
+test("a signing-credential --env value is redacted in the shared index but intact in the job file", async () => {
+  const { enqueueBackgroundJob } = await import("../plugins/grok-build/scripts/grok-bridge.mjs");
+  const repo = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+
+  const SECRET_VALUE = "hunter2-supersecret-signing-password";
+  const NON_SECRET_VALUE = "release";
+
+  // buildStatusSnapshot filters its whole job list by session id (so one
+  // Claude Code session doesn't see another's runs). Pin both the job and the
+  // read side to the same fixed id so the test is deterministic regardless of
+  // whether GROK_CC_SESSION_ID happens to be set in the ambient environment.
+  const sessionId = "grok-build-test-session";
+  const statusOptions = { sessionId };
+
+  try {
+    const job = {
+      id: generateJobId("run"),
+      kind: "task",
+      kindLabel: "delegate",
+      title: "Grok Build Delegate",
+      workspaceRoot: repo,
+      jobClass: "task",
+      summary: "background env redaction",
+      write: false,
+      sessionId
+    };
+    const request = {
+      kind: "task",
+      cwd: repo,
+      prompt: "sign the build",
+      write: false,
+      resumeLast: false,
+      jobId: job.id,
+      env: { KEYSTORE_PASS: SECRET_VALUE, BUILD_CHANNEL: NON_SECRET_VALUE }
+    };
+
+    enqueueBackgroundJob(repo, job, request, {
+      spawnWorker() {
+        return { pid: 424242 };
+      }
+    });
+
+    // The job file is the detached worker's actual input (readStoredJob ==
+    // resolveJobFile). It must keep the real value.
+    const stored = readStoredJob(repo, job.id);
+    assert.equal(stored.request.env.KEYSTORE_PASS, SECRET_VALUE, "worker must read the real value from the job file");
+    assert.equal(stored.request.env.BUILD_CHANNEL, NON_SECRET_VALUE);
+
+    // The shared index (state.json, via listJobs) must never hold the raw value.
+    const indexed = listJobs(repo).find((entry) => entry.id === job.id);
+    assert.ok(indexed, "job must be present in the state index");
+    assert.equal(indexed.request.env.KEYSTORE_PASS, "[redacted]");
+    assert.equal(indexed.request.env.BUILD_CHANNEL, NON_SECRET_VALUE);
+
+    // Nor should the secret ever appear in a `--json`-serializable snapshot.
+    const statusJson = JSON.stringify(buildStatusSnapshot(repo, statusOptions));
+    assert.ok(!statusJson.includes(SECRET_VALUE), "buildStatusSnapshot leaked the secret value");
+
+    const singleJson = JSON.stringify(buildSingleJobSnapshot(repo, job.id));
+    assert.ok(!singleJson.includes(SECRET_VALUE), "buildSingleJobSnapshot leaked the secret value");
+
+    // Defense in depth: enrichJob drops `request` entirely from what these
+    // snapshots surface, since nothing downstream reads it off the index.
+    const snapshot = buildStatusSnapshot(repo, statusOptions);
+    const runningEntry = snapshot.running.find((entry) => entry.id === job.id);
+    assert.ok(runningEntry, "job must appear in the running list");
+    assert.equal(runningEntry.request, undefined);
+  } finally {
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
+});
 
 test("isolated write run patches worktree onto the job before the agent finishes", async () => {
   const repo = makeTempDir("grok-wt-early-");
