@@ -3035,12 +3035,22 @@ async function executeTaskRun(request) {
       created.worktreePath,
       `grok-build ${request.jobId}`
     );
-    // Guarded on the commit actually happening. commitWorktreeChanges returns
-    // {committed:false, sha:HEAD} both when the tree was clean and when
-    // everything staged was an excluded artifact, and diffing HEAD..HEAD in
-    // that state would be a wasted git call - but the EMPTY manifest is still
-    // the answer, and is rendered as such rather than omitted.
-    if (committed.committed) {
+    // The manifest is `baseSha..HEAD`, NOT "what the bridge just committed".
+    //
+    // This used to be gated on `committed.committed`, which quietly reported an
+    // empty change set for the one case that matters most: an agent that commits
+    // its own work inside the worktree. commitWorktreeChanges then finds a clean
+    // tree and returns {committed:false, sha:HEAD} - indistinguishable, under the
+    // old gate, from a run that produced nothing. Observed live on a run that
+    // made three commits and 17 file changes and was recorded as `total: 0`;
+    // under the completed-noop rule that would now downgrade a perfectly good
+    // run to a no-op. Compare the SHAs instead: HEAD moving off the base is the
+    // only reliable evidence that this run produced commits, whoever made them.
+    //
+    // A commit that FAILED is left as null (unknown), never as an empty set:
+    // the work is still on disk in the worktree and "changed nothing" would be a
+    // lie about it.
+    if (committed.sha && committed.sha !== created.baseSha) {
       const listed = listCommittedChanges(created.worktreePath, created.baseSha, committed.sha);
       // A diff that failed is NOT an empty change set - reporting "none" for it
       // would claim the run produced nothing when nobody managed to look.

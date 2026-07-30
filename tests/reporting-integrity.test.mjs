@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import { spawnSync } from "node:child_process";
 import assert from "node:assert/strict";
 import test from "node:test";
 
@@ -16,6 +18,10 @@ import {
 } from "../plugins/grok-build/scripts/lib/render.mjs";
 import { claimJobTerminal, isTerminalJobStatus, listJobs, upsertJob, writeJobFile } from "../plugins/grok-build/scripts/lib/state.mjs";
 import { decideCompletionStatus } from "../plugins/grok-build/scripts/lib/tracked-jobs.mjs";
+import {
+  commitWorktreeChanges,
+  listCommittedChanges
+} from "../plugins/grok-build/scripts/lib/worktree.mjs";
 import { makeTempDir } from "./helpers.mjs";
 
 function withPluginData(fn) {
@@ -453,3 +459,54 @@ test("pay-per-token model is refused without GROK_BUILD_ALLOW_PAY_PER_TOKEN", ()
   assert.match(`${result.stderr}\n${result.stdout}`, /GROK_BUILD_ALLOW_PAY_PER_TOKEN=1/);
 });
 
+
+// --- 12. Agent-committed worktrees are not no-ops ---
+
+test("an agent that commits inside the worktree is not reported as a no-op", () => {
+  // Regression: the manifest used to be gated on the BRIDGE making the commit.
+  // An agent that ran `git commit` itself left a clean tree, commitWorktreeChanges
+  // returned {committed:false, sha:HEAD}, and the run was recorded as changing
+  // nothing - which decideCompletionStatus now turns into completed-noop.
+  const dir = makeTempDir("agent-commit");
+  const run = (args) => {
+    const result = spawnSync("git", args, { cwd: dir, encoding: "utf8" });
+    assert.equal(result.status, 0, `git ${args.join(" ")}: ${result.stderr}`);
+    return result.stdout.trim();
+  };
+
+  run(["init", "-q"]);
+  run(["config", "user.email", "t@example.test"]);
+  run(["config", "user.name", "Test"]);
+  fs.writeFileSync(path.join(dir, "seed.txt"), "seed\n");
+  run(["add", "-A"]);
+  run(["commit", "-qm", "base"]);
+  const baseSha = run(["rev-parse", "HEAD"]);
+
+  // The agent's own commit, exactly as a real run leaves it.
+  fs.writeFileSync(path.join(dir, "added.txt"), "work\n");
+  run(["add", "-A"]);
+  run(["commit", "-qm", "agent work"]);
+  const headSha = run(["rev-parse", "HEAD"]);
+
+  // The bridge finds nothing left to stage...
+  const committed = commitWorktreeChanges(dir, "bridge sweep");
+  assert.equal(committed.committed, false);
+  assert.equal(committed.sha, headSha);
+
+  // ...but the range still names the work, and that is what the manifest uses.
+  const listed = listCommittedChanges(dir, baseSha, committed.sha);
+  assert.equal(listed.total, 1);
+  assert.ok(listed.entries[0].endsWith("added.txt"));
+
+  assert.equal(
+    decideCompletionStatus({
+      exitStatus: 0,
+      stopReason: "EndTurn",
+      write: true,
+      changedFileCount: listed.total,
+      toolCallCount: 4,
+      verified: true
+    }),
+    "completed"
+  );
+});
