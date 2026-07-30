@@ -46,6 +46,36 @@ so a run cannot claim success without it having passed.
 - A run whose verification never passes is reported **`completed-unverified`**, never as
   success.
 
+### Where the verify plan comes from
+
+You no longer have to pass `--verify` for a run to be verified. The bridge resolves the plan
+itself, in this order, and prints the resolved list and its source in the run's output:
+
+1. `--verify` flags you typed (these win outright)
+2. `verify` in the project's `.grok-build.json` — **only once you have trusted that file**
+3. defaults for the detected ecosystem (Godot, Blender, Rust, Python, Node)
+
+`--no-verify` opts out entirely. `node scripts/grok-bridge.mjs verify-plan` prints what would run
+without running any of it.
+
+### `.grok-build.json` and the trust gate
+
+A `.grok-build.json` at the repo root can set `verify`, `verifyAttempts`, `isolate`, `model`,
+`effort`, budget limits, and timeouts. Everything that cannot execute code is honoured
+immediately.
+
+`verify`, `tools`, and `env` are different: those strings are handed to `cmd.exe` / `sh`, and the
+file is tracked in the repository. Honouring them straight out of a clone would mean that cloning
+someone's repo and running `/grok-build:delegate` executes commands they chose. So they are
+**withheld until you trust the file**:
+
+    node scripts/grok-bridge.mjs trust-config
+
+`/grok-build:doctor` prints the withheld commands verbatim so you can read them first. Trust is
+recorded against the file's sha256 in the plugin's state directory — outside the repository, so a
+clone cannot ship its own trust record, and any later edit to the file withdraws it automatically.
+`trust-config --revoke` withdraws it by hand.
+
 ## Requirements
 
 - Node.js >= 18.18
@@ -75,6 +105,7 @@ so a run cannot claim success without it having passed.
 | --- | --- |
 | `--verify <cmd>` | Command that must pass before the run counts as done (repeatable) |
 | `--verify-attempts <n>` | Fix-and-recheck cycles allowed (default 2) |
+| `--no-verify` | Run nothing, even when a config or ecosystem plan exists |
 | `--no-isolate` | Edit the working tree directly instead of using a worktree |
 | `--max-duration <seconds>` | Stop the run after a wall-clock limit |
 | `--max-turns <n>` | Cap agent turns (passed through to the CLI) |

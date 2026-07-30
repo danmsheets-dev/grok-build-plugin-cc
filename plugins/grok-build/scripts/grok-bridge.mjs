@@ -40,7 +40,17 @@ import {
   resolveResultJob,
   sortJobsNewestFirst
 } from "./lib/job-control.mjs";
+import { defaultVerifyCommands, detectPrimaryEcosystem } from "./lib/ecosystem.mjs";
 import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
+import {
+  describeVerifySource,
+  loadWorkspaceProjectConfig,
+  PROJECT_CONFIG_FILENAME,
+  recordProjectConfigTrust,
+  resolveIsolateSetting,
+  resolveRunSettings,
+  revokeProjectConfigTrust
+} from "./lib/project-config.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { planWorktreeLinks, provisionWorktree } from "./lib/provision.mjs";
 import {
@@ -116,6 +126,8 @@ function printUsage() {
       "Usage:",
       "  node scripts/grok-bridge.mjs check [--json]",
       "  node scripts/grok-bridge.mjs doctor [--json]",
+      "  node scripts/grok-bridge.mjs verify-plan [--verify <command>] [--no-verify] [--json]",
+      "  node scripts/grok-bridge.mjs trust-config [--revoke] [--json]",
       "  node scripts/grok-bridge.mjs prune [--apply] [--include-unlanded] [--json]",
       "  node scripts/grok-bridge.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <low|medium|high>]",
       "  node scripts/grok-bridge.mjs critique [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <low|medium|high>] [focus text]",
@@ -142,6 +154,101 @@ function resolveVerifyAttempts(raw) {
   const verifyAttempts =
     Number.isFinite(parsed) && Number.isInteger(parsed) && parsed >= 1 ? parsed : 2;
   return verifyAttempts;
+}
+
+// The one command that grants a project config's executable keys. Printed
+// verbatim by doctor and by the run header, so it must stay copy-pasteable and
+// must stay in one place - a hint the user cannot run is not a trust gate, it
+// is a dead end.
+const TRUST_CONFIG_COMMAND = "node scripts/grok-bridge.mjs trust-config";
+
+/**
+ * Everything a run needs to know about this project before it starts: the
+ * config file (with its trust verdict already applied), the detected
+ * ecosystem, and the resolved settings.
+ *
+ * Resolution happens HERE - server-side, in the bridge - rather than in the
+ * delegate subagent. The subagent makes exactly one Bash call by design (both
+ * agents/grok-delegate.md and the delegate skill state that twice, for
+ * prompt-injection reasons), so a second "ask the bridge for a plan, then
+ * re-serialise N --verify flags" round trip is not available to it, and would
+ * put an LLM in charge of re-quoting command strings. Resolving here covers
+ * foreground runs, --background, and a bare `run` from the CLI at once.
+ *
+ * @param {string} workspaceRoot
+ * @param {object} [cli] already-shaped CLI settings (see cliSettingsFromTaskOptions)
+ */
+function resolveProjectRunPlan(workspaceRoot, cli = {}) {
+  const projectConfig = loadWorkspaceProjectConfig(workspaceRoot);
+  const ecosystem = detectPrimaryEcosystem(workspaceRoot);
+  // tools.* is an executable key, so it only reaches this call at all when the
+  // config file is trusted; loadWorkspaceProjectConfig has already withheld it
+  // otherwise.
+  const toolOverride = ecosystem ? projectConfig.config.tools?.[ecosystem.id] : undefined;
+  const ecosystemVerify = defaultVerifyCommands(ecosystem, { override: toolOverride });
+
+  const settings = resolveRunSettings({
+    cli,
+    config: projectConfig.config,
+    ecosystemDefaults: { verify: ecosystemVerify }
+  });
+
+  return { projectConfig, ecosystem, settings };
+}
+
+/**
+ * The CLI half of the precedence chain, in the shape resolveRunSettings wants.
+ *
+ * `verify` is passed as `undefined` when the flag was absent rather than as
+ * the `[]` normalizeVerifyCommands would produce, because those two are not
+ * the same thing here: `[]` from an absent flag must let the config and the
+ * ecosystem defaults through, while a value the user actually typed must win.
+ */
+function cliSettingsFromTaskOptions(options = {}) {
+  return {
+    verify: options.verify === undefined ? undefined : normalizeVerifyCommands(options.verify),
+    noVerify: Boolean(options["no-verify"]),
+    verifyAttempts: options["verify-attempts"],
+    maxDurationSeconds: options["max-duration"],
+    maxTurns: options["max-turns"],
+    maxCostUsd: options["max-cost"],
+    model: options.model,
+    effort: options.effort
+  };
+}
+
+/**
+ * The resolved verify plan, as reported by `verify-plan` and echoed in the run
+ * header. Spawns nothing and reads nothing but the project's own files.
+ */
+function buildVerifyPlanPayload({ projectConfig, ecosystem, settings }) {
+  return {
+    ecosystem: ecosystem
+      ? {
+          id: ecosystem.id,
+          major: ecosystem.major ?? null,
+          testRunner: ecosystem.testRunner ?? null
+        }
+      : null,
+    commands: settings.verify,
+    source: settings.sources.verify,
+    disabled: Boolean(settings.verifyDisabled),
+    // The no-baseline floor, which is what the first command of a run gets
+    // when the probe has nothing to say about it. Item 7 makes the floor,
+    // cap, and multiplier themselves resolvable; until then reporting the
+    // derived value is the honest number rather than the config's wish.
+    timeoutSeconds: Math.round(deriveVerifyTimeoutMs(null) / 1000),
+    trusted: projectConfig.present ? projectConfig.trusted : null,
+    config: {
+      present: projectConfig.present,
+      path: projectConfig.path,
+      trusted: projectConfig.trusted,
+      withheld: Object.keys(projectConfig.untrusted),
+      errors: projectConfig.errors,
+      warnings: projectConfig.warnings
+    },
+    trustCommand: Object.keys(projectConfig.untrusted).length > 0 ? TRUST_CONFIG_COMMAND : null
+  };
 }
 
 // Wording matters here: this text is the only explanation the user gets for a
@@ -277,14 +384,17 @@ async function runHeadlessAgentWithDurationBudget(runCwd, agentOptions, maxDurat
   return { result: raced.result, timedOut: false };
 }
 
-function resolveIsolateOption(options, write) {
-  if (options["no-isolate"]) {
-    return false;
-  }
-  if (options.isolate) {
-    return true;
-  }
-  return Boolean(write);
+// configIsolate is the project config's `isolate`, and sits between the two
+// explicit flags and the write-implies-isolate default. --no-isolate stays an
+// absolute override rather than just the top of a precedence chain: a user who
+// typed it must get a non-isolated run even when the repo asks for isolation.
+function resolveIsolateOption(options, write, configIsolate = undefined) {
+  return resolveIsolateSetting({
+    cliIsolate: Boolean(options.isolate),
+    cliNoIsolate: Boolean(options["no-isolate"]),
+    configIsolate,
+    write
+  });
 }
 
 function buildBoundedVerifyFixPrompt(command, output) {
@@ -461,12 +571,75 @@ function renderDoctorReport(report) {
   for (const check of report.checks) {
     const mark = check.ok ? "ok" : "FAIL";
     lines.push(`- [${mark}] ${check.name}: ${check.detail}`);
+    // Verbatim, one per line, unwrapped and unshortened. This is the only
+    // place a user gets to read what a repo-tracked config would have this
+    // machine execute, so paraphrasing or truncating it would defeat the
+    // whole trust gate.
+    for (const command of check.commands ?? []) {
+      lines.push(`    ${command}`);
+    }
     if (!check.ok && check.fix) {
       lines.push(`    Fix: ${check.fix}`);
     }
   }
 
   return `${lines.join("\n").trimEnd()}\n`;
+}
+
+/**
+ * The project-config check. This is the visibility half of the trust gate:
+ * a config file that wants to run commands is reported as needing attention,
+ * its commands are printed verbatim, and the exact command that grants them is
+ * named. Without this, "your verify was silently ignored" is indistinguishable
+ * from "you have no config".
+ */
+function buildProjectConfigCheck(workspaceRoot) {
+  const loaded = loadWorkspaceProjectConfig(workspaceRoot);
+
+  if (!loaded.present) {
+    return {
+      name: "project config",
+      ok: true,
+      detail: `no ${PROJECT_CONFIG_FILENAME}`,
+      fix: null
+    };
+  }
+
+  if (loaded.errors.length > 0) {
+    return {
+      name: "project config",
+      ok: false,
+      detail: loaded.errors.join("; "),
+      fix: `Fix ${loaded.path} - until it parses, none of its settings apply.`
+    };
+  }
+
+  const withheld = Object.keys(loaded.untrusted);
+  if (withheld.length === 0) {
+    const suffix = loaded.trusted ? " (trusted)" : "";
+    return {
+      name: "project config",
+      ok: true,
+      detail: `${PROJECT_CONFIG_FILENAME} loaded, no executable keys${suffix}`,
+      fix: null
+    };
+  }
+
+  const commands = [...(loaded.untrusted.verify ?? [])];
+  for (const [tool, binary] of Object.entries(loaded.untrusted.tools ?? {})) {
+    commands.push(`tools.${tool} = ${binary}`);
+  }
+  for (const [name, value] of Object.entries(loaded.untrusted.env ?? {})) {
+    commands.push(`env.${name} = ${value}`);
+  }
+
+  return {
+    name: "project config",
+    ok: false,
+    detail: `${withheld.join(", ")} in ${PROJECT_CONFIG_FILENAME} is withheld until you trust this file - it would run:`,
+    commands,
+    fix: `Read the commands above. If you wrote them (or trust whoever did), run \`${TRUST_CONFIG_COMMAND}\`.`
+  };
 }
 
 function buildDoctorReport(cwd) {
@@ -536,6 +709,9 @@ function buildDoctorReport(cwd) {
   });
 
   const workspaceRoot = resolveWorkspaceRoot(cwd);
+
+  checks.push(buildProjectConfigCheck(workspaceRoot));
+
   const jobs = listJobs(workspaceRoot);
   const abandoned = jobs.filter((job) => classifyJobLiveness(job).abandoned);
   checks.push({
@@ -628,6 +804,125 @@ async function handleDoctor(argv) {
   if (!report.ok) {
     process.exitCode = 0;
   }
+}
+
+function renderVerifyPlan(payload) {
+  const lines = [
+    "# Grok Build Verify Plan",
+    "",
+    `Ecosystem: ${payload.ecosystem ? payload.ecosystem.id : "none detected"}`,
+    `Source: ${describeVerifySource(payload.source)}`
+  ];
+
+  if (payload.disabled) {
+    lines.push("Verification is disabled for this run (--no-verify).");
+  } else if (payload.commands.length === 0) {
+    lines.push("No verify commands resolved; a run would not verify anything.");
+  } else {
+    lines.push(`Timeout per command (no baseline): ${payload.timeoutSeconds}s`, "", "Commands:");
+    for (const command of payload.commands) {
+      lines.push(`  ${command}`);
+    }
+  }
+
+  for (const message of payload.config.errors) {
+    lines.push("", message);
+  }
+  if (payload.config.withheld.length > 0) {
+    lines.push(
+      "",
+      `${payload.config.withheld.join(", ")} in ${PROJECT_CONFIG_FILENAME} is withheld until you trust that file.`,
+      `Trust it with: ${payload.trustCommand}`
+    );
+  }
+
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+/**
+ * `verify-plan` - read-only. It resolves what a run WOULD verify and why, and
+ * that is all: it spawns nothing, runs no verify command, and touches no
+ * network. It exists for doctor/debug visibility. It is deliberately NOT a
+ * step the delegate subagent performs (see resolveProjectRunPlan).
+ */
+async function handleVerifyPlan(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "verify"],
+    repeatableOptions: ["verify"],
+    booleanOptions: ["json", "no-verify"]
+  });
+
+  const workspaceRoot = resolveCommandWorkspace(options);
+  const plan = resolveProjectRunPlan(workspaceRoot, cliSettingsFromTaskOptions(options));
+  const payload = buildVerifyPlanPayload(plan);
+  outputResult(options.json ? payload : renderVerifyPlan(payload), options.json);
+}
+
+function renderTrustConfigResult(payload) {
+  if (payload.revoked) {
+    return `Trust for ${payload.path} revoked. Its verify/tools/env keys are withheld again.\n`;
+  }
+  if (!payload.recorded) {
+    return `Nothing to trust: ${payload.detail}\n`;
+  }
+
+  const lines = [`Trusted ${payload.path} (sha256 ${payload.hash.slice(0, 12)}).`];
+  if (payload.verify.length > 0) {
+    lines.push("", "Runs in this workspace may now execute:");
+    for (const command of payload.verify) {
+      lines.push(`  ${command}`);
+    }
+  }
+  lines.push(
+    "",
+    "Editing the file revokes this automatically - trust is recorded for its exact contents."
+  );
+  return `${lines.join("\n")}\n`;
+}
+
+/**
+ * `trust-config` - the one action that grants a project config's executable
+ * keys. Trust is recorded against the file's sha256, in the plugin's state dir
+ * (keyed by workspace root, outside the repository), so it cannot be shipped
+ * inside a clone and any later edit to the file silently withdraws it.
+ */
+async function handleTrustConfig(argv) {
+  const { options } = parseCommandInput(argv, {
+    valueOptions: ["cwd"],
+    booleanOptions: ["json", "revoke"]
+  });
+
+  const workspaceRoot = resolveCommandWorkspace(options);
+
+  if (options.revoke) {
+    revokeProjectConfigTrust(workspaceRoot);
+    const payload = {
+      revoked: true,
+      recorded: false,
+      path: path.join(workspaceRoot, PROJECT_CONFIG_FILENAME)
+    };
+    outputCommandResult(payload, renderTrustConfigResult(payload), options.json);
+    return;
+  }
+
+  const result = recordProjectConfigTrust(workspaceRoot);
+  const payload = {
+    revoked: false,
+    recorded: result.recorded,
+    path: result.loaded.path,
+    hash: result.hash ?? null,
+    detail: result.recorded
+      ? "trusted"
+      : result.reason === "no-config"
+        ? `there is no ${PROJECT_CONFIG_FILENAME} in this workspace`
+        : `${PROJECT_CONFIG_FILENAME} could not be read`,
+    // Reported from the pre-trust view, which is the set of keys this call
+    // actually unlocked.
+    verify: result.loaded.untrusted.verify ?? [],
+    tools: result.loaded.untrusted.tools ?? {},
+    errors: result.loaded.errors
+  };
+  outputCommandResult(payload, renderTrustConfigResult(payload), options.json);
 }
 
 function collectPrunePlan(cwd, options = {}) {
@@ -1007,6 +1302,10 @@ async function executeTaskRun(request) {
   const isolate = Boolean(request.isolate);
   const verifyCommands = normalizeVerifyCommands(request.verifyCommands);
   const verifyAttempts = resolveVerifyAttempts(request.verifyAttempts);
+  // Resolved by handleTask (or absent, for a caller that passed an explicit
+  // command list of its own). Purely descriptive - the plan is already baked
+  // into verifyCommands by the time it gets here.
+  const verifyPlan = request.verifyPlan ?? null;
   const maxDurationSeconds = resolveMaxDurationSeconds(request.maxDurationSeconds);
   const maxTurns = resolveMaxTurns(request.maxTurns);
   const maxCostUsd = resolveMaxCostUsd(request.maxCostUsd);
@@ -1307,6 +1606,12 @@ async function executeTaskRun(request) {
           write,
           verified,
           verifyNote,
+          // The visibility half of the item-4 trust story: a run that verifies
+          // commands the user never typed has to say which commands, and where
+          // they came from, in the same block that reports the verdict.
+          verifyCommands,
+          verifyPlan,
+          verifyTrustCommand: TRUST_CONFIG_COMMAND,
           baselineProbeMs,
           baselineProbeCommands: baselines.length,
           worktree,
@@ -1316,6 +1621,10 @@ async function executeTaskRun(request) {
 
   const verify = {
     commands: verifyCommands,
+    // Where the command list came from - cli, the project config, an ecosystem
+    // default, or nothing. Persisted because "why did this run verify that?"
+    // is otherwise unanswerable after the fact.
+    plan: verifyPlan,
     attempts: attempt,
     note: verifyNote,
     // The probe is now unconditional, so on a non-isolated run it doubles the
@@ -1440,6 +1749,7 @@ function buildTaskRequest({
   jobId,
   isolate = false,
   verifyCommands = [],
+  verifyPlan = null,
   verifyAttempts = 2,
   maxDurationSeconds = null,
   maxTurns = null,
@@ -1455,6 +1765,10 @@ function buildTaskRequest({
     jobId,
     isolate,
     verifyCommands,
+    // Carried through so a background run's header can say where its plan came
+    // from. The commands themselves are already concrete by this point - the
+    // worker resolves nothing.
+    verifyPlan,
     verifyAttempts,
     maxDurationSeconds,
     maxTurns,
@@ -1650,7 +1964,20 @@ async function handleTask(argv) {
       "max-cost"
     ],
     repeatableOptions: ["verify"],
-    booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background", "isolate", "no-isolate"],
+    booleanOptions: [
+      "json",
+      "write",
+      "resume-last",
+      "resume",
+      "fresh",
+      "background",
+      "isolate",
+      // The opt-out from an auto-resolved plan. Without it, a user in a Godot
+      // or Blender repo has no way to say "run nothing" now that a plan is
+      // resolved from the project rather than only from the flags they typed.
+      "no-verify",
+      "no-isolate"
+    ],
     aliasMap: {
       m: "model"
     }
@@ -1658,8 +1985,6 @@ async function handleTask(argv) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const model = options.model ? String(options.model).trim() : null;
-  const effort = normalizeReasoningEffort(options.effort);
   const prompt = readTaskPrompt(cwd, options, positionals);
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
@@ -1668,12 +1993,36 @@ async function handleTask(argv) {
     throw new Error("Choose either --resume/--resume-last or --fresh.");
   }
   const write = Boolean(options.write);
-  const isolate = resolveIsolateOption(options, write);
-  const verifyCommands = normalizeVerifyCommands(options.verify);
-  const verifyAttempts = resolveVerifyAttempts(options["verify-attempts"]);
-  const maxDurationSeconds = resolveMaxDurationSeconds(options["max-duration"]);
-  const maxTurns = resolveMaxTurns(options["max-turns"]);
-  const maxCostUsd = resolveMaxCostUsd(options["max-cost"]);
+
+  // Resolved from the workspace root, and BEFORE any worktree exists, so that
+  // buildTaskRequest serialises a concrete command list into a background
+  // job's record: the detached worker resolves nothing of its own, and a
+  // worktree (which has no .grok-build.json of its own until the commit lands)
+  // cannot change the plan half way through.
+  const { projectConfig, ecosystem, settings } = resolveProjectRunPlan(
+    workspaceRoot,
+    cliSettingsFromTaskOptions(options)
+  );
+
+  // normalizeReasoningEffort still runs on the CLI value first so an
+  // unsupported --effort keeps failing loudly; the config's value has already
+  // been validated by the schema.
+  const model = options.model ? String(options.model).trim() : (settings.model ?? null);
+  const effort = normalizeReasoningEffort(options.effort) ?? settings.effort ?? null;
+  const isolate = resolveIsolateOption(options, write, settings.isolate);
+  const verifyCommands = settings.verify;
+  const verifyPlan = {
+    source: settings.sources.verify,
+    disabled: Boolean(settings.verifyDisabled),
+    ecosystem: ecosystem?.id ?? null,
+    configPresent: projectConfig.present,
+    configTrusted: projectConfig.trusted,
+    configWithheld: Object.keys(projectConfig.untrusted)
+  };
+  const verifyAttempts = resolveVerifyAttempts(settings.verifyAttempts);
+  const maxDurationSeconds = resolveMaxDurationSeconds(settings.maxDurationSeconds);
+  const maxTurns = resolveMaxTurns(settings.maxTurns);
+  const maxCostUsd = resolveMaxCostUsd(settings.maxCostUsd);
   const taskMetadata = buildTaskRunMetadata({
     prompt,
     resumeLast
@@ -1696,6 +2045,7 @@ async function handleTask(argv) {
         jobId: job.id,
         isolate,
         verifyCommands,
+        verifyPlan,
         verifyAttempts,
         maxDurationSeconds,
         maxTurns,
@@ -1721,6 +2071,7 @@ async function handleTask(argv) {
         jobId: job.id,
         isolate,
         verifyCommands,
+        verifyPlan,
         verifyAttempts,
         maxDurationSeconds,
         maxTurns,
@@ -2137,6 +2488,12 @@ async function main() {
       break;
     case "doctor":
       await handleDoctor(argv);
+      break;
+    case "verify-plan":
+      await handleVerifyPlan(argv);
+      break;
+    case "trust-config":
+      await handleTrustConfig(argv);
       break;
     case "prune":
       await handlePrune(argv);

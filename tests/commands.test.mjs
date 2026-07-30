@@ -145,6 +145,24 @@ test("runtime skill only forwards run once", () => {
   assert.match(resultHandling, /if Grok was never successfully invoked, do not generate a substitute answer at all/i);
 });
 
+test("the delegate command documents that verification is automatic", () => {
+  const delegate = read(path.join("commands", "delegate.md"));
+
+  assert.match(delegate, /[Vv]erification is automatic when a plan exists/);
+  assert.match(delegate, /\.grok-build\.json/, "the config source must be named");
+  assert.match(delegate, /trust-config/, "the trust gate must be documented");
+  assert.match(delegate, /--no-verify/, "the opt-out must be documented");
+
+  // The mechanism, not just the outcome: the plan is resolved server-side, so
+  // the subagent must NOT be told to look one up and re-serialise --verify
+  // flags. That would break the single-Bash-call invariant this file and the
+  // agent state twice for prompt-injection reasons, and would put an LLM in
+  // charge of re-quoting command strings.
+  assert.match(delegate, /does not construct `--verify`/i);
+  assert.match(delegate, /must not make a second `Bash` call/i);
+  assert.match(delegate, /one `Bash` call/);
+});
+
 test("the delegate subagent never chooses background on its own", () => {
   const agent = read(path.join("agents", "grok-delegate.md"));
   assert.match(

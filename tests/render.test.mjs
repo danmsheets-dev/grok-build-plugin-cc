@@ -205,6 +205,92 @@ test("renderTaskResult still explains a plain verification failure without a not
   assert.match(output, /Verified: no - verification did not pass within the attempt budget/);
 });
 
+test("renderTaskResult echoes a verify plan the user never typed, and names its source", () => {
+  // Not cosmetic. A run can now verify commands resolved from a detected
+  // ecosystem or from .grok-build.json, so the run's own output is the only
+  // place a user learns what ran and who chose it.
+  const output = renderTaskResult(
+    { rawOutput: "Did the work." },
+    {
+      title: "Grok Build Delegate",
+      verified: true,
+      verifyCommands: ["godot --headless --path . --import", "godot --headless --path . --quit-after 1"],
+      verifyPlan: { source: "ecosystem-default", ecosystem: "godot", configWithheld: [] }
+    }
+  );
+  assert.match(output, /Verify plan \(ecosystem default, godot\):/);
+  assert.match(output, /godot --headless --path \. --import/);
+  assert.match(output, /godot --headless --path \. --quit-after 1/);
+});
+
+test("renderTaskResult labels a plan the user typed as --verify", () => {
+  // Guards the label map in render.mjs against drift from describeVerifySource
+  // in project-config.mjs, which it deliberately mirrors rather than imports.
+  const output = renderTaskResult(
+    { rawOutput: "Did the work." },
+    {
+      title: "Grok Build Delegate",
+      verifyCommands: ["npm test"],
+      verifyPlan: { source: "cli", ecosystem: "node", configWithheld: [] }
+    }
+  );
+  assert.match(output, /Verify plan \(--verify\):/);
+});
+
+test("renderTaskResult names .grok-build.json when the plan came from the config file", () => {
+  const output = renderTaskResult(
+    { rawOutput: "Did the work." },
+    {
+      title: "Grok Build Delegate",
+      verified: true,
+      verifyCommands: ["cargo test"],
+      verifyPlan: { source: "config", ecosystem: "rust", configWithheld: [] }
+    }
+  );
+  assert.match(output, /Verify plan \(\.grok-build\.json\):/);
+  assert.doesNotMatch(output, /Verify plan \(\.grok-build\.json, rust\)/);
+});
+
+test("renderTaskResult says when a config's verify list was withheld for want of trust", () => {
+  const output = renderTaskResult(
+    { rawOutput: "Did the work." },
+    {
+      title: "Grok Build Delegate",
+      verifyCommands: [],
+      verifyPlan: { source: "none", ecosystem: null, configWithheld: ["verify", "tools"] },
+      verifyTrustCommand: "node scripts/grok-bridge.mjs trust-config"
+    }
+  );
+  assert.match(output, /verify, tools in \.grok-build\.json was NOT used/);
+  assert.match(output, /not trusted yet/);
+  assert.match(output, /trust-config/);
+});
+
+test("renderTaskResult reports an explicit --no-verify rather than staying silent", () => {
+  const output = renderTaskResult(
+    { rawOutput: "Did the work." },
+    {
+      title: "Grok Build Delegate",
+      verifyCommands: [],
+      verifyPlan: { source: "none", disabled: true, ecosystem: "godot", configWithheld: [] }
+    }
+  );
+  assert.match(output, /Verify plan: disabled for this run \(--no-verify\)\./);
+});
+
+test("renderTaskResult says nothing about a verify plan when there is none", () => {
+  const output = renderTaskResult(
+    { rawOutput: "Did the work." },
+    {
+      title: "Grok Build Delegate",
+      verified: true,
+      verifyCommands: [],
+      verifyPlan: { source: "none", disabled: false, ecosystem: null, configWithheld: [] }
+    }
+  );
+  assert.doesNotMatch(output, /Verify plan/);
+});
+
 test("renderTaskResult reports what the baseline probe cost", () => {
   // The probe is unconditional now, so on a non-isolated run it doubles the
   // verify wall clock. An unexplained doubling is how a safeguard gets

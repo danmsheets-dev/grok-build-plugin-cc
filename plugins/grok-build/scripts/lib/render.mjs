@@ -419,8 +419,61 @@ export function renderNativeReviewResult(result, meta) {
  * renderer read job.status instead of the computed liveness) - a value
  * computed correctly and then never actually reaching the user.
  */
+/**
+ * Labels for a resolved verify plan's origin. Mirrors describeVerifySource in
+ * project-config.mjs rather than importing it: this module has no imports at
+ * all today, and pulling in project-config would drag state.mjs (and fs, os,
+ * crypto) into every consumer of the renderer for four strings.
+ */
+const VERIFY_SOURCE_LABELS = {
+  cli: "--verify",
+  config: ".grok-build.json",
+  "ecosystem-default": "ecosystem default"
+};
+
+/**
+ * Echo the verify plan the run actually used, and where it came from.
+ *
+ * Not cosmetic. As of 0.4.0 a run can verify commands the user never typed -
+ * resolved from .grok-build.json or from a detected Godot/Blender project - so
+ * the only thing standing between "helpful default" and "it ran something I
+ * did not ask for" is saying, in the run's own output, exactly what ran and
+ * which source chose it. It is also how a user learns that a config's verify
+ * list was withheld for want of trust, rather than silently ignored.
+ */
+function pushVerifyPlanLines(lines, meta) {
+  const plan = meta.verifyPlan;
+  if (!plan) {
+    return;
+  }
+
+  const commands = Array.isArray(meta.verifyCommands) ? meta.verifyCommands : [];
+  if (commands.length > 0) {
+    const label = VERIFY_SOURCE_LABELS[plan.source] ?? plan.source ?? "unknown";
+    const scope = plan.ecosystem && plan.source === "ecosystem-default" ? `${label}, ${plan.ecosystem}` : label;
+    lines.push(`Verify plan (${scope}):`);
+    for (const command of commands) {
+      lines.push(`  ${command}`);
+    }
+  } else if (plan.disabled) {
+    lines.push("Verify plan: disabled for this run (--no-verify).");
+  }
+
+  const withheld = Array.isArray(plan.configWithheld) ? plan.configWithheld : [];
+  if (withheld.length > 0) {
+    lines.push(
+      `Project config: ${withheld.join(", ")} in .grok-build.json was NOT used - this file is not trusted yet.`
+    );
+    if (meta.verifyTrustCommand) {
+      lines.push(`  Review it, then trust it with: ${meta.verifyTrustCommand}`);
+    }
+  }
+}
+
 function buildTaskStatusLines(meta = {}) {
   const lines = [];
+
+  pushVerifyPlanLines(lines, meta);
 
   // The baseline probe runs for every verify run now, not just isolated write
   // runs, so on a non-isolated run it is a full extra verify pass. Reporting

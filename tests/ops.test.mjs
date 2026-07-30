@@ -353,3 +353,78 @@ test("doctor reports completed-unverified unlanded work as awaiting land, not pr
   assert.equal(awaiting.ok, false);
   assert.doesNotMatch(awaiting.fix ?? "", /prune/i, "must not recommend the destructive prune remedy");
 });
+
+test("a trusted project config drives verification end to end", () => {
+  const binDir = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const repo = makeTempDir();
+  installFakeGrok(binDir);
+  initGitRepo(repo);
+
+  // Passes unconditionally and needs no binary beyond node, so the assertion
+  // is about WHERE the command came from, not about what it does.
+  const verifyCommand = 'node -e "process.exit(0)"';
+  fs.writeFileSync(
+    path.join(repo, ".grok-build.json"),
+    `${JSON.stringify({ verify: [verifyCommand] }, null, 2)}\n`,
+    "utf8"
+  );
+
+  // Untrusted first: the run must NOT execute a command the user has not
+  // vouched for, even though the file is right there in the repo.
+  const untrusted = run("node", [SCRIPT, "run", "--json", "do something"], {
+    cwd: repo,
+    env: pluginDataEnv(pluginDataDir, binDir)
+  });
+  assert.equal(untrusted.status, 0, untrusted.stderr || untrusted.stdout);
+  const untrustedPayload = JSON.parse(untrusted.stdout);
+  assert.deepEqual(untrustedPayload.verify.commands, []);
+  assert.deepEqual(untrustedPayload.verify.plan.configWithheld, ["verify"]);
+
+  const trust = run("node", [SCRIPT, "trust-config", "--json"], {
+    cwd: repo,
+    env: pluginDataEnv(pluginDataDir, binDir)
+  });
+  assert.equal(trust.status, 0, trust.stderr);
+  assert.equal(JSON.parse(trust.stdout).recorded, true);
+
+  const result = run("node", [SCRIPT, "run", "--json", "do something"], {
+    cwd: repo,
+    env: pluginDataEnv(pluginDataDir, binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(payload.verify.commands, [verifyCommand]);
+  assert.equal(payload.verify.plan.source, "config");
+  assert.equal(payload.verify.plan.configTrusted, true);
+  assert.equal(payload.verified, true, "the config's verify command passes");
+  assert.equal(payload.verify.baselines.length, 1, "the baseline probe covered the resolved command");
+});
+
+test("--no-verify opts out of a trusted config's plan", () => {
+  const binDir = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const repo = makeTempDir();
+  installFakeGrok(binDir);
+  initGitRepo(repo);
+
+  fs.writeFileSync(
+    path.join(repo, ".grok-build.json"),
+    `${JSON.stringify({ verify: ['node -e "process.exit(1)"'] }, null, 2)}\n`,
+    "utf8"
+  );
+  run("node", [SCRIPT, "trust-config"], { cwd: repo, env: pluginDataEnv(pluginDataDir, binDir) });
+
+  const result = run("node", [SCRIPT, "run", "--json", "--no-verify", "do something"], {
+    cwd: repo,
+    env: pluginDataEnv(pluginDataDir, binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(payload.verify.commands, []);
+  assert.equal(payload.verify.plan.disabled, true);
+  // A failing command that never ran must not be able to report a verdict.
+  assert.equal(payload.verified, null);
+});

@@ -37,6 +37,13 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" run-resume-candidate --json
 - If the user chooses a new thread, add `--fresh` before routing to the subagent.
 - If the helper reports `available: false`, do not ask. Route normally.
 
+Verification:
+
+- Verification is automatic when a plan exists. The bridge resolves the verify plan itself, server-side, from `--verify` flags, then the project's `.grok-build.json`, then the detected ecosystem's defaults (Godot, Blender, Rust, Python, Node). The subagent does not construct `--verify` and must not make a second `Bash` call to look one up.
+- A `.grok-build.json` can only contribute verify commands or tool paths after the user has trusted that file with `node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" trust-config`. Until then those keys are withheld and the run says so.
+- To see what would run without running it: `node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" verify-plan`. That is a user/debug aid, not a step the subagent performs.
+- Pass `--no-verify` only when the user explicitly asks for no verification.
+
 Operating rules:
 
 - The subagent is a thin forwarder only. It should use one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" run ...` and return that command's stdout as-is.
