@@ -318,9 +318,18 @@ export function renderSetupReport(report) {
     `- node: ${report.node.detail}`,
     `- grok: ${report.grok.detail}`,
     `- auth: ${report.auth.detail}`,
-    `- session runtime: ${report.sessionRuntime.label}`,
-    ""
+    `- session runtime: ${report.sessionRuntime.label}`
   ];
+  if (report.isolation) {
+    const iso = report.isolation;
+    lines.push(
+      iso.programmatic
+        ? `- isolation: programmatic (${iso.source ?? "unknown"}) — write runs force a worktree` +
+          (iso.allowNoIsolate ? " (GROK_BUILD_ALLOW_NO_ISOLATE=1 set)" : "")
+        : "- isolation: interactive — write runs isolate by default; --no-isolate allowed"
+    );
+  }
+  lines.push("");
 
   if (report.actionsTaken?.length > 0) {
     lines.push("Actions taken:");
@@ -629,7 +638,12 @@ function pushRunDiagnosticLines(lines, meta, rawOutput) {
  * Statuses where "Verified: yes" would be a lie even if the verify loop passed:
  * nothing was proven because the run did no work, saw nothing, or stopped early.
  */
-const VERIFIED_NA_STATUSES = new Set(["completed-noop", "completed-blind", "completed-truncated"]);
+const VERIFIED_NA_STATUSES = new Set([
+  "completed-noop",
+  "completed-blind",
+  "completed-truncated",
+  "isolation-breached"
+]);
 
 function verifiedNaLine(status, stopReason) {
   if (status === "completed-noop") {
@@ -641,6 +655,9 @@ function verifiedNaLine(status, stopReason) {
   if (status === "completed-truncated") {
     const reason = stopReason && String(stopReason).trim() ? String(stopReason).trim() : "early stop";
     return `Verified: n/a - the run stopped early (${reason}).`;
+  }
+  if (status === "isolation-breached") {
+    return "Verified: n/a - isolation was breached; work landed in the main checkout, not the worktree.";
   }
   return null;
 }
@@ -712,6 +729,24 @@ export function buildTaskStatusLines(meta = {}, rawOutput = "") {
   // Before the worktree line on purpose: what changed is the answer to "what
   // did this run do", and the path is only where to go and look at it.
   pushChangedFileLines(lines, meta.changedFiles);
+
+  if (meta.isolationBreached || meta.status === "isolation-breached") {
+    lines.push(
+      "Isolation BREACHED: the agent wrote into the main checkout. That work is in the wrong tree and does not count."
+    );
+    const leaked = meta.isolationLeak?.entries ?? meta.isolationLeak?.paths ?? null;
+    if (Array.isArray(leaked) && leaked.length > 0) {
+      lines.push("Leaked paths (main checkout):");
+      for (const entry of leaked) {
+        lines.push(`  ${entry}`);
+      }
+      if (meta.isolationLeak?.truncated) {
+        lines.push(
+          `  … truncated (${meta.isolationLeak.total} total)`
+        );
+      }
+    }
+  }
 
   if (meta.worktree?.path) {
     lines.push(`Worktree: ${meta.worktree.path} (branch ${meta.worktree.branch ?? "unknown"})`);
@@ -1027,6 +1062,7 @@ export function renderStoredJobResult(job, storedJob) {
 
 export function renderCancelReport(job) {
   const delivered = job.cancelKill?.delivered ?? job.killDelivered;
+  const survivors = job.cancelKill?.survivors ?? job.killSurvivors ?? [];
   const lines = [
     "# Grok Build Stop",
     "",
@@ -1042,8 +1078,23 @@ export function renderCancelReport(job) {
   if (job.summary) {
     lines.push(`- Summary: ${job.summary}`);
   }
+  if (job.killMethod ?? job.cancelKill?.method) {
+    lines.push(`- Kill method: ${job.killMethod ?? job.cancelKill?.method}`);
+  }
+  if (Array.isArray(job.killTargets) && job.killTargets.length > 0) {
+    lines.push(`- Kill targets: ${job.killTargets.join(", ")}`);
+  }
   if (delivered === false) {
     lines.push("- Kill delivered: false (process may still be running).");
+    if (Array.isArray(survivors) && survivors.length > 0) {
+      lines.push(
+        `- Survivors: PID ${survivors.join(", ")}. End them from Task Manager or \`Stop-Process -Id <pid> -Force\`, then re-run stop/prune.`
+      );
+    } else {
+      lines.push(
+        "- Re-check with `/grok-build:runs`. If a process is still alive, end it from Task Manager and re-run stop."
+      );
+    }
   }
   lines.push("- Check `/grok-build:runs` for the updated queue.");
 

@@ -50,23 +50,47 @@ function cleanupSessionJobs(cwd, sessionId) {
   for (const job of sessionJobs) {
     const stillRunning = job.status === "queued" || job.status === "running";
     if (stillRunning) {
+      const killTargets = resolveJobKillTargets(job);
+      const killResults = [];
+      const survivors = [];
+      for (const pid of killTargets) {
+        // terminateProcessTree never throws — a taskkill "could not be
+        // terminated" used to blow past the claim and leave the job running
+        // in the record forever.
+        const outcome = terminateProcessTree(pid);
+        killResults.push({ pid, ...outcome });
+        if (Array.isArray(outcome.survivors) && outcome.survivors.length > 0) {
+          survivors.push(...outcome.survivors);
+        }
+      }
+
+      const killDelivered =
+        killTargets.length === 0 ||
+        (killResults.some((entry) => entry.delivered) && survivors.length === 0);
+
       try {
         claimJobTerminal(workspaceRoot, job.id, "cancelled", {
-          errorMessage: "Stopped by session end.",
+          errorMessage: killDelivered
+            ? "Stopped by session end."
+            : "Stopped by session end; process kill was not confirmed.",
           phase: "cancelled",
           pid: null,
           agentPid: null,
-          bridgePid: null
+          bridgePid: null,
+          // Tombstone when a kill could not be delivered so later prune/doctor
+          // can see which PIDs may still need a human.
+          killTombstone: killDelivered
+            ? null
+            : {
+                at: new Date().toISOString(),
+                survivors: [...new Set(survivors)],
+                method: killResults.map((entry) => entry.method).filter(Boolean).join("+") || null,
+                errorText:
+                  killResults.map((entry) => entry.errorText).filter(Boolean).join("; ") || null
+              }
         });
       } catch {
-      }
-
-      const killTargets = resolveJobKillTargets(job);
-      for (const pid of killTargets) {
-        try {
-          terminateProcessTree(pid);
-        } catch {
-        }
+        // Claim races are fine; the process kill already ran.
       }
     }
   }

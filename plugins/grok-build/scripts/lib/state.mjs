@@ -208,7 +208,11 @@ const TERMINAL_STATUSES = new Set([
   "completed-truncated",
   "completed-noop",
   "completed-blind",
-  "timed-out"
+  "timed-out",
+  // Agent wrote into the main checkout during an isolated run. Terminal and
+  // never success — decideCompletionStatus and the report contract both treat
+  // it as a hard failure of the isolation guarantee.
+  "isolation-breached"
 ]);
 
 export function isTerminalJobStatus(status) {

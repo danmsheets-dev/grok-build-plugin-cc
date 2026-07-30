@@ -21,6 +21,9 @@ import {
   assertModelBillingAllowed,
   buildHeadlessPermissionOptions,
   buildReviewPrompt,
+  buildWorkspaceRootDenyRules,
+  cliSupportsConfine,
+  confineFeatureEnabled,
   DEFAULT_CONTINUE_PROMPT,
   describeMissingBinary,
   detectCliBrand,
@@ -29,6 +32,7 @@ import {
   listGrokModels,
   parseStructuredOutput,
   readOutputSchema,
+  resolveGrokBinary,
   runHeadlessAgent,
   runImport,
   schemaInstructionsFromPath
@@ -40,6 +44,7 @@ import {
   filterJobsForSession,
   getSessionRuntimeStatus,
   readStoredJob,
+  reconcileAbandonedJob,
   resolveCancelableJob,
   resolveJobKindLabel,
   resolveResultJob,
@@ -102,7 +107,7 @@ import {
   runVerifyCommand,
   summarizeFailures
 } from "./lib/verify.mjs";
-import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
+import { allowNoIsolateFromEnv, detectCaller, resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import {
   artifactExcludePathspecs,
   capChangedFiles,
@@ -180,7 +185,7 @@ function printUsage() {
       "  node scripts/grok-bridge.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <low|medium|high>]",
       "  node scripts/grok-bridge.mjs critique [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <low|medium|high>] [focus text]",
       "  node scripts/grok-bridge.mjs run [--background] [--write] [--isolate|--no-isolate] [--resume-last|--resume|--fresh]",
-      "      [--model <model>] [--effort <low|medium|high>]",
+      "      [--model <model>] [--effort <low|medium|high>] [--caller <id>]",
       "      [--verify <command>]... [--verify-attempts <n>] [--verify-timeout <seconds>] [--baseline-timeout <seconds>]",
       "      [--verify-max-buffer <megabytes>] [--verify-ignore <regex>]... [--no-verify] [--no-verify-baseline]",
       "      [--env KEY=VALUE]... [--blender-sandbox]",
@@ -193,6 +198,7 @@ function printUsage() {
       "  node scripts/grok-bridge.mjs import [--source <claude-jsonl>] [--json]",
       "  node scripts/grok-bridge.mjs runs [run-id] [--all] [--wait] [--timeout-ms <ms>] [--json]",
       "  node scripts/grok-bridge.mjs show [run-id] [--json]",
+      "  node scripts/grok-bridge.mjs wait <run-id> [--timeout <seconds>] [--json]",
       "  node scripts/grok-bridge.mjs stop [run-id] [--json]",
       "  node scripts/grok-bridge.mjs land [run-id] [--preview|--discard] [--json]",
       "",
@@ -241,6 +247,10 @@ const SUBCOMMAND_HELP = {
   ],
   show: ["Usage: node scripts/grok-bridge.mjs show [run-id] [--json]", "Print a finished run's result plus a BRIDGE-RESULT trailer."],
   stop: ["Usage: node scripts/grok-bridge.mjs stop [run-id] [--json]"],
+  wait: [
+    "Usage: node scripts/grok-bridge.mjs wait <run-id> [--timeout <seconds>] [--timeout-ms <ms>] [--json]",
+    "Block until the run is terminal (or the timeout), then print the same result as show."
+  ],
   land: ["Usage: node scripts/grok-bridge.mjs land [run-id] [--preview|--discard] [--json]"]
 };
 
@@ -681,15 +691,18 @@ async function runHeadlessAgentWithDurationBudget(runCwd, agentOptions, maxDurat
 }
 
 // configIsolate is the project config's `isolate`, and sits between the two
-// explicit flags and the write-implies-isolate default. --no-isolate stays an
-// absolute override rather than just the top of a precedence chain: a user who
-// typed it must get a non-isolated run even when the repo asks for isolation.
-function resolveIsolateOption(options, write, configIsolate = undefined) {
+// explicit flags and the write-implies-isolate default. For a human at a
+// terminal, --no-isolate stays an absolute override. For a programmatic write
+// caller, isolation is forced and --no-isolate is refused (see
+// resolveIsolateSetting).
+function resolveIsolateOption(options, write, configIsolate = undefined, extras = {}) {
   return resolveIsolateSetting({
     cliIsolate: Boolean(options.isolate),
     cliNoIsolate: Boolean(options["no-isolate"]),
     configIsolate,
-    write
+    write,
+    programmatic: Boolean(extras.programmatic),
+    allowNoIsolate: Boolean(extras.allowNoIsolate)
   });
 }
 
@@ -769,6 +782,75 @@ function loadRunReportRules() {
     runReportRulesCache = loadPromptTemplate(ROOT_DIR, "run-report").trim();
   }
   return runReportRulesCache;
+}
+
+// Isolation preamble: only for isolated runs, and short — it counts against
+// the argv budget on the Windows cmd-shim path. Placeholders are absolute
+// paths so the agent does not have to guess which tree is writable.
+let isolationRulesCache = null;
+function loadIsolationRulesTemplate() {
+  if (isolationRulesCache == null) {
+    isolationRulesCache = loadPromptTemplate(ROOT_DIR, "isolation").trim();
+  }
+  return isolationRulesCache;
+}
+
+/**
+ * System-prompt rules for a run. Always includes the final-report contract;
+ * isolated runs also get the isolation preamble naming the only writable root.
+ *
+ * @param {{ isolated?: boolean, worktreePath?: string|null, workspaceRoot?: string|null }} [options]
+ * @returns {string}
+ */
+function loadRunRules(options = {}) {
+  const parts = [loadRunReportRules()];
+  if (options.isolated && options.worktreePath && options.workspaceRoot) {
+    parts.push(
+      interpolateTemplate(loadIsolationRulesTemplate(), {
+        WORKTREE_PATH: String(options.worktreePath),
+        WORKSPACE_ROOT: String(options.workspaceRoot)
+      })
+    );
+  }
+  return parts.join("\n\n");
+}
+
+/**
+ * Progress/log line for isolation state at run start.
+ * WP-P1 owns the surrounding header lines (CLI, model, verify plan); this
+ * emits only the isolation line so the two branches do not collide.
+ *
+ * @param {{ active: boolean, worktreePath?: string|null, branch?: string|null, baseSha?: string|null, workspaceRoot?: string|null, source?: string|null }} info
+ * @returns {string}
+ */
+function formatIsolationHeaderLine(info = {}) {
+  const source = info.source ? ` [${info.source}]` : "";
+  if (info.active) {
+    const base = String(info.baseSha ?? "").slice(0, 7);
+    return `Isolation: ACTIVE (worktree ${info.worktreePath}, branch ${info.branch}, base ${base})${source}`;
+  }
+  return `Isolation: INACTIVE (writing directly to ${info.workspaceRoot})${source}`;
+}
+
+/**
+ * Reconcile abandoned active jobs in this workspace so status stops lying.
+ * Called from runs/show/stop/prune/wait before they report.
+ */
+function reconcileAbandonedInWorkspace(workspaceRoot, options = {}) {
+  const jobs = listJobs(workspaceRoot);
+  const results = [];
+  for (const job of jobs) {
+    const result = reconcileAbandonedJob(workspaceRoot, job, {
+      claimImpl: claimJobTerminal,
+      killImpl: options.killImpl,
+      graceMs: options.graceMs,
+      now: options.now
+    });
+    if (result) {
+      results.push(result);
+    }
+  }
+  return results;
 }
 
 /**
@@ -942,6 +1024,8 @@ async function buildCheckReport(cwd, actionsTaken = []) {
   const nodeStatus = binaryAvailable("node", ["--version"], { cwd });
   const grokStatus = getGrokAvailability(cwd);
   const authStatus = getGrokAuthStatus(cwd);
+  const caller = detectCaller(process.env);
+  const allowNoIsolate = allowNoIsolateFromEnv(process.env);
 
   const nextSteps = [];
   const cliName = grokStatus.binary || "grok";
@@ -960,6 +1044,12 @@ async function buildCheckReport(cwd, actionsTaken = []) {
     grok: grokStatus,
     auth: authStatus,
     sessionRuntime: getSessionRuntimeStatus(),
+    isolation: {
+      programmatic: caller.programmatic,
+      source: caller.source,
+      writeForcesIsolate: caller.programmatic,
+      allowNoIsolate
+    },
     actionsTaken,
     nextSteps
   };
@@ -1611,6 +1701,21 @@ function buildDoctorReport(cwd, options = {}) {
 
   checks.push(buildProjectConfigCheck(workspaceRoot));
 
+  // Surface the isolation policy for programmatic callers so doctor/check
+  // explain why a Claude-side write run cannot pass --no-isolate.
+  const caller = detectCaller(process.env);
+  const allowNoIsolate = allowNoIsolateFromEnv(process.env);
+  checks.push({
+    name: "isolation policy",
+    ok: true,
+    status: "ok",
+    detail: caller.programmatic
+      ? `programmatic caller (${caller.source}): write runs force isolation` +
+        (allowNoIsolate ? "; GROK_BUILD_ALLOW_NO_ISOLATE=1 escape hatch is set" : "")
+      : "interactive: write runs isolate by default; --no-isolate is allowed",
+    fix: null
+  });
+
   // Emits nothing at all when neither Godot nor Blender is detected, so a
   // plain Node repo's report is unchanged.
   checks.push(...buildEcosystemChecks(workspaceRoot, options));
@@ -1864,8 +1969,11 @@ async function handleTrustConfig(argv) {
 function collectPrunePlan(cwd, options = {}) {
   const includeUnlanded = Boolean(options.includeUnlanded);
   const workspaceRoot = resolveWorkspaceRoot(cwd);
+  // Status reconciliation first so abandoned runs become terminal and their
+  // worktrees fall into the removal plan below rather than sitting forever.
+  reconcileAbandonedInWorkspace(workspaceRoot, options);
   const jobs = listJobs(workspaceRoot);
-  /** @type {{ type: string, jobId: string, detail: string, apply: () => void }[]} */
+  /** @type {{ type: string, jobId: string, detail: string, apply: () => { removed?: boolean, orphanedPath?: string|null, reason?: string }|void }[]} */
   const actions = [];
   /** @type {{ jobId: string, branch: string|null, unmergedCommits: number, detail: string }[]} */
   const awaitingLand = [];
@@ -1879,12 +1987,15 @@ function collectPrunePlan(cwd, options = {}) {
         detail: `Claim abandoned run ${jobId} as failed (process tree is gone).`,
         apply: () => {
           claimJobTerminal(workspaceRoot, jobId, "failed", {
-            errorMessage: "Run abandoned; process tree is gone.",
+            // Keep "abandoned" in the message so existing ops tests and log
+            // greps still match; the precise claim text is what status used to lie about.
+            errorMessage: "Run abandoned; process exited without a terminal claim.",
             phase: "failed",
             bridgePid: null,
             agentPid: null,
             pid: null
           });
+          return { removed: true };
         }
       });
     }
@@ -1904,6 +2015,9 @@ function collectPrunePlan(cwd, options = {}) {
       continue;
     }
     const jobId = job.id;
+    // Always the stored path — never recompute via resolveWorktreePath. Older
+    // runs live under the long CLAUDE_PLUGIN_DATA layout; recomputing would
+    // miss them and leave orphans.
     const worktreePath = worktree.path;
     const branchName = worktree.branch ?? null;
     const unmerged = countUnmergedCommits(workspaceRoot, worktree.baseSha, branchName);
@@ -1924,14 +2038,13 @@ function collectPrunePlan(cwd, options = {}) {
       type: "worktree",
       jobId,
       detail: `Remove worktree for terminal run ${jobId} at ${worktreePath}.`,
-      apply: () => {
+      apply: () =>
         removeWorktree({
           repoRoot: workspaceRoot,
           worktreePath,
           branchName,
           deleteBranch: Boolean(branchName)
-        });
-      }
+        })
     });
   }
 
@@ -1942,8 +2055,9 @@ function renderPruneReport(plan, applied) {
   const mode = applied ? "applied" : "dry-run";
   const lines = ["# Grok Build Prune", "", `Mode: ${mode}`, ""];
   const awaiting = plan.awaitingLand ?? [];
+  const failed = plan.failedRemovals ?? [];
 
-  if (plan.actions.length === 0 && awaiting.length === 0) {
+  if (plan.actions.length === 0 && awaiting.length === 0 && failed.length === 0) {
     lines.push("Nothing to prune.");
     return `${lines.join("\n").trimEnd()}\n`;
   }
@@ -1955,6 +2069,13 @@ function renderPruneReport(plan, applied) {
     }
   } else {
     lines.push("No prunable items in the default plan.");
+  }
+
+  if (failed.length > 0) {
+    lines.push("", `Could not delete (${failed.length}) — directories left on disk:`);
+    for (const item of failed) {
+      lines.push(`- ${item.jobId}: ${item.orphanedPath ?? item.detail}${item.reason ? ` (${item.reason})` : ""}`);
+    }
   }
 
   if (awaiting.length > 0) {
@@ -1980,11 +2101,22 @@ async function handlePrune(argv) {
   const apply = Boolean(options.apply);
   const plan = collectPrunePlan(cwd, { includeUnlanded: options["include-unlanded"] });
 
+  /** @type {{ jobId: string, orphanedPath?: string|null, reason?: string, detail: string }[]} */
+  const failedRemovals = [];
   if (apply) {
     for (const action of plan.actions) {
-      action.apply();
+      const result = action.apply();
+      if (result && result.removed === false) {
+        failedRemovals.push({
+          jobId: action.jobId,
+          orphanedPath: result.orphanedPath ?? null,
+          reason: result.reason,
+          detail: action.detail
+        });
+      }
     }
   }
+  plan.failedRemovals = failedRemovals;
 
   const payload = {
     mode: apply ? "apply" : "dry-run",
@@ -1996,6 +2128,7 @@ async function handlePrune(argv) {
       detail: action.detail,
       applied: apply
     })),
+    failedRemovals,
     awaitingLand: (plan.awaitingLand ?? []).map((item) => ({
       jobId: item.jobId,
       branch: item.branch,
@@ -2179,19 +2312,40 @@ function findLatestResumableTaskJob(jobs) {
 }
 
 async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
-  const timeoutMs = Math.max(0, Number(options.timeoutMs) || DEFAULT_STATUS_WAIT_TIMEOUT_MS);
+  // Treat explicit 0 as "do not wait" — `Number(0) || default` would wrongly
+  // fall through to the 240s default and hang every --timeout 0 test/caller.
+  const rawTimeout = options.timeoutMs;
+  const timeoutMs =
+    rawTimeout == null || rawTimeout === ""
+      ? DEFAULT_STATUS_WAIT_TIMEOUT_MS
+      : Math.max(0, Number(rawTimeout));
   const pollIntervalMs = Math.max(100, Number(options.pollIntervalMs) || DEFAULT_STATUS_POLL_INTERVAL_MS);
   const deadline = Date.now() + timeoutMs;
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  reconcileAbandonedInWorkspace(workspaceRoot, options);
   let snapshot = buildSingleJobSnapshot(cwd, reference);
 
-  while (isActiveJobStatus(snapshot.job.status) && Date.now() < deadline) {
+  // Wait on liveness, not only the stored status string. A run that was killed
+  // externally used to sit at status:running with alive:false forever; the
+  // reconciliation above claims it terminal, and the loop also breaks when
+  // alive === false even before the claim lands.
+  while (Date.now() < deadline) {
+    const active = isActiveJobStatus(snapshot.job.status);
+    const alive = snapshot.job.alive;
+    if (!active || alive === false) {
+      break;
+    }
     await sleep(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
+    reconcileAbandonedInWorkspace(workspaceRoot, options);
     snapshot = buildSingleJobSnapshot(cwd, reference);
   }
 
+  const stillActive =
+    isActiveJobStatus(snapshot.job.status) && snapshot.job.alive !== false;
+
   return {
     ...snapshot,
-    waitTimedOut: isActiveJobStatus(snapshot.job.status),
+    waitTimedOut: stillActive,
     timeoutMs
   };
 }
@@ -2466,6 +2620,7 @@ async function executeTaskRun(request) {
   const prompt = String(request.prompt ?? "").trim() || (resumeSessionId ? DEFAULT_CONTINUE_PROMPT : "");
   const write = Boolean(request.write);
   const isolate = Boolean(request.isolate);
+  const isolateSource = request.isolateSource ?? (isolate ? "write-default" : "read-only");
   const verifyCommands = normalizeVerifyCommands(request.verifyCommands);
   const verifyAttempts = resolveVerifyAttempts(request.verifyAttempts);
   // Resolved by handleTask (or absent, for a caller that passed an explicit
@@ -2696,16 +2851,35 @@ async function executeTaskRun(request) {
   const dirtyBeforeRun = write && !created ? porcelainChangeEntries(runCwd) : null;
   const dirtyBeforeRunPaths = dirtyBeforeRun ? new Set(dirtyBeforeRun.keys()) : null;
 
-  // Run header: first lines a user (or log) sees, in fixed order, before the
-  // agent streams. Budgets only when a cap is set so an uncapped run stays quiet.
+  // Isolated runs: snapshot the MAIN checkout (workspaceRoot), not the
+  // worktree. Newly dirty paths there after the agent finishes are an isolation
+  // breach — the agent obeyed an absolute path in the brief. Same post-baseline
+  // timing as the non-isolated snapshot above.
+  const mainDirtyBeforeRun = write && created ? porcelainChangeEntries(workspaceRoot) : null;
+  const mainDirtyBeforeRunPaths = mainDirtyBeforeRun ? new Set(mainDirtyBeforeRun.keys()) : null;
+
+  // Isolation header line only on this branch (WP-P1 owns CLI/model/verify plan
+  // lines). Emitted through the existing progress channel so it lands in the
+  // log and the live preview, not only the final report.
+  request.onProgress?.({
+    message: formatIsolationHeaderLine({
+      active: Boolean(created),
+      worktreePath: created?.worktreePath ?? null,
+      branch: created?.branchName ?? null,
+      baseSha: created?.baseSha ?? null,
+      workspaceRoot,
+      source: isolateSource
+    }),
+    phase: "starting"
+  });
+
+  // Surrounding header lines (CLI, model, verify plan) — leave structure as-is
+  // so WP-P1 merges cleanly; do not rewrite their wording here.
   const availability = getGrokAvailability(request.cwd);
   const cliBrand = availability.brand ?? detectCliBrand(availability.detail);
   const headerLines = [
     `CLI: ${cliBrand.label} ${availability.detail ?? "unknown"} (${availability.binary ?? "grok"})`,
-    `Model: ${request.model ? String(request.model) : "default"}`,
-    created
-      ? `Isolation: ACTIVE (worktree ${created.worktreePath}, branch ${created.branchName}, base ${String(created.baseSha ?? "").slice(0, 7)})`
-      : `Isolation: INACTIVE (writing directly to ${workspaceRoot})`
+    `Model: ${request.model ? String(request.model) : "default"}`
   ];
   for (const line of headerLines) {
     request.onProgress?.({ message: line, phase: "starting" });
@@ -2743,7 +2917,33 @@ async function executeTaskRun(request) {
   // Permission shape: write runs approve every tool; read-only runs get plan +
   // read-only sandbox AND deny rules on Edit/Write/NotebookEdit, because the
   // sandbox is inert on Windows (see buildHeadlessPermissionOptions).
+  //
+  // Isolated write runs ADD deny rules on the main checkout so absolute paths
+  // in the task brief cannot edit it even under --always-approve. Measured:
+  // deny beats always-approve and covers the shell too.
   const permissionOptions = buildHeadlessPermissionOptions(write);
+  if (created && write) {
+    const denyPlan = buildWorkspaceRootDenyRules(workspaceRoot, created.worktreePath);
+    if (denyPlan.skipped) {
+      request.onProgress?.({
+        message: `Warning: isolation deny rules skipped (${denyPlan.reason}); worktree sits inside the main checkout path.`,
+        phase: "starting"
+      });
+    } else {
+      permissionOptions.denyRules = [
+        ...(permissionOptions.denyRules ?? []),
+        ...denyPlan.rules
+      ];
+    }
+    // Optional Hyper --confine when the CLI advertises it and the feature
+    // switch is on (default on). Omitted silently on older CLIs.
+    if (confineFeatureEnabled(process.env)) {
+      const binary = resolveGrokBinary(process.env);
+      if (cliSupportsConfine(binary, { env: process.env })) {
+        permissionOptions.confine = created.worktreePath;
+      }
+    }
+  }
 
   const firstAgent = await runHeadlessAgentWithDurationBudget(
     runCwd,
@@ -2754,12 +2954,15 @@ async function executeTaskRun(request) {
       effort: request.effort,
       ...permissionOptions,
       maxTurns,
-      // The one thing that makes a delegate run return an answer rather than a
-      // narration transcript. Only on the FIRST turn: a fix turn given the same
-      // contract emits a report about the fix, and the newest non-empty report
-      // wins below - which would discard the main run's answer, the exact bug
-      // the accumulation there exists to prevent.
-      rules: loadRunReportRules(),
+      // Report contract always; isolation preamble only when we actually have a
+      // worktree. Only on the FIRST turn: a fix turn given the same contract
+      // emits a report about the fix, and the newest non-empty report wins
+      // below - which would discard the main run's answer.
+      rules: loadRunRules({
+        isolated: Boolean(created),
+        worktreePath: created?.worktreePath ?? null,
+        workspaceRoot
+      }),
       outputFormat: "streaming-json",
       onProgress: request.onProgress,
       // The agent runs the project's own tooling by hand as well as the bridge
@@ -2988,9 +3191,11 @@ async function executeTaskRun(request) {
           resumeSessionId: result.threadId,
           model: request.model,
           effort: request.effort,
-          // Mirror the ORIGINAL run's write policy exactly. Escalating a
-          // read-only verify fix to a write run used to edit the real tree.
-          ...buildHeadlessPermissionOptions(write),
+          // Mirror the ORIGINAL run's write policy AND isolation deny/confine
+          // exactly. Escalating a read-only verify fix to a write run used to
+          // edit the real tree; dropping deny rules on a fix turn would re-open
+          // the main checkout hole the first turn closed.
+          ...permissionOptions,
           maxTurns,
           cwd: runCwd,
           outputFormat: "streaming-json",
@@ -3030,6 +3235,35 @@ async function executeTaskRun(request) {
   let worktree = null;
   /** @type {{source: string, entries: string[], total: number, truncated: boolean, preexistingDirty?: number}|null} */
   let changedFiles = null;
+  /** @type {{entries: string[], total: number, truncated: boolean}|null} */
+  let isolationLeak = null;
+  let isolationBreached = false;
+
+  // Breach detection: any path newly dirty in the MAIN checkout after an
+  // isolated run means the agent wrote outside the worktree. artifact excludes
+  // (and thus junctioned node_modules/.godot/…) are already applied by
+  // porcelainChangeEntries, so provisioned link targets cannot false-positive.
+  if (created && mainDirtyBeforeRunPaths) {
+    const mainAfter = porcelainChangeEntries(workspaceRoot);
+    if (mainAfter) {
+      const leaked = [];
+      for (const [filePath, letter] of mainAfter) {
+        if (mainDirtyBeforeRunPaths.has(filePath)) {
+          continue;
+        }
+        leaked.push(`${letter}\t${filePath}`);
+      }
+      if (leaked.length > 0) {
+        isolationBreached = true;
+        isolationLeak = capChangedFiles(leaked);
+        request.onProgress?.({
+          message: `Isolation BREACHED: ${isolationLeak.total} path(s) dirty in the main checkout (work is in the wrong tree).`,
+          phase: "finalizing"
+        });
+      }
+    }
+  }
+
   if (created) {
     const committed = commitWorktreeChanges(
       created.worktreePath,
@@ -3071,7 +3305,9 @@ async function executeTaskRun(request) {
       // The deliverable, named. For a Godot or Blender run this is the whole
       // point of the run, and the payload used to carry only a path.
       changedFiles: changedFiles?.entries ?? null,
-      changedFileCount: changedFiles?.total ?? null
+      changedFileCount: changedFiles?.total ?? null,
+      breached: isolationBreached,
+      isolationLeak
     };
   } else if (write) {
     changedFiles = collectWorkingTreeChanges(runCwd, dirtyBeforeRunPaths);
@@ -3175,8 +3411,11 @@ async function executeTaskRun(request) {
     toolCallCount,
     changedFileCount: effectiveChangedFileCount,
     write,
-    verified,
-    hadWork: Boolean(prompt)
+    // A breach never reports Verified: yes, even if the worktree verify loop
+    // passed — that verify only saw the worktree, not the leaked paths.
+    verified: isolationBreached ? false : verified,
+    hadWork: Boolean(prompt),
+    isolationBreached
   });
   const rendered = timedOut
     ? `${failureMessage}\n${rawOutput ? `\n${rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`}` : ""}`
@@ -3197,13 +3436,17 @@ async function executeTaskRun(request) {
           unknownEventTypes,
           changedFiles,
           write,
-          verified,
-          verifyNote,
+          verified: isolationBreached ? false : verified,
+          verifyNote: isolationBreached
+            ? "isolation breached — work is in the main checkout, not the worktree"
+            : verifyNote,
           status: terminalStatus,
           stopReason,
           usage: cumulativeUsage ?? null,
           model: request.model ?? null,
           resolvedModel,
+          isolationBreached,
+          isolationLeak,
           // Which command(s) tripped an exit-0 output-failure marker, and what
           // matched - the only evidence available without reading --json for
           // a command whose exit code alone says it passed. Computed here
@@ -3302,8 +3545,10 @@ async function executeTaskRun(request) {
     // project. Null when there was nothing to measure (a read-only run) or
     // nobody could measure it (a failed commit or diff).
     changedFiles,
-    verified,
+    verified: isolationBreached ? false : verified,
     worktree,
+    isolationBreached,
+    isolationLeak,
     // Which environment variables this run imposed on the verify commands and
     // the agent, with sensitive VALUES withheld by key name. Recorded because
     // "why did this pass here and fail for me?" is otherwise unanswerable, and
@@ -3342,8 +3587,10 @@ async function executeTaskRun(request) {
     jobTitle: taskMetadata.title,
     jobClass: "task",
     write,
-    verified,
+    verified: isolationBreached ? false : verified,
     worktree,
+    isolationBreached,
+    isolationLeak,
     grokVersion,
     verify,
     usage: cumulativeUsage ?? null,
@@ -3423,6 +3670,7 @@ function buildTaskRequest({
   resumeLast,
   jobId,
   isolate = false,
+  isolateSource = null,
   verifyCommands = [],
   verifyPlan = null,
   verifyTiming = null,
@@ -3446,6 +3694,9 @@ function buildTaskRequest({
     resumeLast,
     jobId,
     isolate,
+    // Why isolation was on/off — printed on the run header so a forced
+    // programmatic decision is not a mystery when reading the log later.
+    isolateSource,
     verifyCommands,
     // Carried through so a background run's header can say where its plan came
     // from. The commands themselves are already concrete by this point - the
@@ -3703,7 +3954,9 @@ export const TASK_VALUE_OPTIONS = Object.freeze([
   "env",
   "max-duration",
   "max-turns",
-  "max-cost"
+  "max-cost",
+  // Explicit programmatic caller id (also auto-detected from CLAUDECODE etc.).
+  "caller"
 ]);
 
 /**
@@ -3806,7 +4059,13 @@ async function handleTask(argv) {
   if (!billingGate.allowed) {
     throw new Error(billingGate.message);
   }
-  const isolate = resolveIsolateOption(options, write, settings.isolate);
+  const caller = detectCaller(process.env, { caller: options.caller });
+  const isolateDecision = resolveIsolateOption(options, write, settings.isolate, {
+    programmatic: caller.programmatic,
+    allowNoIsolate: allowNoIsolateFromEnv(process.env)
+  });
+  const isolate = isolateDecision.isolate;
+  const isolateSource = isolateDecision.source;
   const verifyCommands = settings.verify;
   const verifyPlan = {
     source: settings.sources.verify,
@@ -3874,6 +4133,7 @@ async function handleTask(argv) {
         resumeLast,
         jobId: job.id,
         isolate,
+        isolateSource,
         verifyCommands,
         verifyPlan,
         verifyTiming,
@@ -3907,6 +4167,7 @@ async function handleTask(argv) {
         resumeLast,
         jobId: job.id,
         isolate,
+        isolateSource,
         verifyCommands,
         verifyPlan,
         verifyTiming,
@@ -4403,6 +4664,8 @@ async function handleStatus(argv) {
   });
 
   const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveCommandWorkspace(options);
+  reconcileAbandonedInWorkspace(workspaceRoot);
   const reference = positionals[0] ?? "";
   if (reference) {
     const snapshot = options.wait
@@ -4443,6 +4706,8 @@ function handleResult(argv) {
   });
 
   const cwd = resolveCommandCwd(options);
+  const workspaceRootPre = resolveCommandWorkspace(options);
+  reconcileAbandonedInWorkspace(workspaceRootPre);
   const reference = positionals[0] ?? "";
   const { workspaceRoot, job } = resolveResultJob(cwd, reference);
   const storedJob = readStoredJob(workspaceRoot, job.id);
@@ -4495,16 +4760,36 @@ function handleTaskResumeCandidate(argv) {
 function terminateJobProcessTrees(job) {
   const targets = resolveJobKillTargets(job);
   const results = [];
+  const survivors = [];
   for (const pid of targets) {
-    results.push({ pid, ...terminateProcessTree(pid) });
+    const outcome = terminateProcessTree(pid);
+    results.push({ pid, ...outcome });
+    // Only trust the explicit survivors list from the kill path. A process that
+    // was already gone returns delivered:false with no survivors — that is a
+    // clean "nothing to kill", not a survivor to report.
+    if (Array.isArray(outcome.survivors) && outcome.survivors.length > 0) {
+      survivors.push(...outcome.survivors);
+    }
   }
   if (results.length === 0) {
-    return { attempted: false, delivered: false, method: null, results: [] };
+    return {
+      attempted: false,
+      delivered: false,
+      method: null,
+      errorText: null,
+      survivors: [],
+      results: []
+    };
   }
+  const uniqueSurvivors = [...new Set(survivors)];
+  const anyDelivered = results.some((entry) => entry.delivered);
   return {
     attempted: results.some((entry) => entry.attempted),
-    delivered: results.some((entry) => entry.delivered),
+    // Never claim a clean stop when any process is known still alive.
+    delivered: anyDelivered && uniqueSurvivors.length === 0,
     method: results.map((entry) => entry.method).filter(Boolean).join("+") || null,
+    errorText: results.map((entry) => entry.errorText).filter(Boolean).join("; ") || null,
+    survivors: uniqueSurvivors,
     results
   };
 }
@@ -4516,6 +4801,8 @@ async function handleCancel(argv) {
   });
 
   const cwd = resolveCommandCwd(options);
+  const workspaceRootPre = resolveCommandWorkspace(options);
+  reconcileAbandonedInWorkspace(workspaceRootPre);
   const reference = positionals[0] ?? "";
   const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
   const existing = readStoredJob(workspaceRoot, job.id) ?? job;
@@ -4540,6 +4827,8 @@ async function handleCancel(argv) {
       title: claim.job?.title ?? job.title,
       killAttempted: killResult.attempted,
       killDelivered: killResult.delivered,
+      killMethod: killResult.method,
+      killSurvivors: killResult.survivors,
       alreadyTerminal: true,
       claimOrder: "claim-before-kill",
       killTargets
@@ -4556,7 +4845,7 @@ async function handleCancel(argv) {
     existing.logFile ?? job.logFile,
     killResult.delivered
       ? "Stopped by user (claim-before-kill)."
-      : `Stop claimed; process tree kill delivered=${killResult.delivered} method=${killResult.method ?? "none"}.`
+      : `Stop claimed; process tree kill delivered=${killResult.delivered} method=${killResult.method ?? "none"} survivors=${(killResult.survivors ?? []).join(",") || "unknown"}.`
   );
 
   const merged = claimJobTerminal(workspaceRoot, job.id, "cancelled", {
@@ -4564,6 +4853,17 @@ async function handleCancel(argv) {
       ? "Stopped by user."
       : "Stop claimed but process may still be running (kill not delivered).",
     cancelKill: killResult,
+    // Tombstone when kill could not be confirmed — stop must never pretend
+    // the tree is gone if survivors remain.
+    killTombstone:
+      killResult.delivered
+        ? null
+        : {
+            at: nowIso(),
+            survivors: killResult.survivors ?? [],
+            method: killResult.method,
+            errorText: killResult.errorText
+          },
     logFile: existing.logFile ?? job.logFile ?? null
   });
 
@@ -4580,12 +4880,78 @@ async function handleCancel(argv) {
     killAttempted: killResult.attempted,
     killDelivered: killResult.delivered,
     killMethod: killResult.method,
+    killSurvivors: killResult.survivors,
+    killErrorText: killResult.errorText,
     killTargets,
     claimOrder: "claim-before-kill",
     claimed: claim.claimed
   };
 
-  outputCommandResult(payload, renderCancelReport({ ...nextJob, ...payload }), options.json);
+  outputCommandResult(
+    payload,
+    renderCancelReport({ ...nextJob, ...payload, cancelKill: killResult }),
+    options.json
+  );
+}
+
+/**
+ * Block until a run reaches a terminal state (or timeout), then print the same
+ * result `show` would. Reuses `runs --wait` machinery so there is one wait path.
+ */
+async function handleWait(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    // --timeout is seconds (user-facing); --timeout-ms is the runs-compatible form.
+    valueOptions: ["cwd", "timeout", "timeout-ms", "poll-interval-ms"],
+    booleanOptions: ["json"]
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const reference = positionals[0] ?? "";
+  if (!reference) {
+    throw new Error("`wait` requires a run id.");
+  }
+
+  let timeoutMs = options["timeout-ms"];
+  if (timeoutMs == null && options.timeout != null) {
+    const seconds = Number(options.timeout);
+    if (!Number.isFinite(seconds) || seconds < 0) {
+      throw new Error(`--timeout must be a non-negative number of seconds, got ${options.timeout}`);
+    }
+    timeoutMs = seconds * 1000;
+  }
+
+  const snapshot = await waitForSingleJobSnapshot(cwd, reference, {
+    timeoutMs,
+    pollIntervalMs: options["poll-interval-ms"]
+  });
+
+  if (snapshot.waitTimedOut) {
+    const payload = {
+      ...snapshot,
+      timedOut: true
+    };
+    outputCommandResult(
+      payload,
+      renderJobStatusReport(snapshot.job, {
+        waitTimedOut: true,
+        timeoutMs: snapshot.timeoutMs
+      }),
+      options.json
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  // Terminal: print the same shape as show.
+  const storedJob = readStoredJob(snapshot.workspaceRoot, snapshot.job.id);
+  const hydrated = hydrateJobFromStored(snapshot.workspaceRoot, snapshot.job);
+  const payload = {
+    job: hydrated,
+    storedJob,
+    waitTimedOut: false,
+    timeoutMs: snapshot.timeoutMs
+  };
+  outputCommandResult(payload, renderStoredJobResult(hydrated, storedJob), options.json);
 }
 
 function handleModels(argv) {
@@ -4709,6 +5075,9 @@ async function main() {
     case "stop":
       await handleCancel(argv);
       break;
+    case "wait":
+      await handleWait(argv);
+      break;
     case "land":
       await handleLand(argv);
       break;
@@ -4732,6 +5101,8 @@ export {
   buildBoundedVerifyFixPrompt,
   buildDoctorReport,
   buildEcosystemChecks,
+  formatIsolationHeaderLine,
+  loadRunRules,
   main,
   normalizeDoctorCheck,
   readStoredJobWithRetry,

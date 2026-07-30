@@ -149,7 +149,9 @@ export function isJobProcessAlive(job = {}, options = {}) {
 
 /**
  * A run whose tracked processes are all gone but whose status still says active.
- * Reported at read time rather than written to state; reaping it is /prune.
+ * Reported at read time rather than written to state; reaping it is /prune —
+ * unless the grace window has elapsed, in which case reconcileAbandonedJob
+ * claims it terminal so `status` stops lying while only `alive` was truthful.
  */
 export function classifyJobLiveness(job = {}, options = {}) {
   const active = job.status === "queued" || job.status === "running";
@@ -158,6 +160,72 @@ export function classifyJobLiveness(job = {}, options = {}) {
   }
   const alive = isJobProcessAlive(job, options);
   return { abandoned: alive === false, alive };
+}
+
+/**
+ * How long after the last heartbeat a dead process may still be "running" in
+ * the record before we claim it failed. Short enough that `runs`/`show` stop
+ * lying within a poll interval; long enough that a brief PID-recycle race
+ * during a clean exit does not flip a finishing run to failed.
+ */
+export const ABANDONED_RECONCILE_GRACE_MS = 15_000;
+
+/**
+ * True when a job is active in the record, its tracked PIDs are gone, and the
+ * last heartbeat is older than the grace window (or missing entirely).
+ */
+export function shouldReconcileAbandoned(job = {}, options = {}) {
+  const liveness = classifyJobLiveness(job, options);
+  if (!liveness.abandoned) {
+    return false;
+  }
+  const graceMs =
+    Number.isFinite(Number(options.graceMs)) && Number(options.graceMs) >= 0
+      ? Number(options.graceMs)
+      : ABANDONED_RECONCILE_GRACE_MS;
+  const now = Number.isFinite(Number(options.now)) ? Number(options.now) : Date.now();
+  const stamp = job.lastHeartbeatAt ?? job.lastEventAt ?? job.updatedAt ?? job.startedAt ?? null;
+  const parsed = Date.parse(stamp ?? "");
+  if (!Number.isFinite(parsed)) {
+    // No clock to measure grace against — process is dead, claim it.
+    return true;
+  }
+  return now - parsed >= graceMs;
+}
+
+/**
+ * Claim an abandoned active job as terminal so status matches reality.
+ *
+ * Returns the claim result, or null when the job did not need reconciling.
+ * Safe to call from runs/show/stop/prune on every read.
+ *
+ * @param {string} workspaceRoot
+ * @param {object} job
+ * @param {{ claimImpl?: Function, killImpl?: Function, graceMs?: number, now?: number }} [options]
+ */
+export function reconcileAbandonedJob(workspaceRoot, job, options = {}) {
+  if (!job?.id || !shouldReconcileAbandoned(job, options)) {
+    return null;
+  }
+  const claimImpl = options.claimImpl;
+  if (typeof claimImpl !== "function") {
+    // Lazy import shape: callers usually pass claimJobTerminal from state.mjs.
+    // When omitted, only report that reconciliation is due without writing.
+    return {
+      claimed: false,
+      due: true,
+      jobId: job.id,
+      reason: "no-claim-impl"
+    };
+  }
+  return claimImpl(workspaceRoot, job.id, "failed", {
+    errorMessage: "Run abandoned; process exited without a terminal claim.",
+    phase: "failed",
+    bridgePid: null,
+    agentPid: null,
+    pid: null,
+    abandonedReconciled: true
+  });
 }
 
 function computeIdleSeconds(job, now = Date.now()) {

@@ -18,6 +18,10 @@ test("terminateProcessTree uses taskkill on Windows", () => {
   let captured = null;
   const outcome = terminateProcessTree(1234, {
     platform: "win32",
+    settleMs: 0,
+    // After a clean taskkill the path re-probes liveness; report dead so we
+    // do not escalate into PowerShell. killImpl is unused when isAliveImpl is set.
+    isAliveImpl: () => false,
     runCommandImpl(command, args) {
       captured = { command, args };
       return {

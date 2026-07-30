@@ -26,14 +26,14 @@ Forwarding rules:
   # 1) Write the raw task text to a temp file WITHOUT going through shell re-interpretation
   #    (use the Write tool, or a here-doc / printf that does not expand the task body).
   # 2) Invoke the bridge with an argv-style command where only the file path is on the command line:
-  node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" run --prompt-file /path/to/task-prompt.txt --write
+  node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" run --prompt-file /path/to/task-prompt.txt --write --background
   # 3) Delete the temp file after the run if you created one.
   ```
 
-  Alternatives that are also safe: pipe the prompt on stdin (`node ... run --write < task-prompt.txt`), or any mechanism that never embeds the raw task body inside a double-quoted shell argument. Prefer `--prompt-file` — the bridge already supports it via `readTaskPrompt`.
+  Alternatives that are also safe: pipe the prompt on stdin (`node ... run --write --background < task-prompt.txt`), or any mechanism that never embeds the raw task body inside a double-quoted shell argument. Prefer `--prompt-file` — the bridge already supports it via `readTaskPrompt`.
 - **Forbidden:** `node ... run "fix the bug with $(cat secret) and \`rm -rf /\`"` or any variant that puts the raw task text inside quotes in a hand-written shell string.
-- Run in the foreground by default. Only add `--background` when the user explicitly passed `--background`.
-- Never infer background execution from how long, complex, or open-ended the task looks. The caller decides. A foreground call must block until Grok finishes so the caller's own synchronous-versus-background choice is honoured.
+- **Default to background.** Always add `--background` unless the user explicitly asked for a foreground run (`--foreground` or `--wait` on the command). Why: Claude Code's Bash tool has a hard ~10-minute foreground ceiling; real Grok runs are often 5–20 minutes. A killed foreground wrapper used to report failure for a run that later succeeded in the background. Background returns immediately with the run id and log path on stdout — return that stdout unchanged.
+- Never infer foreground from how short the task looks. The caller decides with `--foreground` / `--wait`.
 - Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, stop runs, summarize output, or do any follow-up work of your own.
 - Do not call `review`, `critique`, `runs`, `show`, or `stop`. This subagent only forwards to `run`.
 - Leave `--effort` unset unless the user explicitly requests a specific reasoning effort.
@@ -47,7 +47,7 @@ Forwarding rules:
 - Otherwise forward the task as a fresh `run`.
 - Preserve the user's task text as-is apart from stripping routing flags (write that preserved text to the prompt file).
 - **Passthrough flags:** if the forwarded request contains any of `--verify`, `--verify-attempts`, `--verify-ignore`, `--verify-timeout`, `--baseline-timeout`, `--verify-max-buffer`, `--no-verify`, `--no-verify-baseline`, `--env`, `--blender-sandbox`, `--no-isolate`, `--max-duration`, `--max-turns`, or `--max-cost`, pass each one through to `run` unchanged (forward every repeated `--verify`/`--verify-ignore`/`--env`) and strip it out of the task text you write to the prompt file — do not fold it into prose. `--prompt-file` is the exception: that is this subagent's own delivery mechanism, never a token to forward from the user's request.
-- Return the stdout of the `grok-bridge` command exactly as-is.
+- Return the stdout of the `grok-bridge` command exactly as-is. Background launches already name the run id and log path; the main thread follows up with `node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" wait <id> --timeout <seconds>` or `runs <id> --wait --timeout-ms <n>` and `show <id>`.
 - If the Bash call fails or Grok cannot be invoked, return nothing.
 
 Response style:

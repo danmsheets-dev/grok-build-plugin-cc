@@ -84,6 +84,13 @@ export function decideCompletionStatus(outcome = {}) {
   // the agent made zero tool calls.
   const hadWork = outcome.hadWork !== false;
 
+  // Isolation breach beats every success path: work in the wrong tree is never
+  // "completed" and never "Verified: yes", even if the agent exited 0 and
+  // verify inside the worktree passed.
+  if (outcome.isolationBreached) {
+    return "isolation-breached";
+  }
+
   if (timedOut) {
     return "timed-out";
   }
@@ -424,7 +431,9 @@ export async function runTrackedJob(job, runner, options = {}) {
         null,
       write: execution.write ?? job.write,
       verified: execution.verified,
-      hadWork: execution.hadWork
+      hadWork: execution.hadWork,
+      isolationBreached:
+        Boolean(execution.isolationBreached) || Boolean(execution.payload?.isolationBreached)
     });
     // Redact once, centrally, before anything text-bearing reaches disk or the
     // --json CLI path (which serializes the same payload we return here).

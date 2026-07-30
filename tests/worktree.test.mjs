@@ -122,22 +122,34 @@ function listMentionsPath(listLines, targetPath) {
   return listLines.some((line) => normalizePath(line.split(/\s+/)[0]).includes(normalized) || line.replace(/\\/g, "/").toLowerCase().includes(normalized));
 }
 
-test("resolveWorktreePath uses dataDir, CLAUDE_PLUGIN_DATA, or tmpdir fallback", () => {
+test("resolveWorktreePath uses dataDir, short win32 default, or CLAUDE_PLUGIN_DATA/tmpdir", () => {
   const dataDir = makeTempDir("grok-wt-data-");
   assert.equal(
     resolveWorktreePath("run-a", { dataDir }),
     path.join(dataDir, "worktrees", "run-a")
   );
 
+  // win32 defaults to a short TEMP path (deep engine caches break MAX_PATH under
+  // the long CLAUDE_PLUGIN_DATA prefix; LOCALAPPDATA outside Temp breaks junctions).
+  // Explicit dataDir still wins above.
+  const winPath = resolveWorktreePath("run-b", {
+    platform: "win32",
+    env: {
+      TEMP: "C:\\Users\\me\\AppData\\Local\\Temp",
+      CLAUDE_PLUGIN_DATA: "C:\\very\\long\\plugin\\data"
+    }
+  });
+  assert.match(winPath.replace(/\\/g, "/"), /\/gb\/w\/[0-9a-f]{8}$/);
+
   const pluginData = makeTempDir("grok-wt-plugin-");
   assert.equal(
-    resolveWorktreePath("run-b", { env: { CLAUDE_PLUGIN_DATA: pluginData } }),
-    path.join(pluginData, "worktrees", "run-b")
+    resolveWorktreePath("run-c", { platform: "linux", env: { CLAUDE_PLUGIN_DATA: pluginData } }),
+    path.join(pluginData, "worktrees", "run-c")
   );
 
-  const fallback = resolveWorktreePath("run-c", { env: {} });
+  const fallback = resolveWorktreePath("run-d", { platform: "linux", env: {} });
   assert.match(fallback, /grok-cc-worktrees/);
-  assert.ok(fallback.endsWith(path.join("grok-cc-worktrees", "run-c")));
+  assert.ok(fallback.endsWith(path.join("grok-cc-worktrees", "run-d")));
 });
 
 test("createWorktree makes a real worktree directory and grok-build branch", () => {

@@ -486,22 +486,67 @@ export function resolveRunSettings(input = {}) {
 }
 
 /**
- * Isolation is resolved separately from resolveRunSettings because
- * `--no-isolate` is an absolute override rather than a precedence winner: a
- * user who typed it must get a non-isolated run even if the repo's config asks
- * for isolation.
+ * Isolation is resolved separately from resolveRunSettings.
+ *
+ * For a human at a terminal, `--no-isolate` stays an absolute override rather
+ * than a precedence winner: a user who typed it must get a non-isolated run
+ * even if the repo's config asks for isolation.
+ *
+ * For a programmatic caller (Claude Code, another bridge, `--caller`), a write
+ * run ALWAYS isolates. `--no-isolate` and `isolate: false` in config are
+ * refused with a clear error rather than silently downgraded, unless
+ * `allowNoIsolate` is set (GROK_BUILD_ALLOW_NO_ISOLATE=1). That is deliberate:
+ * silent downgrade is how concurrent programmatic runs shared one dirty tree.
+ *
+ * Pure and injectable — every input is a parameter so tests do not need to
+ * poke process.env.
+ *
+ * @returns {{ isolate: boolean, source: "forced-programmatic"|"cli"|"config"|"write-default"|"read-only" }}
  */
-export function resolveIsolateSetting({ cliIsolate, cliNoIsolate, configIsolate, write }) {
+export function resolveIsolateSetting({
+  cliIsolate,
+  cliNoIsolate,
+  configIsolate,
+  write,
+  programmatic = false,
+  allowNoIsolate = false
+} = {}) {
+  // Programmatic write: isolation is mandatory. Refuse every opt-out path
+  // unless the operator set the escape hatch.
+  if (write && programmatic) {
+    const wantsOut = Boolean(cliNoIsolate) || configIsolate === false;
+    if (wantsOut && !allowNoIsolate) {
+      throw new Error(
+        "Programmatic write runs require isolation (a worktree). " +
+          "`--no-isolate` and `isolate: false` are refused for Claude Code / bridge callers " +
+          "because absolute paths in the task brief otherwise write into the main checkout. " +
+          "Unset those, or set GROK_BUILD_ALLOW_NO_ISOLATE=1 only if you deliberately accept that risk."
+      );
+    }
+    if (wantsOut && allowNoIsolate) {
+      // Escape hatch honoured: keep the same source labels a human would get.
+      if (cliNoIsolate) {
+        return { isolate: false, source: "cli" };
+      }
+      return { isolate: false, source: "config" };
+    }
+    return { isolate: true, source: "forced-programmatic" };
+  }
+
+  // Human (or non-write programmatic) path — identical precedence to 0.4.x.
   if (cliNoIsolate) {
-    return false;
+    return { isolate: false, source: "cli" };
   }
   if (cliIsolate) {
-    return true;
+    return { isolate: true, source: "cli" };
   }
   if (typeof configIsolate === "boolean") {
-    return configIsolate;
+    return { isolate: configIsolate, source: "config" };
   }
-  return Boolean(write);
+  if (write) {
+    return { isolate: true, source: "write-default" };
+  }
+  return { isolate: false, source: "read-only" };
 }
 
 /** Human-readable label for a verify-plan source, used in the run header. */

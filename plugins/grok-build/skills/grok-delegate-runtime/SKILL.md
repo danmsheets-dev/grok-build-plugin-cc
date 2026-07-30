@@ -18,9 +18,9 @@ Why `--prompt-file` (not an inline quoted string):
 
 Safe invocation pattern:
 1. Write the preserved task text (routing flags stripped) to a temporary file using a mechanism that does not shell-expand the body (Write tool, or a here-doc / redirected write that does not expand the task).
-2. Invoke once: `node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" run --prompt-file /path/to/task-prompt.txt --write` plus any other bridge flags.
+2. Invoke once: `node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" run --prompt-file /path/to/task-prompt.txt --write --background` plus any other bridge flags.
 3. Never build the Bash command by directly embedding the task text inside double quotes in a hand-written shell string.
-4. Optional equivalent: pipe stdin (`node ... run --write < task-prompt.txt`).
+4. Optional equivalent: pipe stdin (`node ... run --write --background < task-prompt.txt`).
 
 Forbidden:
 - `node ... run "user task with $(rm -rf /) and \`id\`"`
@@ -37,7 +37,8 @@ Execution rules:
 
 Command selection:
 - Use exactly one `run` invocation per delegate handoff.
-- Only add `--background` when the user explicitly passed `--background`. Otherwise run in the foreground and let the call block. Do not infer background execution from task size. Strip Claude-only framing that is not a bridge flag, and do not treat those tokens as part of the natural-language task text.
+- **Always add `--background` unless the user explicitly asked for a foreground run** (`--foreground` or `--wait` on the command). Why: Claude Code's Bash tool hard-caps foreground at ~10 minutes; real Grok runs routinely take 5–20 minutes. A wrapper killed at the ceiling used to report failure for a run that later succeeded. Background returns immediately with the run id and log path — return that stdout unchanged so the main thread can wait.
+- Follow-up (for the main Claude thread, not this subagent): `node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" wait <id> --timeout <seconds>` (or `runs <id> --wait --timeout-ms <n>`) then `show <id>`.
 - If the forwarded request includes `--model`, pass it through to `run`.
 - If the forwarded request includes `--effort`, pass it through to `run`.
 - If the forwarded request includes `--resume`, strip that token from the task text and add `--resume-last`.

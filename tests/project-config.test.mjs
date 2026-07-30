@@ -340,19 +340,62 @@ test("numeric CLI strings resolve, because that is how argv arrives", () => {
   assert.equal(settings.sources.maxDurationSeconds, "cli");
 });
 
-test("--no-isolate beats a config that asks for isolation", () => {
-  assert.equal(
-    resolveIsolateSetting({ cliNoIsolate: true, configIsolate: true, write: true }),
-    false
-  );
+test("--no-isolate beats a config that asks for isolation (human path)", () => {
+  const decision = resolveIsolateSetting({
+    cliNoIsolate: true,
+    configIsolate: true,
+    write: true
+  });
+  assert.equal(decision.isolate, false);
+  assert.equal(decision.source, "cli");
 });
 
 test("a config can turn isolation on for a run that would not have isolated", () => {
-  assert.equal(resolveIsolateSetting({ configIsolate: true, write: false }), true);
-  assert.equal(resolveIsolateSetting({ configIsolate: false, write: true }), false);
+  assert.equal(resolveIsolateSetting({ configIsolate: true, write: false }).isolate, true);
+  assert.equal(resolveIsolateSetting({ configIsolate: true, write: false }).source, "config");
+  assert.equal(resolveIsolateSetting({ configIsolate: false, write: true }).isolate, false);
   // Unset config: write still implies isolate, exactly as in 0.3.x.
-  assert.equal(resolveIsolateSetting({ write: true }), true);
-  assert.equal(resolveIsolateSetting({ write: false }), false);
+  assert.equal(resolveIsolateSetting({ write: true }).isolate, true);
+  assert.equal(resolveIsolateSetting({ write: true }).source, "write-default");
+  assert.equal(resolveIsolateSetting({ write: false }).isolate, false);
+  assert.equal(resolveIsolateSetting({ write: false }).source, "read-only");
+});
+
+test("programmatic write forces isolation and refuses --no-isolate", () => {
+  const forced = resolveIsolateSetting({ write: true, programmatic: true });
+  assert.equal(forced.isolate, true);
+  assert.equal(forced.source, "forced-programmatic");
+
+  assert.throws(
+    () =>
+      resolveIsolateSetting({
+        write: true,
+        programmatic: true,
+        cliNoIsolate: true
+      }),
+    /Programmatic write runs require isolation/
+  );
+
+  assert.throws(
+    () =>
+      resolveIsolateSetting({
+        write: true,
+        programmatic: true,
+        configIsolate: false
+      }),
+    /Programmatic write runs require isolation/
+  );
+});
+
+test("GROK_BUILD_ALLOW_NO_ISOLATE escape hatch permits programmatic --no-isolate", () => {
+  const decision = resolveIsolateSetting({
+    write: true,
+    programmatic: true,
+    cliNoIsolate: true,
+    allowNoIsolate: true
+  });
+  assert.equal(decision.isolate, false);
+  assert.equal(decision.source, "cli");
 });
 
 test("verify sources have user-facing labels", () => {

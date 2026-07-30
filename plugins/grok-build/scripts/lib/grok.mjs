@@ -561,6 +561,123 @@ export const READ_ONLY_DENY_RULES = Object.freeze([
 ]);
 
 /**
+ * Normalise a filesystem path for Hyper deny/allow globs.
+ *
+ * Forward slashes, no trailing slash. Measured on Windows: Hyper accepts
+ * `C:/Users/…/main/**` and evaluates it against absolute tool targets. A
+ * trailing slash would double up with the `/**` suffix.
+ *
+ * @param {string} targetPath
+ * @returns {string}
+ */
+export function normalizePathForPermissionRule(targetPath) {
+  return String(targetPath ?? "")
+    .replace(/\\/g, "/")
+    .replace(/\/+$/, "");
+}
+
+/**
+ * True when `inner` is the same as or nested under `outer` after normalisation.
+ * Used to refuse a self-denying rule that would block the run's own worktree.
+ *
+ * @param {string} outer
+ * @param {string} inner
+ * @returns {boolean}
+ */
+export function pathIsInsideOrEqual(outer, inner) {
+  const a = normalizePathForPermissionRule(outer).toLowerCase();
+  const b = normalizePathForPermissionRule(inner).toLowerCase();
+  if (!a || !b) {
+    return false;
+  }
+  return b === a || b.startsWith(`${a}/`);
+}
+
+/**
+ * Deny rules that keep an isolated write run out of the main checkout.
+ *
+ * Measured: `--deny` beats `--always-approve` and covers the shell too
+ * (Hyper permission/manager.rs evaluates deny first). Skip the rules entirely
+ * when the worktree sits inside `workspaceRoot` — that would self-deny the
+ * only writable root. Callers should log a warning in that case.
+ *
+ * @param {string} workspaceRoot
+ * @param {string} [worktreePath]
+ * @returns {{ rules: string[], skipped: boolean, reason: string|null }}
+ */
+export function buildWorkspaceRootDenyRules(workspaceRoot, worktreePath = null) {
+  const root = normalizePathForPermissionRule(workspaceRoot);
+  if (!root) {
+    return { rules: [], skipped: true, reason: "empty-workspace-root" };
+  }
+  if (worktreePath && pathIsInsideOrEqual(root, worktreePath)) {
+    return {
+      rules: [],
+      skipped: true,
+      reason: "worktree-inside-workspace-root"
+    };
+  }
+  return {
+    rules: [
+      `Edit(${root}/**)`,
+      `Write(${root}/**)`,
+      `NotebookEdit(${root}/**)`
+    ],
+    skipped: false,
+    reason: null
+  };
+}
+
+// Per-process cache: probing `--help` once is enough. Tests inject a fresh
+// Map via options.cache when they need isolation between cases.
+const defaultConfineSupportCache = new Map();
+
+/**
+ * Whether `GROK_BUILD_CONFINE` wants the confine flag (default: on).
+ * Only "0" / "false" disable it — absence means try when the CLI supports it.
+ */
+export function confineFeatureEnabled(env = process.env) {
+  const raw = String(env?.GROK_BUILD_CONFINE ?? "").trim().toLowerCase();
+  if (raw === "0" || raw === "false" || raw === "off" || raw === "no") {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Probe whether the CLI binary advertises `--confine`. Cached per binary path
+ * for the lifetime of the process so a long-running bridge does not pay the
+ * cost on every run.
+ *
+ * @param {string} binary
+ * @param {{ env?: NodeJS.ProcessEnv, runCommandImpl?: typeof runCommand, cache?: Map<string, boolean> }} [options]
+ * @returns {boolean}
+ */
+export function cliSupportsConfine(binary, options = {}) {
+  const cache = options.cache ?? defaultConfineSupportCache;
+  const key = String(binary ?? "");
+  if (cache.has(key)) {
+    return cache.get(key);
+  }
+  const runCommandImpl = options.runCommandImpl ?? runCommand;
+  let supported = false;
+  try {
+    const result = runCommandImpl(binary, ["--help"], {
+      env: options.env,
+      maxBuffer: 256 * 1024
+    });
+    const text = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+    // Do not use a leading \b: `--` is non-word so \b-- never matches after a
+    // space. Look for the flag token anywhere in --help output.
+    supported = /(?:^|[\s,|])--confine(?:\b|=|\s|$)/.test(text);
+  } catch {
+    supported = false;
+  }
+  cache.set(key, supported);
+  return supported;
+}
+
+/**
  * Permission flags for a headless run.
  *
  * Read-only keeps `--permission-mode plan` (portable intent) and
@@ -637,6 +754,13 @@ export function buildHeadlessArgs(prompt, options = {}) {
   }
   for (const rule of normalizeRuleList(options.allowRules)) {
     trailing.push("--allow", rule);
+  }
+  // Future Hyper flag: confine the agent to a single writable root. Only
+  // emitted when the caller confirmed the CLI advertises it (probe is cached
+  // once per process). Silently omit on a CLI that lacks it so the bridge
+  // does not break on an older binary.
+  if (options.confine) {
+    trailing.push("--confine", String(options.confine));
   }
   if (options.model) {
     trailing.push("--model", options.model);

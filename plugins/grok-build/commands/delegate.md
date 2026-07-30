@@ -1,6 +1,6 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up work to the Grok Build delegate subagent
-argument-hint: "[--background|--wait] [--resume|--fresh] [--model <model>] [--effort <low|medium|high>] [--verify <cmd>] [--no-verify] [--env KEY=VALUE] [--blender-sandbox] [--no-isolate] [--max-duration <s>] [what Grok should investigate, solve, or continue]"
+argument-hint: "[--background|--wait|--foreground] [--resume|--fresh] [--model <model>] [--effort <low|medium|high>] [--verify <cmd>] [--no-verify] [--env KEY=VALUE] [--blender-sandbox] [--no-isolate] [--max-duration <s>] [what Grok should investigate, solve, or continue]"
 allowed-tools: Bash(node:*), AskUserQuestion, Agent
 ---
 
@@ -13,11 +13,14 @@ $ARGUMENTS
 
 Execution mode:
 
-- If the request includes `--background`, run the `grok-build:grok-delegate` subagent in the background.
-- If the request includes `--wait`, run the `grok-build:grok-delegate` subagent in the foreground.
-- If neither flag is present, default to foreground.
-- Bridge `--background` is used only when the user explicitly asked for it. A foreground delegation blocks until Grok finishes; pass `--max-duration <seconds>` if the caller wants a wall-clock cap on the run itself. That flag already exists and stops the run after the limit — it is not the same thing as Claude Code's own (separate, shorter) Bash-tool timeout, so do not treat one as a substitute for the other.
-- `--background` and `--wait` are execution flags for Claude Code. Do not forward them to `run`, and do not treat them as part of the natural-language task text.
+- **Default is background.** The Claude Code Bash tool hard-caps foreground work at ~10 minutes; real Grok runs are often 5–20 minutes. A killed wrapper used to report failure for a run that later succeeded. Unless the user passed `--wait` or `--foreground`, run the `grok-build:grok-delegate` subagent in the background and have it pass `--background` to the bridge.
+- If the request includes `--background`, run the subagent in the background (same as the default).
+- If the request includes `--wait` or `--foreground`, run the subagent in the foreground and do **not** pass bridge `--background`.
+- After a background launch, the bridge stdout names the run id and log path. Follow up with:
+  - `node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" wait <id> --timeout <seconds>`
+  - or `node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" runs <id> --wait --timeout-ms <n>` then `show <id>`
+- Pass `--max-duration <seconds>` if the caller wants a wall-clock cap on the run itself. That flag already exists and stops the run after the limit — it is not the same thing as Claude Code's own (separate, shorter) Bash-tool timeout, so do not treat one as a substitute for the other.
+- `--background`, `--wait`, and `--foreground` are execution flags for Claude Code. Do not forward them to `run`, and do not treat them as part of the natural-language task text.
 - `--model` and `--effort` are runtime-selection flags. Preserve them for the forwarded `run` call, but do not treat them as part of the natural-language task text.
 - **Passthrough flags.** The user may type any of the following directly into `/grok-build:delegate`. Forward each one **verbatim** to the `run` invocation the subagent builds, and strip it out of the natural-language task text exactly like `--model`/`--effort` are already stripped — never fold one of these into prose:
   `--verify` (repeatable — forward every occurrence), `--verify-attempts`, `--verify-ignore` (repeatable), `--verify-timeout`, `--baseline-timeout`, `--verify-max-buffer`, `--no-verify`, `--no-verify-baseline`, `--env` (repeatable), `--blender-sandbox`, `--no-isolate`, `--max-duration`, `--max-turns`, `--max-cost`. `--prompt-file` is deliberately **not** in this list: it is the subagent's own mechanism for delivering the task text (see below), not a flag a user types.
@@ -52,7 +55,7 @@ Operating rules:
 - The subagent must NOT embed the raw task text inside a double-quoted shell string. Task text may contain backticks or `$(...)` (including when quoted from a file, issue, or PR) and would execute if re-parsed by the shell. Prefer writing the task to a temp file and passing `--prompt-file` (the bridge supports this), or piping on stdin. Never hand-build `run "…task…"`.
 - Return the Grok bridge stdout verbatim to the user.
 - Do not paraphrase, summarize, rewrite, or add commentary before or after it.
-- Do not ask the subagent to inspect files, monitor progress, poll `/grok-build:runs`, fetch `/grok-build:show`, call `/grok-build:stop`, summarize output, or do follow-up work of its own.
+- Do not ask the subagent to inspect files, monitor progress, poll `/grok-build:runs`, fetch `/grok-build:show`, call `/grok-build:stop`, summarize output, or do follow-up work of its own. The main thread may wait with `wait <id>` / `runs <id> --wait` after a background launch.
 - Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort.
 - Leave the model unset unless the user explicitly asks for one.
 - Leave `--resume` and `--fresh` in the forwarded request. The subagent handles that routing when it builds the `run` command.

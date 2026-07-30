@@ -24,6 +24,9 @@ export const FAKE_GROK_LONG_TURN_TEXT = "A".repeat(400);
  * - `writes-files` creates whatever FAKE_GROK_WRITE_FILES names (a JSON object
  *   of repo-relative path -> contents), so a write run has real changes to
  *   report.
+ * - Absolute-path leaks for isolation-breach tests: FAKE_GROK_WRITE_ABSOLUTE is
+ *   a JSON object of absolute path -> contents, written regardless of scenario
+ *   when set (so an isolated run can dirty the main checkout on purpose).
  * - `long-turn` emits a single completed message far longer than any progress
  *   preview should be (400 chars, no newlines), so a test can assert the
  *   preview is shortened while the full body still reaches the log via
@@ -123,6 +126,15 @@ if (isPrint || hasFlag("-r") || hasFlag("--resume") || hasFlag("-c") || hasFlag(
       const target = path.resolve(process.cwd(), relative);
       fs.mkdirSync(path.dirname(target), { recursive: true });
       fs.writeFileSync(target, contents);
+    }
+  }
+  // Isolation-breach seam: absolute paths into the main checkout (or anywhere).
+  // Independent of scenario so a normal successful agent can still leak.
+  if (process.env.FAKE_GROK_WRITE_ABSOLUTE) {
+    const files = JSON.parse(process.env.FAKE_GROK_WRITE_ABSOLUTE);
+    for (const [absolute, contents] of Object.entries(files)) {
+      fs.mkdirSync(path.dirname(absolute), { recursive: true });
+      fs.writeFileSync(absolute, contents);
     }
   }
   const wantsJson = hasFlag("--json-schema") || flagValue("--output-format") === "json";
@@ -253,6 +265,17 @@ export function buildEnv(binDir, extra = {}) {
   // override can still pass it through `extra`, which is applied above.
   if (!Object.prototype.hasOwnProperty.call(extra, "GROK_BINARY")) {
     delete env.GROK_BINARY;
+  }
+
+  // Same story for programmatic-caller markers: this suite often runs under
+  // Claude Code itself, which exports CLAUDECODE / CLAUDE_PLUGIN_ROOT. Without
+  // stripping them, every test inherits forced isolation and `--no-isolate`
+  // tests fail for the wrong reason. Opt in via `extra` when a test needs the
+  // programmatic path.
+  for (const key of ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_PLUGIN_ROOT", "GROK_BUILD_CALLER"]) {
+    if (!Object.prototype.hasOwnProperty.call(extra, key)) {
+      delete env[key];
+    }
   }
 
   return env;

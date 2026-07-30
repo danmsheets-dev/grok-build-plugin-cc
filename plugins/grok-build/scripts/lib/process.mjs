@@ -475,6 +475,57 @@ function looksLikeMissingProcessMessage(text) {
   return /not found|no running instance|cannot find|does not exist|no such process/i.test(text);
 }
 
+function looksLikeCouldNotTerminateMessage(text) {
+  // taskkill can exit non-zero with per-PID lines like:
+  //   ERROR: The process with PID 33740 (child process of PID 27808) could not be terminated.
+  //   Reason: The operation attempted is not supported.
+  // Treating the overall exit code alone as "failed completely" and throwing
+  // left the job at status:running with alive:false for over an hour.
+  return /could not be terminated/i.test(String(text ?? ""));
+}
+
+/**
+ * Best-effort descendant PIDs of `rootPid` on win32 via CIM, leaf-first.
+ * Empty array on any failure — the caller still has the root pid to try.
+ */
+function listWin32DescendantPidsLeafFirst(rootPid, runCommandImpl, options = {}) {
+  const script = [
+    `$root = ${Number(rootPid)}`,
+    "$all = Get-CimInstance Win32_Process | Select-Object ProcessId, ParentProcessId",
+    "$children = @{}",
+    "foreach ($p in $all) {",
+    "  $pp = [int]$p.ParentProcessId",
+    "  if (-not $children.ContainsKey($pp)) { $children[$pp] = New-Object System.Collections.ArrayList }",
+    "  [void]$children[$pp].Add([int]$p.ProcessId)",
+    "}",
+    "$ordered = New-Object System.Collections.ArrayList",
+    "function Walk([int]$id) {",
+    "  if ($children.ContainsKey($id)) { foreach ($c in @($children[$id])) { Walk $c } }",
+    "  if ($id -ne $root) { [void]$ordered.Add($id) }",
+    "}",
+    "Walk $root",
+    "$ordered -join ','"
+  ].join("; ");
+
+  try {
+    const result = runCommandImpl(
+      "powershell",
+      ["-NoProfile", "-NonInteractive", "-Command", script],
+      { cwd: options.cwd, env: options.env }
+    );
+    const text = String(result.stdout ?? "").trim();
+    if (!text) {
+      return [];
+    }
+    return text
+      .split(",")
+      .map((part) => Number(part.trim()))
+      .filter((pid) => Number.isFinite(pid) && pid > 0);
+  } catch {
+    return [];
+  }
+}
+
 function isZombieProcess(pid) {
   try {
     const result = spawnSync("ps", ["-p", String(pid), "-o", "stat="], {
@@ -524,9 +575,28 @@ function tryKill(killImpl, pid, signal) {
   }
 }
 
+/**
+ * Best-effort kill of a process tree.
+ *
+ * NEVER throws on a kill-tool failure. Field defect: taskkill can report
+ * "could not be terminated" for a child while the overall status is non-zero,
+ * and the previous code threw — so `stop` never wrote a terminal claim and the
+ * job sat at `status: running, alive: false` for over an hour. The final
+ * answer always comes from the alive probe, not from any single command's
+ * exit code.
+ *
+ * @returns {{
+ *   attempted: boolean,
+ *   delivered: boolean,
+ *   method: string|null,
+ *   errorText: string|null,
+ *   survivors?: number[],
+ *   result?: object
+ * }}
+ */
 export function terminateProcessTree(pid, options = {}) {
   if (!Number.isFinite(pid)) {
-    return { attempted: false, delivered: false, method: null };
+    return { attempted: false, delivered: false, method: null, errorText: null };
   }
 
   const platform = options.platform ?? process.platform;
@@ -535,35 +605,157 @@ export function terminateProcessTree(pid, options = {}) {
   const isAliveImpl =
     options.isAliveImpl ?? ((candidatePid) => processIsAlive(candidatePid, killImpl));
   const graceMs = options.graceMs ?? 200;
+  // Short settle between win32 escalation steps. Injected so tests do not sleep.
+  const settleMs = options.settleMs ?? 250;
 
   if (platform === "win32") {
-    const result = runCommandImpl("taskkill", ["/PID", String(pid), "/T", "/F"], {
-      cwd: options.cwd,
-      env: options.env
-    });
+    const methods = [];
+    const errorParts = [];
+    let lastResult = null;
 
-    if (!result.error && result.status === 0) {
-      return { attempted: true, delivered: true, method: "taskkill", result };
-    }
-
-    const combinedOutput = `${result.stderr}\n${result.stdout}`.trim();
-    if (!result.error && looksLikeMissingProcessMessage(combinedOutput)) {
-      return { attempted: true, delivered: false, method: "taskkill", result };
-    }
-
-    if (result.error?.code === "ENOENT") {
-      const direct = tryKill(killImpl, pid, "SIGTERM");
-      if (direct.missing) {
-        return { attempted: true, delivered: false, method: "kill" };
+    const recordError = (text) => {
+      const trimmed = String(text ?? "").trim();
+      if (trimmed) {
+        errorParts.push(trimmed);
       }
-      return { attempted: true, delivered: true, method: "kill" };
+    };
+
+    // 1) taskkill /T /F — still the right first move; it covers the common case.
+    try {
+      const result = runCommandImpl("taskkill", ["/PID", String(pid), "/T", "/F"], {
+        cwd: options.cwd,
+        env: options.env
+      });
+      lastResult = result;
+      methods.push("taskkill");
+      const combinedOutput = `${result.stderr ?? ""}\n${result.stdout ?? ""}`.trim();
+      if (result.error?.code === "ENOENT") {
+        recordError("taskkill not found");
+        const direct = tryKill(killImpl, pid, "SIGTERM");
+        methods.push("kill");
+        if (direct.missing) {
+          return {
+            attempted: true,
+            delivered: false,
+            method: methods.join("+"),
+            errorText: errorParts.join("; ") || null,
+            result: lastResult
+          };
+        }
+      } else if (result.error) {
+        recordError(result.error.message || String(result.error));
+      } else if (looksLikeMissingProcessMessage(combinedOutput)) {
+        return {
+          attempted: true,
+          delivered: false,
+          method: methods.join("+"),
+          errorText: null,
+          result: lastResult
+        };
+      } else if (result.status === 0 && !looksLikeCouldNotTerminateMessage(combinedOutput)) {
+        // Clean taskkill. Still re-probe below — exit 0 is not proof a
+        // stubborn child is gone on every Windows build.
+      } else {
+        recordError(combinedOutput || `taskkill exit ${result.status}`);
+      }
+    } catch (error) {
+      // Deliberately never rethrow: stop must report survivors, not crash.
+      methods.push("taskkill");
+      recordError(error instanceof Error ? error.message : String(error));
     }
 
-    if (result.error) {
-      throw result.error;
+    sleepMs(settleMs);
+    if (!isAliveImpl(pid)) {
+      return {
+        attempted: true,
+        delivered: true,
+        method: methods.join("+") || "taskkill",
+        errorText: errorParts.join("; ") || null,
+        result: lastResult
+      };
     }
 
-    throw new Error(formatCommandFailure(result));
+    // 2) PowerShell Stop-Process on the root.
+    try {
+      const stopResult = runCommandImpl(
+        "powershell",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          `Stop-Process -Id ${Number(pid)} -Force -ErrorAction SilentlyContinue`
+        ],
+        { cwd: options.cwd, env: options.env }
+      );
+      lastResult = stopResult;
+      methods.push("stop-process");
+      if (stopResult.error) {
+        recordError(stopResult.error.message || String(stopResult.error));
+      }
+    } catch (error) {
+      methods.push("stop-process");
+      recordError(error instanceof Error ? error.message : String(error));
+    }
+
+    sleepMs(settleMs);
+    if (!isAliveImpl(pid)) {
+      return {
+        attempted: true,
+        delivered: true,
+        method: methods.join("+"),
+        errorText: errorParts.join("; ") || null,
+        result: lastResult
+      };
+    }
+
+    // 3) Enumerate descendants leaf-first and Stop-Process each one. taskkill
+    // /T sometimes cannot terminate a child ("operation not supported");
+    // killing leaves first is the remaining lever.
+    const descendants = listWin32DescendantPidsLeafFirst(pid, runCommandImpl, options);
+    if (descendants.length > 0) {
+      methods.push("cim-leaf");
+      for (const childPid of descendants) {
+        try {
+          runCommandImpl(
+            "powershell",
+            [
+              "-NoProfile",
+              "-NonInteractive",
+              "-Command",
+              `Stop-Process -Id ${Number(childPid)} -Force -ErrorAction SilentlyContinue`
+            ],
+            { cwd: options.cwd, env: options.env }
+          );
+        } catch {
+          // best-effort per child
+        }
+      }
+      try {
+        runCommandImpl(
+          "powershell",
+          [
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            `Stop-Process -Id ${Number(pid)} -Force -ErrorAction SilentlyContinue`
+          ],
+          { cwd: options.cwd, env: options.env }
+        );
+      } catch {
+        // best-effort root retry
+      }
+      sleepMs(settleMs);
+    }
+
+    const stillAlive = isAliveImpl(pid);
+    return {
+      attempted: true,
+      delivered: !stillAlive,
+      method: methods.join("+") || "taskkill",
+      errorText: errorParts.join("; ") || null,
+      survivors: stillAlive ? [pid] : [],
+      result: lastResult
+    };
   }
 
   const methods = [];
@@ -586,7 +778,8 @@ export function terminateProcessTree(pid, options = {}) {
       return {
         attempted: true,
         delivered: signaledLiveProcess,
-        method: methods.join("+") || "process"
+        method: methods.join("+") || "process",
+        errorText: null
       };
     } else if (directKill.denied) {
       methods.push("process-denied");
@@ -595,26 +788,38 @@ export function terminateProcessTree(pid, options = {}) {
     return {
       attempted: true,
       delivered: false,
-      method: methods.join("+") || "process-group"
+      method: methods.join("+") || "process-group",
+      errorText: null
     };
   } else {
     return {
       attempted: true,
       delivered: true,
-      method: methods.join("+") || "process-group"
+      method: methods.join("+") || "process-group",
+      errorText: null
     };
   }
 
   const deadline = Date.now() + graceMs;
   while (Date.now() < deadline) {
     if (!isAliveImpl(pid)) {
-      return { attempted: true, delivered: true, method: methods.join("+") || "process" };
+      return {
+        attempted: true,
+        delivered: true,
+        method: methods.join("+") || "process",
+        errorText: null
+      };
     }
     sleepMs(20);
   }
 
   if (!isAliveImpl(pid)) {
-    return { attempted: true, delivered: true, method: methods.join("+") || "process" };
+    return {
+      attempted: true,
+      delivered: true,
+      method: methods.join("+") || "process",
+      errorText: null
+    };
   }
 
   const groupKillHard = tryKill(killImpl, -pid, "SIGKILL");
@@ -626,10 +831,20 @@ export function terminateProcessTree(pid, options = {}) {
     if (directKillHard.ok) {
       methods.push("process-sigkill");
     } else if (directKillHard.missing) {
-      return { attempted: true, delivered: true, method: methods.join("+") || "process-sigkill" };
+      return {
+        attempted: true,
+        delivered: true,
+        method: methods.join("+") || "process-sigkill",
+        errorText: null
+      };
     }
   } else {
-    return { attempted: true, delivered: true, method: methods.join("+") || "process-group-sigkill" };
+    return {
+      attempted: true,
+      delivered: true,
+      method: methods.join("+") || "process-group-sigkill",
+      errorText: null
+    };
   }
 
   sleepMs(40);
@@ -637,7 +852,9 @@ export function terminateProcessTree(pid, options = {}) {
   return {
     attempted: true,
     delivered: !stillAlive,
-    method: methods.join("+") || "process-sigkill"
+    method: methods.join("+") || "process-sigkill",
+    errorText: stillAlive ? "process still alive after SIGKILL" : null,
+    survivors: stillAlive ? [pid] : []
   };
 }
 

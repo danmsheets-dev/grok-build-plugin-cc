@@ -2,6 +2,7 @@
  * Git worktree lifecycle for isolated agent runs.
  */
 
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -99,18 +100,79 @@ const GENERATED_ARTIFACT_PATTERNS = Object.freeze([
 const NEVER_COMMIT_PATTERNS = Object.freeze(["export_credentials.cfg"]);
 
 /**
+ * Stable 8-character digest of a run id for short Windows worktree paths.
+ *
+ * Deep engine caches (`.godot/imported/…`) under a long plugin-data prefix
+ * blow past MAX_PATH; `git worktree remove` then fails with "Filename too long"
+ * and leaves multi-hundred-MB orphans. The short form keeps the absolute path
+ * under the limit without changing how land/prune find an existing worktree —
+ * those always use the path stored on the job record, never recompute it.
+ *
  * @param {string} runId
- * @param {{ dataDir?: string, env?: NodeJS.ProcessEnv }} [options]
+ * @returns {string}
+ */
+export function shortWorktreeId(runId) {
+  return crypto.createHash("sha256").update(String(runId ?? "")).digest("hex").slice(0, 8);
+}
+
+/**
+ * Where a NEW worktree for `runId` should be created.
+ *
+ * Honour an explicit `dataDir` (tests and callers that own the layout). On
+ * win32 the default is deliberately short: `%TEMP%\gb\w\<8-char>` — not under
+ * CLAUDE_PLUGIN_DATA (path too long for deep Godot caches to delete) and not
+ * bare `%LOCALAPPDATA%\gb` (junctions fail to resolve there on Windows).
+ * Elsewhere keep the historical CLAUDE_PLUGIN_DATA / tmpdir layout.
+ *
+ * Existing worktrees recorded under the old path must still be found, removed
+ * and landed — resolve those from the stored job descriptor, never by calling
+ * this function again.
+ *
+ * @param {string} runId
+ * @param {{ dataDir?: string, env?: NodeJS.ProcessEnv, platform?: string }} [options]
  */
 export function resolveWorktreePath(runId, options = {}) {
   const env = options.env ?? process.env;
   if (options.dataDir) {
     return path.join(options.dataDir, "worktrees", runId);
   }
+  const platform = options.platform ?? process.platform;
+  if (platform === "win32") {
+    // TEMP, not LOCALAPPDATA: Windows junctions under bare %LOCALAPPDATA%\…
+    // (outside Temp) fail to resolve on this host class — mklink succeeds but
+    // dir/existsSync through the junction returns ENOENT. That breaks blender
+    // sandbox and provisioned link-dirs. %TEMP% is still short enough that an
+    // 8-char digest keeps deep .godot/imported paths under MAX_PATH.
+    const tempRoot = env.TEMP || env.TMP || os.tmpdir();
+    return path.join(tempRoot, "gb", "w", shortWorktreeId(runId));
+  }
   if (env.CLAUDE_PLUGIN_DATA) {
     return path.join(env.CLAUDE_PLUGIN_DATA, "worktrees", runId);
   }
   return path.join(os.tmpdir(), "grok-cc-worktrees", runId);
+}
+
+/**
+ * win32 long-path form (`\\?\C:\…`). Only meaningful on Windows; elsewhere
+ * returns the resolved path unchanged. Used when ordinary recursive delete
+ * fails with "Filename too long".
+ *
+ * @param {string} targetPath
+ * @returns {string}
+ */
+export function toWin32LongPath(targetPath) {
+  const resolved = path.resolve(String(targetPath ?? ""));
+  if (process.platform !== "win32") {
+    return resolved;
+  }
+  if (resolved.startsWith("\\\\?\\")) {
+    return resolved;
+  }
+  // UNC paths need \\?\UNC\server\share, not \\?\server\share.
+  if (resolved.startsWith("\\\\")) {
+    return `\\\\?\\UNC\\${resolved.slice(2)}`;
+  }
+  return `\\\\?\\${resolved}`;
 }
 
 /**
@@ -254,6 +316,14 @@ export function createWorktree({
     }
   }
 
+  // Best-effort: deep engine caches under the worktree otherwise hit MAX_PATH
+  // on win32 during teardown. Unsupported git versions simply ignore the set.
+  try {
+    gitImpl(worktreePath, ["config", "core.longpaths", "true"]);
+  } catch {
+    // creation already succeeded; longpaths is a teardown aid, not a gate
+  }
+
   return {
     worktreePath,
     branchName,
@@ -322,16 +392,81 @@ function unlinkReparsePointsSync(root) {
   }
 }
 
-export function removeWorktree({ repoRoot, worktreePath, branchName, deleteBranch = true }) {
-  if (worktreePath && fs.existsSync(worktreePath)) {
+/**
+ * Attempt to delete a directory tree, including the win32 `\\?\` long-path
+ * form when ordinary recursive delete fails (deep `.godot/imported/…` trees).
+ *
+ * @param {string} targetPath
+ * @param {{ platform?: string, rmSyncImpl?: typeof fs.rmSync }} [options]
+ * @returns {{ deleted: boolean, errorText?: string }}
+ */
+export function removeDirectoryTree(targetPath, options = {}) {
+  if (!targetPath) {
+    return { deleted: true };
+  }
+  const platform = options.platform ?? process.platform;
+  const rmSyncImpl = options.rmSyncImpl ?? fs.rmSync.bind(fs);
+  const exists = options.existsImpl ?? ((p) => fs.existsSync(p));
+
+  if (!exists(targetPath)) {
+    return { deleted: true };
+  }
+
+  let lastError = null;
+  try {
+    rmSyncImpl(targetPath, { recursive: true, force: true });
+  } catch (error) {
+    lastError = error;
+  }
+
+  if (!exists(targetPath)) {
+    return { deleted: true };
+  }
+
+  // win32 only: retry through the extended-length path. Node's fs accepts
+  // `\\?\` prefixes; without them MAX_PATH still applies and deep Godot caches
+  // survive every ordinary delete.
+  if (platform === "win32") {
+    try {
+      rmSyncImpl(toWin32LongPath(targetPath), { recursive: true, force: true });
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  if (!exists(targetPath)) {
+    return { deleted: true };
+  }
+
+  return {
+    deleted: false,
+    errorText: lastError instanceof Error ? lastError.message : lastError ? String(lastError) : "directory still exists"
+  };
+}
+
+export function removeWorktree({
+  repoRoot,
+  worktreePath,
+  branchName,
+  deleteBranch = true,
+  platform = process.platform,
+  rmSyncImpl,
+  existsImpl
+}) {
+  const exists = existsImpl ?? ((p) => fs.existsSync(p));
+  let removeError = null;
+
+  if (worktreePath && exists(worktreePath)) {
     unlinkReparsePointsSync(worktreePath);
     const result = git(repoRoot, ["worktree", "remove", "--force", worktreePath]);
-    if (result.status !== 0) {
-      try {
-        fs.rmSync(worktreePath, { recursive: true, force: true });
-      } catch {
-        // best-effort
+    if (result.status !== 0 || exists(worktreePath)) {
+      const treeResult = removeDirectoryTree(worktreePath, { platform, rmSyncImpl, existsImpl: exists });
+      if (!treeResult.deleted) {
+        removeError = treeResult.errorText;
       }
+      // Only prune the registration after we either deleted the directory or
+      // have already failed loudly. Quiet prune-without-delete is what left
+      // multi-hundred-MB orphans in the field while git forgot the worktree.
       git(repoRoot, ["worktree", "prune"]);
     }
   } else {
@@ -343,8 +478,13 @@ export function removeWorktree({ repoRoot, worktreePath, branchName, deleteBranc
   }
 
   const reasons = [];
-  if (worktreePath && fs.existsSync(worktreePath)) {
-    reasons.push("worktree directory still exists after removal attempt");
+  const stillOnDisk = Boolean(worktreePath && exists(worktreePath));
+  if (stillOnDisk) {
+    reasons.push(
+      removeError
+        ? `worktree directory still exists after removal attempt: ${removeError}`
+        : "worktree directory still exists after removal attempt"
+    );
   }
   if (deleteBranch && branchName) {
     const branchCheck = git(repoRoot, ["rev-parse", "--verify", branchName]);
@@ -358,11 +498,14 @@ export function removeWorktree({ repoRoot, worktreePath, branchName, deleteBranc
       removed: false,
       worktreePath,
       branchName,
-      reason: reasons.join("; ")
+      reason: reasons.join("; "),
+      // Loud rather than quietly deregistered: the caller (prune, land) must
+      // list anything it could not delete so an operator can free the disk.
+      orphanedPath: stillOnDisk ? worktreePath : null
     };
   }
 
-  return { removed: true, worktreePath, branchName };
+  return { removed: true, worktreePath, branchName, orphanedPath: null };
 }
 
 /**

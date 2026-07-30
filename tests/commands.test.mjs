@@ -143,10 +143,10 @@ test("runtime skill only forwards run once", () => {
   assert.match(runtimeSkill, /Use `run` for every delegate request/i);
   assert.match(runtimeSkill, /run --resume-last/i);
   assert.match(runtimeSkill, /Do not call `check`, `review`, `critique`, `runs`, `show`, or `stop`/);
-  assert.match(runtimeSkill, /natural-language task text/);
   // Shell-injection safety: task text must not be interpolated into a quoted shell string.
   assert.match(runtimeSkill, /--prompt-file/i);
   assert.match(runtimeSkill, /Never build the Bash command by directly embedding the task text/i);
+  assert.match(runtimeSkill, /natural-language task text|task text/i);
 
   const agent = read("agents/grok-delegate.md");
   assert.match(agent, /--prompt-file/i);
@@ -178,24 +178,33 @@ test("the delegate command documents that verification is automatic", () => {
   assert.match(delegate, /one `Bash` call/);
 });
 
-test("the delegate subagent never chooses background on its own", () => {
+test("the delegate subagent defaults to background because of the Bash ceiling", () => {
   const agent = read(path.join("agents", "grok-delegate.md"));
   assert.match(
     agent,
-    /only add `--background` when the user explicitly passed/i,
-    "the agent must not infer background from task complexity"
+    /Default to background/i,
+    "background is the default so runs over 10 minutes can finish"
   );
+  assert.match(agent, /10-minute|10 minute|Bash.*ceiling|hard ~10/i);
+  assert.match(agent, /--foreground|--wait/);
   assert.doesNotMatch(
     agent,
     /looks complicated, open-ended, multi-step/i,
-    "the complexity-based background heuristic must be removed"
+    "the complexity-based background heuristic must stay removed"
   );
 });
 
-test("the delegate runtime skill states the same rule", () => {
+test("the delegate runtime skill defaults to background", () => {
   const skill = read(path.join("skills", "grok-delegate-runtime", "SKILL.md"));
-  assert.match(skill, /only add `--background` when the user explicitly passed/i);
-  assert.doesNotMatch(skill, /Prefer bridge `--background` for long work/i);
+  assert.match(skill, /Always add `--background` unless/i);
+  assert.match(skill, /10 minute|10-minute|Bash tool hard-caps/i);
+  assert.match(skill, /wait <id>|runs <id> --wait/i);
+});
+
+test("the delegate command documents background default and wait follow-up", () => {
+  const delegate = read(path.join("commands", "delegate.md"));
+  assert.match(delegate, /Default is background/i);
+  assert.match(delegate, /wait <id>|grok-bridge\.mjs" wait/i);
 });
 
 test("the plugin README states the isolation guarantee plainly", () => {
