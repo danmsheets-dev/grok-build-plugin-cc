@@ -633,7 +633,7 @@ function tailBytesOf(text, maxBytes) {
   return `[... ${buffer.length - maxBytes} earlier bytes elided; showing the last ${maxBytes} bytes ...]\n${tail}`;
 }
 
-function buildBoundedVerifyFixPrompt(command, output) {
+function buildBoundedVerifyFixPrompt(command, output, options = {}) {
   // Verify stdout/stderr can echo real secrets (env dumps, config prints). Scrub
   // before embedding in the next model prompt so a leaked key is not re-sent.
   // Redact BEFORE truncating: truncating first would leave a secret that happens
@@ -643,6 +643,29 @@ function buildBoundedVerifyFixPrompt(command, output) {
     redactSecretsDeep(output == null ? "" : String(output)),
     VERIFY_FIX_OUTPUT_TAIL_BYTES
   );
+
+  const matchedLines = Array.isArray(options.matchedLines) ? options.matchedLines : [];
+  if (options.outputFailure && matchedLines.length > 0) {
+    // Godot and Blender both exit 0 on a broken project, so "exit_code: 0" in
+    // the Output block below reads as a pass unless the prompt says
+    // otherwise. The matched marker line(s) - the ONLY evidence this command
+    // actually failed - go ABOVE the tail-truncated output rather than relying
+    // on them surviving inside it: a Godot import prints its SCRIPT ERROR
+    // early and then hundreds of `Import: res://...` lines, which is exactly
+    // what pushes the real failure out of a tail-only capture. The generic
+    // "re-run until it passes" instruction is also wrong here - the command
+    // already exits 0 every time, so that sentence is not swapped in.
+    const safeMatchedLines = matchedLines.map((line) => redactSecretsDeep(String(line ?? "")));
+    return (
+      `The verify command \`${command}\` exited 0, but it is treated as FAILED because its output matched a known ` +
+      `engine failure marker:\n${safeMatchedLines.map((line) => `  ${line}`).join("\n")}\n\n` +
+      `Exit status alone does not mean it passed. Fix the underlying cause so that marker no longer appears - do not ` +
+      `just make this command exit non-zero or otherwise game its exit code. Do not investigate unrelated failures, ` +
+      `do not run the full test suite, and do not change any test to make it pass.\n\n` +
+      `Output:\n${safeOutput}`
+    );
+  }
+
   return (
     `The verify command \`${command}\` failed. Fix the cause, then re-run only that exact command until it passes. ` +
     `Do not investigate unrelated failures, do not run the full test suite, and do not change any test to make it pass.\n\n` +
@@ -2566,7 +2589,13 @@ async function executeTaskRun(request) {
           env: runEnv,
           timeoutMs,
           maxOutputBytes: verifyTiming.maxOutputBytes ?? undefined,
-          outputFailurePatterns
+          outputFailurePatterns,
+          // Must mirror the baseline probe above: passing this to
+          // summarizeFailures alone (as shipped) left detectOutputFailures
+          // ungated, so an "ignored" line still set outcome.ok:false and then
+          // produced an empty, incomparable signature - a diagnosis strictly
+          // worse than not ignoring the line at all.
+          ignorePatterns: verifyIgnorePatterns
         });
         const commandMs = Date.now() - commandStarted;
         request.onProgress?.({
@@ -2698,7 +2727,10 @@ async function executeTaskRun(request) {
       const fixAgent = await runHeadlessAgentWithDurationBudget(
         runCwd,
         {
-          prompt: buildBoundedVerifyFixPrompt(firstBlamed.command, firstBlamed.output),
+          prompt: buildBoundedVerifyFixPrompt(firstBlamed.command, firstBlamed.output, {
+            outputFailure: firstBlamed.outputFailure,
+            matchedLines: firstBlamed.matchedLines
+          }),
           resumeSessionId: result.threadId,
           model: request.model,
           effort: request.effort,
@@ -2851,6 +2883,15 @@ async function executeTaskRun(request) {
           write,
           verified,
           verifyNote,
+          // Which command(s) tripped an exit-0 output-failure marker, and what
+          // matched - the only evidence available without reading --json for
+          // a command whose exit code alone says it passed. Computed here
+          // rather than filtered inside buildTaskStatusLines so a render-only
+          // caller (e.g. a stored job re-rendered later) sees the same list a
+          // live run would have.
+          verifyMatchedLines: verifyResults
+            .filter((entry) => Array.isArray(entry.matchedLines) && entry.matchedLines.length > 0)
+            .map((entry) => ({ command: entry.command, matchedLines: entry.matchedLines })),
           // The visibility half of the item-4 trust story: a run that verifies
           // commands the user never typed has to say which commands, and where
           // they came from, in the same block that reports the verdict.

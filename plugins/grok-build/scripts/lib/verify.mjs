@@ -94,13 +94,21 @@ const OUTPUT_WARNING_LINE = /^(?:SCRIPT |USER |USER SCRIPT )?WARNING\b/;
  *
  * @param {string} output
  * @param {{id: string, re: RegExp}[]|null|undefined} patterns
+ * @param {RegExp[]|null|undefined} ignorePatterns `--verify-ignore` /
+ *   `verifyIgnorePatterns` — dropped BEFORE a failure pattern is tested, next
+ *   to the WARNING guard above, so an ignored line cannot set `ok:false` in
+ *   the first place. Threading this only into summarizeFailures (as shipped)
+ *   left detection itself ungated: the command still came back failed, just
+ *   with an empty signature, which classifies as the unreadable
+ *   `incomparable` verdict instead of not failing at all.
  * @returns {{ id: string, line: string }[]}
  */
-export function detectOutputFailures(output, patterns) {
+export function detectOutputFailures(output, patterns, ignorePatterns) {
   const list = Array.isArray(patterns) ? patterns : [];
   if (list.length === 0) {
     return [];
   }
+  const ignore = Array.isArray(ignorePatterns) ? ignorePatterns : [];
 
   const matched = [];
   const seen = new Set();
@@ -108,7 +116,7 @@ export function detectOutputFailures(output, patterns) {
   // with carriage returns would otherwise present its whole run as one line.
   for (const raw of String(output ?? "").split(/\r\n|\r|\n/)) {
     const line = raw.trim();
-    if (!line || OUTPUT_WARNING_LINE.test(line)) {
+    if (!line || OUTPUT_WARNING_LINE.test(line) || ignore.some((re) => re.test(line))) {
       continue;
     }
     for (const entry of list) {
@@ -196,6 +204,7 @@ export function resolveOutputFailurePatterns(ecosystemId, extraPatterns, options
  *   timeoutMs?: number,
  *   maxOutputBytes?: number,
  *   outputFailurePatterns?: {id: string, re: RegExp}[],
+ *   ignorePatterns?: RegExp[],
  *   runCommandImpl?: typeof runCommandAsync,
  *   platform?: string
  * }} [options]
@@ -303,7 +312,9 @@ export async function runVerifyCommand(command, cwd, options = {}) {
   // re-labelling its source would overwrite the more specific attribution the
   // classifier derives from the baseline comparison.
   const outputFailures =
-    status === 0 ? detectOutputFailures(`${stdout}\n${stderr}`, options.outputFailurePatterns) : [];
+    status === 0
+      ? detectOutputFailures(`${stdout}\n${stderr}`, options.outputFailurePatterns, options.ignorePatterns)
+      : [];
 
   // A command that failed and said nothing about it. On Windows this is the
   // signature of a GUI-subsystem Godot build: it has no console attached, so
@@ -402,7 +413,14 @@ export async function probeBaselines(commands, cwd, options = {}) {
       env: options.env,
       timeoutMs: options.timeoutMs,
       maxOutputBytes: options.maxOutputBytes,
-      outputFailurePatterns: options.outputFailurePatterns
+      outputFailurePatterns: options.outputFailurePatterns,
+      // Must match the post-agent pass: this used to be threaded into
+      // summarizeFailures only (below), leaving detection itself ungated. A
+      // baseline probed WITHOUT the ignore list can come back `ok:false` on a
+      // line the user asked to ignore, and every downstream comparison then
+      // treats "ignored at baseline" and "ignored after the run" as two
+      // different runs of two different commands.
+      ignorePatterns: options.ignorePatterns
     });
     const ms = Date.now() - started;
     const summary = summarizeFailures(probe?.output, { ignorePatterns: options.ignorePatterns });

@@ -620,6 +620,17 @@ export function buildTaskStatusLines(meta = {}, rawOutput = "") {
         ? `Verified: no - ${meta.verifyNote}`
         : "Verified: no - verification did not pass within the attempt budget."
     );
+
+    // Godot and Blender both exit 0 on a broken project, so a `Verified: no`
+    // on an exit-0 command is otherwise inexplicable without reading
+    // `--json`'s matchedLines field - which nobody does mid-run. This is the
+    // only place a reader who never opens the JSON learns which line made the
+    // bridge disbelieve a clean exit code.
+    for (const entry of meta.verifyMatchedLines ?? []) {
+      for (const line of entry.matchedLines ?? []) {
+        lines.push(`  Output matched a known failure marker in \`${entry.command}\`: ${line}`);
+      }
+    }
   }
 
   pushProvisionLines(lines, meta.provision);

@@ -1255,6 +1255,87 @@ test("the same exit-0 output passes in a project with no engine ecosystem", () =
   assert.equal(payload.verify.results[0].outputFailure, false);
 });
 
+test("--verify-ignore applies to detection symmetrically at baseline and after the run", () => {
+  // F2's mandatory guard test. The ignore list used to reach summarizeFailures
+  // only, leaving detectOutputFailures ungated in BOTH probeBaselines and the
+  // post-agent runVerifyCommand call - so an "ignored" engine failure still
+  // set ok:false on both sides and then produced an empty, incomparable
+  // signature, blaming the agent with a reason nobody could act on.
+  //
+  // engine.cjs prints the SAME two lines unconditionally, both at baseline and
+  // after the run: one that --verify-ignore is asked to drop, and one that is
+  // not. If the ignore is applied on only one of the two call sites, the two
+  // sides disagree about whether the command ok'd at all, which either
+  // produces an "incomparable" verdict or blames the agent outright - the
+  // exact asymmetry the fix plan calls out as strictly worse than the bug.
+  const repo = makeTempDir("grok-verify-ignore-symmetry-");
+  const binDir = makeTempDir("grok-verify-ignore-symmetry-bin-");
+  const pluginDataDir = makeTempDir("grok-verify-ignore-symmetry-data-");
+  installFakeGrok(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(
+    path.join(repo, "project.godot"),
+    'config_version=5\n\n[application]\n\nconfig/name="Demo"\n',
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(repo, "engine.cjs"),
+    [
+      "console.log('SCRIPT ERROR: Parse Error: known_issue not declared');",
+      "console.log('SCRIPT ERROR: Failed to load script res://always_broken.gd');",
+      "process.exit(0);",
+      ""
+    ].join("\n"),
+    "utf8"
+  );
+  run("git", ["add", "."], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run(
+    "node",
+    [
+      SCRIPT,
+      "run",
+      "--json",
+      "--verify",
+      "node engine.cjs",
+      "--verify-ignore",
+      "known_issue",
+      "do something"
+    ],
+    { cwd: repo, env: pluginDataEnv(pluginDataDir, binDir) }
+  );
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.verify.plan.ecosystem, "godot");
+
+  const entry = payload.verify.results[0];
+  // The non-ignored line is a genuine failure that was ALSO there at
+  // baseline, so it must not be blamed on the agent...
+  assert.equal(entry.ok, false, "the non-ignored line still marks the command failed");
+  assert.equal(entry.failureSource, "baseline", "unchanged-from-baseline, not the agent");
+  assert.equal(entry.attribution, "unchanged-from-baseline");
+  // ...and the signature must be a real, non-empty, COMPARABLE one - not the
+  // empty "incomparable" signature the pre-fix asymmetry produced.
+  assert.ok(Array.isArray(entry.signature) && entry.signature.length > 0, JSON.stringify(entry.signature));
+  // The ignored line must never surface as a matched failure marker, at
+  // either the baseline probe or the post-agent pass.
+  assert.ok(
+    entry.matchedLines.every((line) => !line.includes("known_issue")),
+    JSON.stringify(entry.matchedLines)
+  );
+  assert.ok(entry.matchedLines.some((line) => line.includes("Failed to load script")));
+  const baselineEntry = payload.verify.baselines[0];
+  assert.ok(
+    !JSON.stringify(baselineEntry.signature).includes("known_issue"),
+    "the ignore list must reach the baseline probe's detection too, not only the post-agent pass"
+  );
+
+  // Because nothing was blamed, the run itself is reported verified overall.
+  assert.equal(payload.verified, true);
+});
+
 test("--verify-ignore reaches the stored request under --background", () => {
   // Compiled RegExps do not survive the JSON round trip into the job file, so
   // the request has to carry the raw pattern strings. A pattern that reached

@@ -725,6 +725,26 @@ test("the baseline probe measures with the same environment as the real pass", a
   }
 });
 
+test("probeBaselines forwards ignorePatterns to the probe, not only to summarizeFailures", async () => {
+  // F2's symmetry requirement: the baseline probe and the post-agent pass must
+  // both gate detection on the ignore list, or the two sides disagree about
+  // whether the same line was ever a failure.
+  const seen = [];
+  const fake = async (command, cwd, options) => {
+    seen.push(options?.ignorePatterns);
+    return { ok: true, exitCode: 0, timedOut: false, output: "exit_code: 0" };
+  };
+
+  const ignorePatterns = [/Cannot create RenderingDevice/];
+  await probeBaselines(["godot --headless --import"], "/repo", {
+    runVerifyCommandImpl: fake,
+    ignorePatterns
+  });
+
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0], ignorePatterns, "the exact ignore list must reach the probe call");
+});
+
 test("probeBaselines returns an empty list for an empty command list", () => {
   return probeBaselines([], "/tmp/project", {
     runVerifyCommandImpl: () => {
@@ -944,6 +964,32 @@ test("detectOutputFailures counts a line that trips two patterns once", () => {
   assert.equal(matched.length, 1);
 });
 
+test("detectOutputFailures drops an ignored line before it is ever tested against a pattern", () => {
+  // This is the load-bearing half of F2: threading ignorePatterns into
+  // summarizeFailures alone (as shipped) left THIS function - the one that
+  // decides outcome.ok - ungated, so an "ignored" line still failed the
+  // command outright and produced an empty, incomparable signature.
+  const output = [
+    "SCRIPT ERROR: Parse Error: identifier foo not declared",
+    "SCRIPT ERROR: Failed to load script res://always_broken.gd"
+  ].join("\n");
+
+  const ignoringTheOnlyFailure = detectOutputFailures(output, OUTPUT_FAILURE_PATTERNS.godot, [
+    /identifier foo not declared/
+  ]);
+  assert.equal(ignoringTheOnlyFailure.length, 1, "the second, non-ignored line must still be caught");
+  assert.match(ignoringTheOnlyFailure[0].line, /Failed to load script/);
+
+  const ignoringEverything = detectOutputFailures(output, OUTPUT_FAILURE_PATTERNS.godot, [
+    /SCRIPT ERROR/
+  ]);
+  assert.deepEqual(ignoringEverything, [], "both lines dropped means no failure at all, not an empty-signature failure");
+
+  // No ignore list at all must behave exactly as before - this is not a case
+  // of the new parameter being silently mandatory.
+  assert.deepEqual(detectOutputFailures(output, OUTPUT_FAILURE_PATTERNS.godot), detectOutputFailures(output, OUTPUT_FAILURE_PATTERNS.godot, []));
+});
+
 test("detectOutputFailures with no patterns is a no-op", () => {
   assert.deepEqual(detectOutputFailures(GODOT_IMPORT_OUTPUT, []), []);
   assert.deepEqual(detectOutputFailures(GODOT_IMPORT_OUTPUT, undefined), []);
@@ -983,6 +1029,32 @@ test("a command that prints SCRIPT ERROR and exits 0 does not pass verification"
   assert.equal(passed.ok, true);
   assert.equal(passed.exitCode, 0);
   assert.equal(passed.failureSource, undefined);
+});
+
+test("runVerifyCommand's ignorePatterns option reaches detection, not just the summary", () => {
+  // F2: the ignore list used to be threaded into summarizeFailures only, so a
+  // command whose only failure was on the ignore list still came back
+  // ok:false with failureSource:"output-pattern" - it just produced an empty,
+  // "incomparable" signature afterwards. That is strictly worse than not
+  // matching at all: the command reports failed for a reason the caller can
+  // no longer see or explain.
+  const dir = makeTempDir("grok-output-pattern-ignore-");
+  const script = path.join(dir, "godot-like.cjs");
+  fs.writeFileSync(
+    script,
+    'console.log("SCRIPT ERROR: Parse Error: Identifier not declared");\nprocess.exit(0);\n',
+    "utf8"
+  );
+
+  return runVerifyCommand(`node "${script}"`, dir, {
+    outputFailurePatterns: OUTPUT_FAILURE_PATTERNS.godot,
+    ignorePatterns: [/Identifier not declared/]
+  }).then((ignored) => {
+    assert.equal(ignored.ok, true, "the only failure line was ignored, so the command must pass");
+    assert.equal(ignored.exitCode, 0);
+    assert.equal(ignored.failureSource, undefined);
+    assert.equal(ignored.matchedLines, undefined);
+  });
 });
 
 test("a command that prints Blender's python-failure marker and exits 0 does not pass either", async () => {

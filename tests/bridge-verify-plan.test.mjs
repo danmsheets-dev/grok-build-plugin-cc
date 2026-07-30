@@ -439,3 +439,52 @@ test("the fix prompt still redacts before it truncates", () => {
   assert.doesNotMatch(prompt, /sk-abcdefghijklmnopqrstuvwxyz012345/);
   assert.match(prompt, /FAILED/);
 });
+
+test("F1: an exit-0 output-pattern fix prompt carries the matched evidence, small output", () => {
+  // Before the fix, buildBoundedVerifyFixPrompt only ever saw
+  // firstBlamed.output - matchedLines (written at verify.mjs:340 and
+  // grok-bridge.mjs's entryResult) was read nowhere. For a short capture this
+  // still LOOKED fine (the marker line survives in `output` too), but the
+  // prompt still told the agent to "re-run only that exact command until it
+  // passes" for a command that already exits 0 every time - an instruction it
+  // can only satisfy by ignoring the real failure.
+  const output = "exit_code: 0\nstdout:\nSCRIPT ERROR: Parse Error: Identifier foo not declared\n";
+  const prompt = buildBoundedVerifyFixPrompt("godot --headless --path . --import", output, {
+    outputFailure: true,
+    matchedLines: ["SCRIPT ERROR: Parse Error: Identifier foo not declared"]
+  });
+
+  assert.match(prompt, /SCRIPT ERROR: Parse Error: Identifier foo not declared/);
+  assert.match(prompt, /exited 0/);
+  assert.doesNotMatch(prompt, /until it passes/, "that instruction is only satisfiable by ignoring an exit-0 failure");
+});
+
+test("F1: the matched evidence survives truncation of a large exit-0 capture", () => {
+  // The real-world trigger: godot --headless --import prints SCRIPT ERROR
+  // early, then hundreds of `Import: res://...` lines, which pushes the
+  // marker line out of a tail-only capture. The matched line must be placed
+  // ABOVE the truncated output rather than relying on it surviving inside it.
+  const matchedLine = "SCRIPT ERROR: Parse Error: Identifier foo not declared";
+  const output = `exit_code: 0\nstdout:\n${matchedLine}\n${"Import: res://assets/texture.png -> .godot/imported/texture.ctex\n".repeat(400)}`;
+  assert.ok(Buffer.byteLength(output, "utf8") > 4096, "the fixture must actually exceed the tail budget");
+
+  const prompt = buildBoundedVerifyFixPrompt("godot --headless --path . --import", output, {
+    outputFailure: true,
+    matchedLines: [matchedLine]
+  });
+
+  assert.match(prompt, /SCRIPT ERROR: Parse Error: Identifier foo not declared/, "the marker must survive even though the tail-only Output block elided it");
+  assert.match(prompt, /elided/, "the fixture itself must still be truncated, or this proves nothing");
+  assert.doesNotMatch(prompt, /until it passes/);
+});
+
+test("F1: a plain non-zero-exit failure keeps the original wording, unaffected", () => {
+  // Guards against over-applying the new branch: a command that failed the
+  // ordinary way (non-zero exit, no output-pattern match) must be unaffected.
+  const prompt = buildBoundedVerifyFixPrompt("npm test", "FAILED: assert 1 === 2\n", {
+    outputFailure: false,
+    matchedLines: []
+  });
+  assert.match(prompt, /until it passes/);
+  assert.doesNotMatch(prompt, /known engine failure marker/);
+});

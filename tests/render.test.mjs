@@ -201,6 +201,47 @@ test("renderTaskResult surfaces a failing verification with its note", () => {
   assert.match(output, /still failing after 2 attempts/);
 });
 
+test("renderTaskResult names the matched engine-failure marker on an exit-0 Verified: no", () => {
+  // F1's second half: an exit-0 output-pattern failure used to be explicable
+  // only by reading --json's matchedLines field. This is the only place a
+  // reader who never opens the JSON learns which line made the bridge
+  // disbelieve a clean exit code.
+  const output = renderTaskResult(
+    { rawOutput: "Ran the import." },
+    {
+      title: "Grok Build Delegate",
+      verified: false,
+      verifyNote: "verification did not pass within the attempt budget.",
+      verifyMatchedLines: [
+        {
+          command: "godot --headless --path . --import",
+          matchedLines: ["SCRIPT ERROR: Parse Error: Identifier foo not declared"]
+        }
+      ]
+    }
+  );
+  assert.match(output, /Verified: no/);
+  assert.match(output, /SCRIPT ERROR: Parse Error: Identifier foo not declared/);
+  assert.match(output, /godot --headless --path \. --import/);
+});
+
+test("renderTaskResult says nothing extra about matched markers on a healthy run", () => {
+  // Guards against over-applying the render: a verified run must not print
+  // this block even if verifyMatchedLines happened to be non-empty (e.g. an
+  // exit-0 output failure that turned out unchanged from baseline).
+  const output = renderTaskResult(
+    { rawOutput: "Ran the import." },
+    {
+      title: "Grok Build Delegate",
+      verified: true,
+      verifyMatchedLines: [
+        { command: "godot --headless --path . --import", matchedLines: ["SCRIPT ERROR: something"] }
+      ]
+    }
+  );
+  assert.doesNotMatch(output, /SCRIPT ERROR/);
+});
+
 test("renderTaskResult explains an infrastructure verify failure instead of implying a code fault", () => {
   // Regression: the verified:false branch emitted one fixed sentence and
   // dropped verifyNote entirely, so a run that failed because the verify
