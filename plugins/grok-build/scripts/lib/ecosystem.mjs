@@ -555,16 +555,66 @@ function godotVerifyCommands(exe, descriptor) {
   return commands;
 }
 
+/**
+ * Characters a repo-derived path may contain before it is allowed into a
+ * command string.
+ *
+ * `descriptor.manifestPath` is the one token in a default verify command built
+ * from repo content: `inspectBlenderDir` derives it from a depth-1 directory
+ * NAME read straight off disk. It is executed through `cmd /d /s /c` on win32
+ * and `/bin/sh -c` elsewhere (verify.mjs), and by a route with no gate in front
+ * of it - an ecosystem default is not config-sourced, so `.grok-build.json`'s
+ * trust-on-first-use gate never covers it, and the baseline probe runs the
+ * command BEFORE the agent spawns, so the echoed plan is not a gate either.
+ * A directory named `addon & whoami` therefore used to mean arbitrary command
+ * execution from merely cloning a repository.
+ *
+ * Anything outside this set is refused rather than escaped, because quoting is
+ * not sufficient on its own: cmd.exe still expands `%VAR%` and honours `^`
+ * inside double quotes, and the same string also has to survive sh, where `$`
+ * and a backtick are live. Space IS inside the set on purpose - a legitimate
+ * `My Addon/` must still get its validate command, which is what the quoting
+ * at the call site is for.
+ *
+ * The check lives here and not in `relPosix`/`inspectBlenderDir`: the
+ * descriptor field is also consumed as a real filesystem path (provision.mjs
+ * links the add-on directory from it), where the raw name is what is wanted.
+ */
+const SAFE_COMMAND_PATH_PATTERN = /^[A-Za-z0-9 ._\/-]+$/;
+
+/**
+ * Quote a path token for a command string. Same rule as
+ * `resolveEcosystemBinary`: quote only when whitespace makes it necessary, so
+ * an ordinary `myaddon/blender_manifest.toml` renders unchanged. Callers must
+ * have passed the value through `SAFE_COMMAND_PATH_PATTERN` first - a `"` can
+ * never reach this.
+ */
+function quoteCommandPath(value) {
+  return /\s/.test(value) ? `"${value}"` : value;
+}
+
 function blenderVerifyCommands(exe, descriptor) {
   const commands = [];
 
-  if (descriptor.manifestPath) {
+  // Refuse outright rather than emit an injectable command. Falling through
+  // costs the manifest check on a repo with an exotic directory name; the
+  // branches below still produce the test-script or smoke-check command, so
+  // the run is verified, just less specifically.
+  const manifestPath =
+    typeof descriptor.manifestPath === "string" &&
+    SAFE_COMMAND_PATH_PATTERN.test(descriptor.manifestPath)
+      ? descriptor.manifestPath
+      : null;
+
+  if (manifestPath) {
     // `--command extension validate` is a real manifest schema check that
     // loads no scene. A blender_manifest.toml can only exist for 4.2+, which
     // is exactly where the subcommand exists, so it is safe to assume here.
-    commands.push(`${exe} --command extension validate ${descriptor.manifestPath}`);
+    commands.push(`${exe} --command extension validate ${quoteCommandPath(manifestPath)}`);
   }
 
+  // testScript needs no such guard: `detectBlender` only ever assigns it one of
+  // two hardcoded candidates, so no repo-controlled bytes reach it.
   if (descriptor.testScript) {
     // --python-exit-code turns an exception in the script into a non-zero
     // exit; without it Blender exits 0 and the failure is invisible to
@@ -574,7 +624,7 @@ function blenderVerifyCommands(exe, descriptor) {
     commands.push(
       `${exe} --background --factory-startup --python-exit-code 1 --python ${descriptor.testScript}`
     );
-  } else if (!descriptor.manifestPath) {
+  } else if (!manifestPath) {
     // Nothing better to run than a smoke check: it still catches a broken
     // install or a GUI-only build that cannot start headless, and it is the
     // only thing that can be asserted about an arbitrary .blend repo.
@@ -589,11 +639,18 @@ function blenderVerifyCommands(exe, descriptor) {
 /**
  * Default verify commands for a descriptor, as ready-to-run command strings.
  *
- * Every binary is resolved to a literal here (see `resolveEcosystemBinary`);
- * no returned string ever contains shell parameter expansion. Commands are
- * conservative on purpose - item 5 wires this into runs that previously did no
- * verification at all, so a default that fails on a healthy project would be a
- * regression, not a feature.
+ * Every binary is resolved to a literal here (see `resolveEcosystemBinary`).
+ * The stronger claim this comment used to make - that no returned string ever
+ * contains shell parameter expansion - reasoned about the binary token only and
+ * was false for the one argument built from repo content: the Blender manifest
+ * path. That token is now allowlisted and quoted at construction time (see
+ * `SAFE_COMMAND_PATH_PATTERN`), which is what makes the claim true of the whole
+ * string rather than of its first word. Every other interpolated argument comes
+ * from a hardcoded candidate list in this module.
+ *
+ * Commands are conservative on purpose - item 5 wires this into runs that
+ * previously did no verification at all, so a default that fails on a healthy
+ * project would be a regression, not a feature.
  *
  * @param {{id?: string}|null|undefined} descriptor
  * @param {{env?: NodeJS.ProcessEnv, platform?: string, existsSync?: typeof fs.existsSync, override?: string}} [options]

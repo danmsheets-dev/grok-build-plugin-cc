@@ -295,6 +295,62 @@ test("defaultVerifyCommands for Blender validates the manifest and exits non-zer
   assert.match(script, /--background --factory-startup --python-exit-code 1/);
 });
 
+test("a manifest path carrying a shell metacharacter emits no validate command", () => {
+  // A depth-1 directory name is repo-controlled and the verify command is run
+  // through `cmd /d /s /c` / `/bin/sh -c` by the baseline probe, before the
+  // agent spawns and before anything echoes the plan - so `addon & whoami/`
+  // used to mean command execution from merely cloning a repository.
+  const root = makeProject({ "addon & whoami/blender_manifest.toml": 'id = "demo"\n' });
+  const blender = findDescriptor(root, "blender", { env: {} });
+  // The descriptor keeps the raw path: provision.mjs consumes it as a real
+  // filesystem path, so the refusal belongs at command construction, not here.
+  assert.equal(blender.manifestPath, "addon & whoami/blender_manifest.toml");
+
+  for (const platform of ["win32", "linux"]) {
+    const commands = defaultVerifyCommands(blender, { env: {}, platform, existsSync: () => false });
+    assert.ok(
+      commands.every((command) => !command.includes("extension validate")),
+      `${platform}: ${commands.join("\n")}`
+    );
+    assert.ok(
+      commands.every((command) => !command.includes("whoami")),
+      `${platform}: ${commands.join("\n")}`
+    );
+    // Refusing must not leave the project unverified: the smoke check stands in.
+    assert.equal(commands.length, 1);
+    assert.match(commands[0], /--python-expr "import bpy"/);
+  }
+});
+
+test("every shell metacharacter that reaches a manifest path is refused", () => {
+  for (const name of ["a&b", "a|b", "a>b", "a$b", "a`b", 'a"b', "a^b", "a%PATH%b", "a;b", "a\nb"]) {
+    const commands = defaultVerifyCommands(
+      { id: "blender", manifestPath: `${name}/blender_manifest.toml`, testScript: null },
+      { env: {}, platform: "linux" }
+    );
+    assert.ok(
+      commands.every((command) => !command.includes("extension validate")),
+      `${JSON.stringify(name)}: ${commands.join("\n")}`
+    );
+  }
+});
+
+test("a manifest path with a space is still validated, as a single quoted token", () => {
+  // The reject half alone would silently drop the manifest check for a
+  // perfectly legitimate add-on directory, so the quote half has to stay: this
+  // is what proves the fix did not just delete the feature.
+  const root = makeProject({ "My Addon/blender_manifest.toml": 'id = "demo"\n' });
+  const blender = findDescriptor(root, "blender", { env: {} });
+  assert.equal(blender.manifestPath, "My Addon/blender_manifest.toml");
+
+  for (const platform of ["win32", "linux"]) {
+    const commands = defaultVerifyCommands(blender, { env: {}, platform, existsSync: () => false });
+    const validate = commands.find((command) => command.includes("extension validate"));
+    assert.ok(validate, `${platform}: ${commands.join("\n")}`);
+    assert.ok(validate.endsWith('--command extension validate "My Addon/blender_manifest.toml"'), validate);
+  }
+});
+
 test("a Blender project with neither manifest nor test script still gets a smoke check", () => {
   const commands = defaultVerifyCommands(
     { id: "blender", manifestPath: null, testScript: null },
