@@ -36,6 +36,44 @@ export function parseStreamEvent(line) {
 
 export const MESSAGE_SEPARATOR = "\n\n";
 
+// Delimiters of the run-report contract (prompts/run-report.md). Plain ASCII
+// on purpose: on Windows an npm-installed grok resolves to `grok.cmd`, which
+// which.mjs routes through `cmd.exe /d /s /c`, and cmd re-interprets `<`, `>`,
+// `&`, `^` and `%` even inside the quoted command line. Angle-bracket tags -
+// the shape prompts/critique.md uses, because that prompt never travels through
+// argv on the cmd shim path - would come back mangled.
+export const FINAL_REPORT_OPEN = "===GROK-FINAL-REPORT===";
+export const FINAL_REPORT_CLOSE = "===END-GROK-FINAL-REPORT===";
+
+/**
+ * Pull the delimited final report out of an agent's messages.
+ *
+ * Returns the LAST complete block: a long agentic run can echo the contract
+ * mid-flight (quoting it back while planning, or reporting on a sub-task), and
+ * the one that matters is the one it finished on. Returns "" when the model did
+ * not comply, which every caller treats as "fall back to the plain text".
+ *
+ * @param {string[]|string} messages
+ * @returns {string}
+ */
+export function extractFinalReport(messages) {
+  const joined = Array.isArray(messages)
+    ? messages.filter((message) => typeof message === "string").join(MESSAGE_SEPARATOR)
+    : String(messages ?? "");
+  if (!joined) {
+    return "";
+  }
+  // Built per call rather than hoisted: a module-scope /g regex carries
+  // lastIndex, and one stray .test()/.exec() added later would make this
+  // function's result depend on call order.
+  const pattern = new RegExp(`${FINAL_REPORT_OPEN}([\\s\\S]*?)${FINAL_REPORT_CLOSE}`, "g");
+  let report = "";
+  for (const match of joined.matchAll(pattern)) {
+    report = match[1].trim();
+  }
+  return report;
+}
+
 const PHASE_BY_TYPE = {
   thought: "thinking",
   text: "writing"
@@ -114,9 +152,26 @@ export function createStreamTranscript() {
 
     finish() {
       closeCurrentMessage();
+      const joined = messages.join(MESSAGE_SEPARATOR);
       return {
         messages: [...messages],
-        finalMessage: messages.join(MESSAGE_SEPARATOR),
+        // The whole narration. Every `text` run that followed a `thought` is a
+        // separate message (the CLI emits no turn markers), so on a 40-turn run
+        // this is a wall of "Let me check X" with the answer buried at the end.
+        // Keep it: it is the log, and the only thing that survives when the
+        // model ends mid-thought.
+        transcript: joined,
+        // The text after the final `thought` - the streaming analogue of
+        // `--output-format json`'s `text` field, i.e. the answer.
+        lastMessage: messages.at(-1) ?? "",
+        // The answer the run-report contract asked for, when the model complied.
+        finalReport: extractFinalReport(messages),
+        // UNCHANGED, and deliberately still the joined transcript. Narrowing it
+        // to the last message would be a silent contract change for every
+        // existing consumer (the review paths want the full text), and until the
+        // report contract is actually honoured `lastMessage` on its own is often
+        // a mid-flight line - strictly less information than this.
+        finalMessage: joined,
         sessionId,
         stopReason,
         usage,

@@ -6,7 +6,12 @@ import process from "node:process";
 
 import { readJsonFile } from "./fs.mjs";
 import { binaryAvailable, runCommand } from "./process.mjs";
-import { createNdjsonDecoder, createStreamTranscript, parseStreamEvent } from "./stream-events.mjs";
+import {
+  createNdjsonDecoder,
+  createStreamTranscript,
+  extractFinalReport,
+  parseStreamEvent
+} from "./stream-events.mjs";
 import { resolveSpawnInvocation } from "./which.mjs";
 
 export const DEFAULT_CONTINUE_PROMPT =
@@ -297,6 +302,15 @@ export function buildHeadlessArgs(prompt, options = {}) {
   if (options.effort) {
     trailing.push("--effort", options.effort);
   }
+  // Extra rules appended to the SYSTEM prompt. The output contract belongs here
+  // rather than glued onto the user's prompt: the prompt is also what the bridge
+  // shortens into a job summary and the /grok-build:runs table, so contract text
+  // pasted there becomes the visible title of every run. Counted in the argv
+  // budget below like any other flag - it is a few hundred bytes off a 7 000
+  // byte allowance on the Windows cmd-shim path.
+  if (options.rules) {
+    trailing.push("--rules", String(options.rules));
+  }
   if (options.outputFormat) {
     trailing.push("--output-format", options.outputFormat);
   } else {
@@ -491,6 +505,10 @@ export function runHeadlessAgent(cwd, options = {}) {
       }
 
       const resolvedThreadId = result?.sessionId || sessionId;
+      // Non-streaming (`--output-format json`, or plain) has exactly one body of
+      // text, so all four text fields collapse onto it. Only `finalReport` can
+      // still differ, because the fence may or may not be in there.
+      const plainText = stdout.trimEnd();
       emitProgress(
         options.onProgress,
         status === 0 ? "Grok finished." : `Grok exited with status ${status}.`,
@@ -506,7 +524,14 @@ export function runHeadlessAgent(cwd, options = {}) {
         sessionId: resolvedThreadId,
         threadId: resolvedThreadId,
         agentPid,
-        finalMessage: result ? result.finalMessage : stdout.trimEnd(),
+        finalMessage: result ? result.finalMessage : plainText,
+        // Additive companions to finalMessage: the whole narration, the final
+        // assistant message, and the delimited report when the model emitted
+        // one. finalMessage keeps meaning "the joined transcript" so no existing
+        // consumer changes meaning under it.
+        transcript: result ? result.transcript : plainText,
+        lastMessage: result ? result.lastMessage : plainText,
+        finalReport: result ? result.finalReport : extractFinalReport(plainText),
         messages: result ? result.messages : null,
         usage: result?.usage ?? null,
         stopReason: result?.stopReason ?? null,

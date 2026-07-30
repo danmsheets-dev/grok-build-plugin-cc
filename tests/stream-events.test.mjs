@@ -37,7 +37,13 @@ test("parseStreamEvent returns objects and rejects everything else", () => {
   assert.equal(parseStreamEvent(""), null);
 });
 
-import { createStreamTranscript, MESSAGE_SEPARATOR } from "../plugins/grok-build/scripts/lib/stream-events.mjs";
+import {
+  createStreamTranscript,
+  extractFinalReport,
+  FINAL_REPORT_CLOSE,
+  FINAL_REPORT_OPEN,
+  MESSAGE_SEPARATOR
+} from "../plugins/grok-build/scripts/lib/stream-events.mjs";
 
 function feed(transcript, events) {
   return events.map((event) => transcript.accept(event));
@@ -118,6 +124,94 @@ test("unknown event types are recorded and do not break the transcript", () => {
 
   assert.deepEqual(result.unknownTypes, ["tool_use"]);
   assert.deepEqual(result.messages, ["a", "b"], "an unknown type still ends the current message");
+});
+
+test("the transcript and the answer are separate fields, and finalMessage still means the transcript", () => {
+  // The reported bug in one fixture: three text runs, of which only the last is
+  // the answer. Every consumer used to get all three glued together.
+  const transcript = createStreamTranscript();
+  feed(transcript, [
+    { type: "text", data: "turn one" },
+    { type: "thought", data: "thinking" },
+    { type: "text", data: "preamble" },
+    { type: "thought", data: "thinking again" },
+    { type: "text", data: "Final answer." },
+    { type: "end", stopReason: "EndTurn" }
+  ]);
+  const result = transcript.finish();
+
+  assert.equal(result.lastMessage, "Final answer.", "the answer is the text after the last thought");
+  assert.equal(result.transcript.split(MESSAGE_SEPARATOR).length, 3);
+  assert.equal(result.transcript, "turn one\n\npreamble\n\nFinal answer.");
+  // Conflict 5: additive only. Narrowing this is what breaks every existing
+  // consumer, and the review paths genuinely want the whole text.
+  assert.equal(result.finalMessage, result.transcript, "finalMessage must still be the joined transcript");
+  assert.equal(result.finalReport, "", "no fence emitted means no report");
+});
+
+test("a transcript that ends mid-thought still reports an empty answer, not a stale one", () => {
+  const transcript = createStreamTranscript();
+  feed(transcript, [
+    { type: "thought", data: "planning" },
+    { type: "end", stopReason: "EndTurn" }
+  ]);
+  const result = transcript.finish();
+
+  assert.equal(result.lastMessage, "");
+  assert.equal(result.transcript, "");
+  assert.equal(result.finalMessage, "");
+});
+
+test("extractFinalReport pulls the delimited block out of surrounding chatter", () => {
+  assert.equal(
+    extractFinalReport([
+      "noise",
+      `chatter ${FINAL_REPORT_OPEN}\n## Result\nDone.\n${FINAL_REPORT_CLOSE} trailing`
+    ]),
+    "## Result\nDone."
+  );
+});
+
+test("extractFinalReport returns the LAST block when a run echoes the contract mid-flight", () => {
+  // A long agentic run quotes the contract back while planning, or reports on a
+  // sub-task. The block it finished on is the one that describes the run.
+  const messages = [
+    `${FINAL_REPORT_OPEN}\n## Result\nFirst pass.\n${FINAL_REPORT_CLOSE}`,
+    "more work",
+    `${FINAL_REPORT_OPEN}\n## Result\nSecond pass.\n${FINAL_REPORT_CLOSE}`
+  ];
+  assert.equal(extractFinalReport(messages), "## Result\nSecond pass.");
+});
+
+test("extractFinalReport is empty for a non-compliant run, and total for junk input", () => {
+  assert.equal(extractFinalReport(["just narration", "no fence here"]), "");
+  // An unterminated block is not a block: half a report is worse than none,
+  // because the fallback chain would then never reach the plain text.
+  assert.equal(extractFinalReport([`${FINAL_REPORT_OPEN}\n## Result\ntruncated`]), "");
+  assert.equal(extractFinalReport([]), "");
+  assert.equal(extractFinalReport(null), "");
+  assert.equal(extractFinalReport(undefined), "");
+  assert.equal(extractFinalReport([null, 42, { a: 1 }]), "");
+  // Accepts an already-joined string too, which is what the non-streaming
+  // output formats hand it.
+  assert.equal(extractFinalReport(`${FINAL_REPORT_OPEN}\nok\n${FINAL_REPORT_CLOSE}`), "ok");
+});
+
+test("a report split across streamed text deltas is still extracted whole", () => {
+  // The fence never arrives in one event: grok streams it in fragments, and a
+  // thought in the middle would split it across two messages.
+  const transcript = createStreamTranscript();
+  feed(transcript, [
+    { type: "thought", data: "planning" },
+    { type: "text", data: "Working on it." },
+    { type: "thought", data: "writing the report" },
+    { type: "text", data: `${FINAL_REPORT_OPEN}\n## Result\n` },
+    { type: "text", data: `Rebuilt the scene.\n${FINAL_REPORT_CLOSE}` }
+  ]);
+  const result = transcript.finish();
+
+  assert.equal(result.finalReport, "## Result\nRebuilt the scene.");
+  assert.match(result.lastMessage, /GROK-FINAL-REPORT/, "the raw fence stays in the message text");
 });
 
 test("a transcript with no end event yields null usage", () => {

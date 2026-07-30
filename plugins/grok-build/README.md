@@ -171,6 +171,31 @@ project used to pay for it twice — once in tokens, once in a prompt too long f
 - **Verify output reaching a fix turn is tail-truncated** to the last 4 KB — the end is where the
   assertion and the exit line are. It is redacted first, then truncated.
 
+## What a delegate run returns
+
+`grok --output-format streaming-json` emits only `text`, `thought` and `end` events — no tool
+events at all — and a `text` event arriving after a `thought` opens a new message. A 40-turn run is
+therefore dozens of narration fragments in which the conclusion is the last few lines, and a run
+that ends on a tool call ends on *"Let me check X"*. That is why a delegate run used to look like
+it returned nothing unless you told Grok to write the answer to a file.
+
+Three things changed:
+
+- **Delegate runs carry an output contract**, delivered on the CLI's `--rules` flag so it lands in
+  the system prompt rather than in your prompt (your prompt is also the run's title in
+  `/grok-build:runs`). It asks for a `===GROK-FINAL-REPORT===` block with `## Result`,
+  `## Files changed`, `## Artifacts`, `## Verification` and `## Follow-ups`, emitted as prose in the
+  final message — **not** only into a file — and emitted even when the run failed or ran out of
+  turns. See `prompts/run-report.md`.
+- **The result is the answer, the transcript is kept separately.** The run reports the final report
+  if there is one, otherwise the last assistant message, otherwise the whole narration — so a model
+  that ignores the contract still prints exactly what it always did. `payload.transcript` (via
+  `--json`) always holds the full turn-separated narration.
+- **A verify fix turn cannot erase the answer.** When `--verify` fails once, the fix turn usually
+  ends on a tool call with no prose. Its empty result used to replace the original run's, so a run
+  that did the work and then passed verification reported *"Grok did not return a final message."*
+  The text channel now accumulates across turns; the newest non-empty answer wins.
+
 ## Requirements
 
 - Node.js >= 18.18

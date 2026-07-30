@@ -64,6 +64,7 @@ import {
   writeJobFile
 } from "./lib/state.mjs";
 import { redactSecrets, redactSecretsDeep } from "./lib/redact.mjs";
+import { MESSAGE_SEPARATOR } from "./lib/stream-events.mjs";
 import {
   appendLogLine,
   createJobLogFile,
@@ -525,6 +526,26 @@ function buildBoundedVerifyFixPrompt(command, output) {
     `Do not investigate unrelated failures, do not run the full test suite, and do not change any test to make it pass.\n\n` +
     `Output:\n${safeOutput}`
   );
+}
+
+// The run-report contract, delivered through `--rules` so the CLI appends it to
+// the SYSTEM prompt.
+//
+// Not appended to the user's prompt, for two reasons. The prompt is what
+// buildTaskRunMetadata shortens into `job.summary`, which is the title shown in
+// /grok-build:runs and /grok-build:show - contract text pasted there would
+// become the visible name of every run. And under --resume-last the prompt is
+// DEFAULT_CONTINUE_PROMPT, which doubles as the fallback summary, so the leak
+// would be worse there, not better.
+//
+// Read once per process. A background worker is its own process, so nothing is
+// stale across runs.
+let runReportRulesCache = null;
+function loadRunReportRules() {
+  if (runReportRulesCache == null) {
+    runReportRulesCache = loadPromptTemplate(ROOT_DIR, "run-report").trim();
+  }
+  return runReportRulesCache;
 }
 
 /**
@@ -1641,6 +1662,12 @@ async function executeTaskRun(request) {
       permissionMode: write ? undefined : "plan",
       sandbox: write ? undefined : "read-only",
       maxTurns,
+      // The one thing that makes a delegate run return an answer rather than a
+      // narration transcript. Only on the FIRST turn: a fix turn given the same
+      // contract emits a report about the fix, and the newest non-empty report
+      // wins below - which would discard the main run's answer, the exact bug
+      // the accumulation there exists to prevent.
+      rules: loadRunReportRules(),
       outputFormat: "streaming-json",
       onProgress: request.onProgress,
       // Spill target for a prompt too large for argv. Anchored on the workspace
@@ -1652,6 +1679,12 @@ async function executeTaskRun(request) {
     maxDurationSeconds
   );
   let result = firstAgent.result;
+  // Every agent turn this run makes, in order. `result` keeps tracking only the
+  // LAST one, because status, threadId, stopReason and the stop condition all
+  // belong to it - but the text channel must accumulate, which is what this is
+  // for. Declared out here rather than inside the verify loop so a run with no
+  // verify commands takes exactly the same path.
+  const agentResults = [firstAgent.result];
   let timedOut = firstAgent.timedOut;
   let cumulativeUsage = result.usage ? { ...result.usage } : null;
 
@@ -1860,6 +1893,7 @@ async function executeTaskRun(request) {
         maxDurationSeconds
       );
       result = fixAgent.result;
+      agentResults.push(fixAgent.result);
       cumulativeUsage = addUsage(cumulativeUsage, fixAgent.result.usage);
       if (fixAgent.timedOut) {
         timedOut = true;
@@ -1902,7 +1936,33 @@ async function executeTaskRun(request) {
     };
   }
 
-  const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
+  // The text channel is the ONE thing that accumulates across turns. `result`
+  // used to be overwritten wholesale by the verify fix loop, so a fix turn that
+  // ended on a tool call with no trailing prose (the common shape - the fix
+  // prompt asks for an edit and a re-run, not an essay) threw away the original
+  // run's answer entirely, and the user got "Grok did not return a final
+  // message." for a run that did the work and passed verification.
+  //
+  // Newest non-empty wins per field, so a silent fix turn falls back to the main
+  // run's answer while a talkative one still gets the last word.
+  const newestNonEmpty = (field) =>
+    agentResults
+      .map((entry) => (typeof entry?.[field] === "string" ? entry[field] : ""))
+      .filter(Boolean)
+      .at(-1) ?? "";
+  const finalReport = newestNonEmpty("finalReport");
+  const lastMessage = newestNonEmpty("lastMessage");
+  // Concatenated rather than picked: the transcript is the log, and every turn's
+  // narration belongs in it.
+  const transcript = agentResults
+    .map((entry) => (typeof entry?.transcript === "string" ? entry.transcript : ""))
+    .filter(Boolean)
+    .join(MESSAGE_SEPARATOR);
+  // The delimited report first (what the run-report contract asked for), then
+  // the final assistant message, then the whole narration. The last fallback is
+  // what today's behaviour was, so a model that ignores the contract still
+  // prints exactly what it used to rather than nothing.
+  const rawOutput = finalReport || lastMessage || transcript;
   const failureMessage = timedOut
     ? `Run timed out after ${maxDurationSeconds}s (--max-duration).`
     : result.status === 0
@@ -1982,6 +2042,10 @@ async function executeTaskRun(request) {
     usage: cumulativeUsage ?? null,
     stopReason: timedOut ? "max-duration" : (result.stopReason ?? null),
     rawOutput,
+    // The full narration across every turn, kept alongside the answer so
+    // nothing is lost by rawOutput now preferring the answer. This is what a
+    // caller reads when it wants to know what the agent actually did.
+    transcript,
     verified,
     worktree,
     // What the worktree was seeded with, and what could not be. Null on a
@@ -2003,7 +2067,15 @@ async function executeTaskRun(request) {
     rendered,
     summary: timedOut
       ? failureMessage
-      : firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)),
+      // Off lastMessage rather than rawOutput: rawOutput now prefers the final
+      // report, whose first line is the literal heading `## Result`, and that
+      // would become the title of every compliant run in /grok-build:runs.
+      // rawOutput stays as the fallback for a run that produced no trailing
+      // prose at all.
+      : firstMeaningfulLine(
+          lastMessage || rawOutput,
+          firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)
+        ),
     jobTitle: taskMetadata.title,
     jobClass: "task",
     write,

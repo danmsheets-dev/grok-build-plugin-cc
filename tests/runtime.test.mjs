@@ -216,18 +216,23 @@ test("run delegates through fake grok and stores a finished job", () => {
   run("git", ["add", "README.md"], { cwd: repo });
   run("git", ["commit", "-m", "init"], { cwd: repo });
 
-  const result = run("node", [SCRIPT, "run", "check auth preflight"], {
+  const result = run("node", [SCRIPT, "run", "--json", "check auth preflight"], {
     cwd: repo,
     env: pluginDataEnv(pluginDataDir, binDir)
   });
 
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /Handled the requested task/);
+  const payload = JSON.parse(result.stdout);
+  // rawOutput is now the ANSWER, not the narration: the fake's second turn.
+  assert.equal(payload.rawOutput, "Handled the requested task.");
   // Proves the delegate path actually streams. The fake emits two turns; under
   // --output-format plain they would concatenate with no separator, which is the
   // Summary run-together defect. Guards against the bridge reverting to "plain".
+  // Retargeted from stdout onto payload.transcript, which is where the whole
+  // turn-separated narration lives now that rawOutput prefers the answer -
+  // the guard is about the stream shape, not about which field carries it.
   assert.match(
-    result.stdout,
+    payload.transcript,
     /Starting the requested task\.\s*\n\s*\nHandled the requested task\./,
     "delegate output must be turn-separated, proving streaming-json is in use"
   );
@@ -246,6 +251,115 @@ test("run delegates through fake grok and stores a finished job", () => {
       process.env.CLAUDE_PLUGIN_DATA = previous;
     }
   }
+});
+
+test("a delegate run carries the report contract and surfaces the report as the result", () => {
+  // The user's reported complaint, end to end: without a contract the run
+  // returns narration and the only way to get an answer is to ask for a file.
+  const repo = makeTempDir("grok-report-");
+  const binDir = makeTempDir("grok-report-bin-");
+  const pluginDataDir = makeTempDir("grok-report-data-");
+  const fakeGrokLog = path.join(pluginDataDir, "fake-grok.log");
+  installFakeGrok(binDir, "reporting");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "run", "--json", "rebuild the scene"], {
+    cwd: repo,
+    env: pluginDataEnv(pluginDataDir, binDir, { FAKE_GROK_LOG: fakeGrokLog })
+  });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+
+  // The contract reached the CLI on --rules, not welded onto the user's prompt.
+  const argv = lastFakeGrokArgv(fakeGrokLog);
+  assert.ok(argv.includes("--rules"), `expected --rules in ${argv.join(" ")}`);
+  assert.match(argv[argv.indexOf("--rules") + 1], /===GROK-FINAL-REPORT===/);
+  assert.equal(argv[argv.indexOf("-p") + 1], "rebuild the scene", "the prompt must stay the user's");
+
+  // The result is the report, with the delimiters stripped - not the narration
+  // that preceded it, and not the raw fence.
+  assert.equal(payload.rawOutput, "## Result\nRebuilt the scene.\n## Files changed\nscene.tscn - rebuilt");
+  assert.doesNotMatch(payload.rawOutput, /GROK-FINAL-REPORT/);
+  assert.doesNotMatch(payload.rawOutput, /Let me look at the project structure/);
+  // The narration is still recorded, just not presented as the answer.
+  assert.match(payload.transcript, /Let me look at the project structure/);
+
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  try {
+    const jobs = listJobs(repo);
+    // The runs table must not be titled `## Result` for every compliant run.
+    assert.doesNotMatch(jobs[0].summary ?? "", /^##/, `summary was: ${jobs[0].summary}`);
+  } finally {
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
+});
+
+test("a silent verify fix turn does not erase the original run's answer", () => {
+  // The default path for any --verify run that fails once: the fix turn ends on
+  // a tool call with no trailing prose, `result` was overwritten wholesale, and
+  // a run that did the work and passed verification reported "Grok did not
+  // return a final message."
+  const repo = makeTempDir("grok-silent-fix-");
+  const binDir = makeTempDir("grok-silent-fix-bin-");
+  const pluginDataDir = makeTempDir("grok-silent-fix-data-");
+  installFakeGrok(binDir, "silent-fix");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  // Passes at baseline (call 1), fails the first real attempt (call 2), passes
+  // the re-check after the fix turn (call 3). Needs no binary beyond node, and
+  // no cooperation from the agent - the fake cannot fix anything.
+  const verifyCommand =
+    `node -e "const fs=require('fs');const p='.gvcount';` +
+    `const n=(fs.existsSync(p)?Number(fs.readFileSync(p,'utf8')):0)+1;fs.writeFileSync(p,String(n));` +
+    `if(n===2){console.error('AssertionError: marker check failed');process.exit(1)}"`;
+
+  const result = run(
+    "node",
+    [SCRIPT, "run", "--json", "--verify", verifyCommand, "do something"],
+    {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir)
+    }
+  );
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+
+  // The loop really did run a fix turn and then pass.
+  assert.equal(payload.verify.attempts, 1, "expected exactly one fix turn");
+  assert.equal(payload.verified, true);
+
+  // ...and the answer survived it.
+  assert.equal(payload.rawOutput, "Handled the requested task.");
+  assert.match(payload.transcript, /Starting the requested task/);
+
+  // The same run again in text mode, which is what the user actually sees.
+  // Resetting the counter puts the fix turn back in the picture.
+  fs.rmSync(path.join(repo, ".gvcount"));
+  const rendered = run("node", [SCRIPT, "run", "--verify", verifyCommand, "do something"], {
+    cwd: repo,
+    env: pluginDataEnv(pluginDataDir, binDir)
+  });
+  assert.equal(rendered.status, 0, rendered.stderr);
+  assert.doesNotMatch(
+    rendered.stdout,
+    /Grok did not return a final message/,
+    "this is the exact string the reported bug produced"
+  );
+  assert.match(rendered.stdout, /Handled the requested task/);
+  assert.match(rendered.stdout, /Verified: yes/);
 });
 
 test("runs and show surface the latest finished run", () => {

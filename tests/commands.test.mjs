@@ -4,6 +4,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
+import { loadPromptTemplate } from "../plugins/grok-build/scripts/lib/prompts.mjs";
+import {
+  FINAL_REPORT_CLOSE,
+  FINAL_REPORT_OPEN
+} from "../plugins/grok-build/scripts/lib/stream-events.mjs";
+
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "grok-build");
 
@@ -276,4 +282,54 @@ test("the README says binaries are described rather than inlined into the prompt
   // The two bounds a user can actually be surprised by.
   assert.match(readme, /40 files and 64 KB/);
   assert.match(readme, /--prompt-file/);
+});
+
+test("the run-report contract ships as a loadable prompt template", () => {
+  const template = loadPromptTemplate(PLUGIN_ROOT, "run-report");
+  assert.ok(template.trim().length > 0, "prompts/run-report.md must not be empty");
+
+  assert.match(template, new RegExp(FINAL_REPORT_OPEN));
+  assert.match(template, new RegExp(FINAL_REPORT_CLOSE));
+  for (const section of ["## Result", "## Files changed", "## Artifacts", "## Verification", "## Follow-ups"]) {
+    assert.match(template, new RegExp(section), `the contract must name ${section}`);
+  }
+  // The two behaviours the reported bug is made of: an answer that only exists
+  // as a file, and a failed run that says nothing at all.
+  assert.match(template, /not only into a file|only in a file/i);
+  assert.match(template, /even when the task failed/i);
+
+  // It has no interpolation variables: there is no per-run value to fill in, so
+  // an unreplaced {{TOKEN}} would reach the model verbatim.
+  assert.doesNotMatch(template, /\{\{[A-Z_]+\}\}/);
+});
+
+test("the run-report contract survives the Windows cmd.exe shim", () => {
+  // It travels in argv on --rules. On Windows an npm-installed grok is a .cmd,
+  // which which.mjs routes through `cmd /d /s /c "<line>"` - and cmd still
+  // expands `%VAR%` and re-reads `<`, `>`, `&`, `^`, `|` in there. Angle-bracket
+  // tags (the shape prompts/critique.md uses, which never goes through that
+  // path) would come back mangled, which is why this file is plain ASCII.
+  const template = loadPromptTemplate(PLUGIN_ROOT, "run-report");
+
+  for (const char of ["<", ">", "%", "&", "^", "|", '"']) {
+    assert.ok(!template.includes(char), `run-report.md must not contain ${char}`);
+  }
+  // Non-ASCII would depend on the console code page too.
+  assert.doesNotMatch(template, /[^\x20-\x7e\r\n\t]/, "run-report.md must be printable ASCII");
+});
+
+test("the docs explain why a delegate run used to look like it returned nothing", () => {
+  const readme = fs.readFileSync(path.join(PLUGIN_ROOT, "README.md"), "utf8");
+
+  // The root cause, so nobody "simplifies" the contract away again.
+  assert.match(readme, /only `text`, `thought` and `end` events/);
+  assert.match(readme, /--rules/);
+  assert.match(readme, new RegExp(FINAL_REPORT_OPEN));
+  // The two failure modes the release fixes.
+  assert.match(readme, /not\*{0,2} only into a file/i);
+  assert.match(readme, /Grok did not return a final message/);
+
+  const skill = read("skills/grok-run-output/SKILL.md");
+  assert.match(skill, /## Artifacts/, "artifact paths are the deliverable for Godot and Blender");
+  assert.match(skill, /do not invent one/i);
 });

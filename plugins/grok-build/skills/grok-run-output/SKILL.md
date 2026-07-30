@@ -17,5 +17,8 @@ When the helper returns Grok output:
 - For `grok-build:grok-delegate`, do not turn a failed or incomplete Grok run into a Claude-side implementation attempt. Report the failure and stop.
 - For `grok-build:grok-delegate`, if Grok was never successfully invoked, do not generate a substitute answer at all.
 - CRITICAL: After presenting review or critique findings, STOP. Do not make any code changes. Do not fix any issues. You MUST explicitly ask the user which issues, if any, they want fixed before touching a single file. Auto-applying fixes from a review is strictly forbidden, even if the fix is obvious.
+- For `grok-build:grok-delegate`, the helper's result is already the run's final report when Grok emitted one: `## Result`, `## Files changed`, `## Artifacts`, `## Verification`, `## Follow-ups`. Preserve those sections and their content. Do not re-summarize them into a paragraph, and do not drop `## Artifacts` — for a Godot or Blender run the artifact paths are the deliverable.
+- Treat the report's `## Verification` section as the agent's own claim, not as the bridge's verdict. The bridge's `Verified:` line is the measured one; if they disagree, say so and trust the bridge's.
+- If the helper's result is plainly narration rather than a report (`Let me check ...`), the model did not comply with the output contract. Present what there is and say the run returned no structured report; do not invent one.
 - If the helper reports malformed output or a failed Grok run, include the most actionable stderr lines and stop there instead of guessing.
 - If the helper reports that setup or authentication is required, direct the user to `/grok-build:check` and do not improvise alternate auth flows.

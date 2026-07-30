@@ -6,8 +6,15 @@ import { writeExecutable } from "./helpers.mjs";
 
 /**
  * Install a fake `grok` binary that responds to version/models/-p/import for hermetic tests.
+ *
+ * Scenarios:
+ * - `reporting` emits the run-report fence, but ONLY when `--rules` actually
+ *   carried the contract - so a test using it proves the bridge injected it.
+ * - `silent-fix` answers a verify fix prompt with a thought and nothing else,
+ *   which is the shape that used to erase the original run's answer.
+ *
  * @param {string} binDir directory that will be prepended to PATH
- * @param {"default"|"not-logged-in"|"fail-print"|"import-ok"} scenario
+ * @param {"default"|"not-logged-in"|"fail-print"|"import-ok"|"reporting"|"silent-fix"} scenario
  */
 export function installFakeGrok(binDir, scenario = "default") {
   fs.mkdirSync(binDir, { recursive: true });
@@ -95,20 +102,7 @@ if (isPrint || hasFlag("-r") || hasFlag("--resume") || hasFlag("-c") || hasFlag(
 
   if (flagValue("--output-format") === "streaming-json") {
     const emit = (event) => process.stdout.write(JSON.stringify(event) + "\\n");
-    // Mirror the plain-mode prompt branching below, so streaming callers get
-    // content shaped like their request rather than generic task text.
-    const isReview = /code review|Review the provided repository|Reviewing/i.test(prompt) || hasFlag("--agent");
-    const firstTurn = isReview ? ["Reviewing ", "uncommitted changes."] : ["Starting ", "the requested task."];
-    const secondTurn = isReview
-      ? ["Reviewed uncommitted changes.", "\\nNo material issues found."]
-      : ["Handled ", "the requested task."];
-    emit({ type: "thought", data: "planning the task" });
-    emit({ type: "text", data: firstTurn[0] });
-    emit({ type: "text", data: firstTurn[1] });
-    emit({ type: "thought", data: "double-checking" });
-    emit({ type: "text", data: secondTurn[0] });
-    emit({ type: "text", data: secondTurn[1] });
-    emit({
+    const endEvent = {
       type: "end",
       stopReason: "EndTurn",
       sessionId: "99999999-8888-4777-8666-555555555555",
@@ -122,7 +116,44 @@ if (isPrint || hasFlag("-r") || hasFlag("--resume") || hasFlag("-c") || hasFlag(
       },
       num_turns: 2,
       total_cost_usd: 0.0123
-    });
+    };
+
+    // A verify fix turn that ends on a tool call with no trailing prose. Real
+    // and common: the fix prompt asks for an edit and a re-run, not an essay.
+    if (scenario === "silent-fix" && /The verify command .* failed/.test(prompt)) {
+      emit({ type: "thought", data: "re-running the failing command" });
+      emit(endEvent);
+      process.exit(0);
+    }
+
+    // Only when the contract actually arrived on --rules. A test asserting the
+    // report is then also asserting that the bridge delivered the contract.
+    const rules = flagValue("--rules") ?? "";
+    if (scenario === "reporting" && rules.includes("===GROK-FINAL-REPORT===")) {
+      emit({ type: "thought", data: "planning the task" });
+      emit({ type: "text", data: "Let me look at " });
+      emit({ type: "text", data: "the project structure." });
+      emit({ type: "thought", data: "writing the report" });
+      emit({ type: "text", data: "===GROK-FINAL-REPORT===\\n## Result\\nRebuilt the scene.\\n" });
+      emit({ type: "text", data: "## Files changed\\nscene.tscn - rebuilt\\n===END-GROK-FINAL-REPORT===" });
+      emit(endEvent);
+      process.exit(0);
+    }
+
+    // Mirror the plain-mode prompt branching below, so streaming callers get
+    // content shaped like their request rather than generic task text.
+    const isReview = /code review|Review the provided repository|Reviewing/i.test(prompt) || hasFlag("--agent");
+    const firstTurn = isReview ? ["Reviewing ", "uncommitted changes."] : ["Starting ", "the requested task."];
+    const secondTurn = isReview
+      ? ["Reviewed uncommitted changes.", "\\nNo material issues found."]
+      : ["Handled ", "the requested task."];
+    emit({ type: "thought", data: "planning the task" });
+    emit({ type: "text", data: firstTurn[0] });
+    emit({ type: "text", data: firstTurn[1] });
+    emit({ type: "thought", data: "double-checking" });
+    emit({ type: "text", data: secondTurn[0] });
+    emit({ type: "text", data: secondTurn[1] });
+    emit(endEvent);
     process.exit(0);
   }
 

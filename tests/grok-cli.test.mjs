@@ -281,7 +281,10 @@ test("live grok --help advertises headless flags when grok is on PATH", () => {
     "--sandbox",
     "--output-format",
     "--json-schema",
-    "--effort"
+    "--effort",
+    // The transport for the run-report contract. Everything else in this list
+    // was already load-bearing; this one is newly so.
+    "--rules"
   ]) {
     assert.match(text, new RegExp(flag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
   }
@@ -348,6 +351,56 @@ test("runHeadlessAgent parses streaming output, separates turns and reports usag
   assert.ok(phases.includes("writing"), `expected a writing phase, saw ${phases.join(",")}`);
 });
 
+test("a streaming run reports the transcript and the answer as separate fields", async () => {
+  // The reported complaint: there was one text channel out of runHeadlessAgent,
+  // so every consumer that wanted "the answer" was handed the narration.
+  const dir = makeTempDir();
+  const binDir = path.join(dir, "bin");
+  installFakeGrok(binDir);
+
+  const result = await runHeadlessAgent(dir, {
+    prompt: "do the task",
+    binary: path.join(binDir, "grok"),
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.transcript, "Starting the requested task.\n\nHandled the requested task.");
+  assert.equal(result.lastMessage, "Handled the requested task.");
+  assert.equal(result.finalReport, "", "the default fake emits no report fence");
+  assert.equal(result.finalMessage, result.transcript, "finalMessage is unchanged");
+});
+
+test("the run-report contract travels on --rules, and is charged to the argv budget", () => {
+  const rules = "Emit ===GROK-FINAL-REPORT=== ... ===END-GROK-FINAL-REPORT=== last.";
+  const args = buildHeadlessArgs("small prompt", { rules });
+
+  assert.ok(args.includes("--rules"));
+  assert.equal(args[args.indexOf("--rules") + 1], rules);
+  // Not glued onto the prompt: the prompt is also the job summary.
+  assert.equal(promptArgOf(args), "small prompt");
+
+  // The platform limit is on the WHOLE command line, so a big rules block has
+  // to shrink the prompt's share rather than silently overflow it.
+  const withoutRules = buildHeadlessArgs("x".repeat(500000), { platform: "win32", cmdShim: true });
+  const withRules = buildHeadlessArgs("x".repeat(500000), {
+    platform: "win32",
+    cmdShim: true,
+    rules: "r".repeat(2000)
+  });
+  const total = withRules.reduce((sum, arg) => sum + Buffer.byteLength(String(arg), "utf8") + 3, 0);
+  assert.ok(total <= PROMPT_ARGV_BUDGET_WIN32_CMD_SHIM, `whole argv was ${total} bytes`);
+  assert.ok(
+    Buffer.byteLength(promptArgOf(withRules), "utf8") <
+      Buffer.byteLength(promptArgOf(withoutRules), "utf8") - 1900
+  );
+});
+
+test("no --rules flag is emitted when the caller passes none", () => {
+  // The review paths must keep their exact argv: they have their own contracts.
+  assert.ok(!buildHeadlessArgs("review this", {}).includes("--rules"));
+  assert.ok(!buildHeadlessArgs("review this", { rules: "" }).includes("--rules"));
+});
+
 test("runHeadlessAgent still returns plain output verbatim when asked", async () => {
   const dir = makeTempDir();
   const binDir = path.join(dir, "bin");
@@ -363,6 +416,11 @@ test("runHeadlessAgent still returns plain output verbatim when asked", async ()
   assert.equal(result.status, 0);
   assert.equal(result.finalMessage, "Handled the requested task.");
   assert.equal(result.usage, null);
+  // Non-streaming has one body of text, so the four text fields collapse onto
+  // it rather than going undefined and tripping the fallback chain.
+  assert.equal(result.transcript, "Handled the requested task.");
+  assert.equal(result.lastMessage, "Handled the requested task.");
+  assert.equal(result.finalReport, "");
 });
 
 test("no test ever resolves grok to a binary outside its own bin dir", () => {
