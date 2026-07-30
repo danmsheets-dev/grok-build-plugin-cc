@@ -851,6 +851,46 @@ async function handleCheck(argv) {
   outputResult(options.json ? finalReport : renderSetupReport(finalReport), options.json);
 }
 
+/**
+ * How each doctor status level is marked in the rendered report.
+ *
+ * `skipped` renders as `skip` so every marker stays four characters or fewer
+ * and the check names line up when a report mixes levels.
+ */
+const DOCTOR_STATUS_MARKS = Object.freeze({
+  ok: "ok",
+  fail: "FAIL",
+  warn: "warn",
+  skipped: "skip"
+});
+
+/**
+ * The status of one check, for readers that were written before `status`
+ * existed (or for a check literal that only set `ok`).
+ */
+function doctorCheckStatus(check) {
+  return check?.status ?? (check?.ok ? "ok" : "fail");
+}
+
+/**
+ * Normalize one doctor check to carry BOTH a `status` level and the legacy
+ * `ok` boolean.
+ *
+ * `ok` is kept deliberately: every existing consumer - `tests/ops.test.mjs`,
+ * `commands/doctor.md`'s "return the report verbatim" contract, and any script
+ * a user has already written against `--json` - reads it. Adding a level
+ * without keeping the boolean would be a silent breaking change to a payload
+ * whose whole job is to be machine-read.
+ *
+ * `warn` and `skipped` resolve to `ok: true` so an unmigrated reader stays
+ * green: a warning is advice, not a defect, and a skipped check measured
+ * nothing at all. Only `fail` is false.
+ */
+function normalizeDoctorCheck(check) {
+  const status = doctorCheckStatus(check);
+  return { ...check, status, ok: status !== "fail" };
+}
+
 function renderDoctorReport(report) {
   const lines = [
     "# Grok Build Doctor",
@@ -861,7 +901,8 @@ function renderDoctorReport(report) {
   ];
 
   for (const check of report.checks) {
-    const mark = check.ok ? "ok" : "FAIL";
+    const status = doctorCheckStatus(check);
+    const mark = DOCTOR_STATUS_MARKS[status] ?? status;
     lines.push(`- [${mark}] ${check.name}: ${check.detail}`);
     // Verbatim, one per line, unwrapped and unshortened. This is the only
     // place a user gets to read what a repo-tracked config would have this
@@ -870,7 +911,11 @@ function renderDoctorReport(report) {
     for (const command of check.commands ?? []) {
       lines.push(`    ${command}`);
     }
-    if (!check.ok && check.fix) {
+    // A warn carries `ok: true`, so the fix line has to be selected on the
+    // status level. Gating it on `!check.ok` (as this did before levels
+    // existed) would print the problem and silently withhold the remedy,
+    // which is the least useful half of the two.
+    if ((status === "fail" || status === "warn") && check.fix) {
       lines.push(`    Fix: ${check.fix}`);
     }
   }
@@ -1065,9 +1110,14 @@ function buildDoctorReport(cwd) {
         : "Run `/grok-build:land` to apply or discard unlanded isolated work."
   });
 
+  const normalized = checks.map(normalizeDoctorCheck);
   return {
-    ok: checks.every((check) => check.ok),
-    checks
+    // Only a `fail` moves the overall verdict. A warn is advice the user may
+    // legitimately have already decided against (verifying via an absolute
+    // path, or with no engine binary installed at all), and a skip measured
+    // nothing - neither is grounds for calling the whole environment broken.
+    ok: normalized.every((check) => check.status !== "fail"),
+    checks: normalized
   };
 }
 
@@ -1093,9 +1143,11 @@ async function handleDoctor(argv) {
   const cwd = resolveCommandCwd(options);
   const report = buildDoctorReport(cwd);
   outputResult(options.json ? report : renderDoctorReport(report), options.json);
-  if (!report.ok) {
-    process.exitCode = 0;
-  }
+  // doctor always exits 0, including for warn and fail checks: it is a report,
+  // not a gate. A non-zero exit would make `/grok-build:doctor` look like a
+  // failed command in the Claude Code transcript. There used to be an
+  // `if (!report.ok) { process.exitCode = 0; }` here, which read as an
+  // unfinished thought and invited exactly the wiring this comment forbids.
 }
 
 function renderVerifyPlan(payload) {
@@ -3610,4 +3662,11 @@ if (isMain) {
   });
 }
 
-export { buildBoundedVerifyFixPrompt, main, readStoredJobWithRetry };
+export {
+  buildBoundedVerifyFixPrompt,
+  buildDoctorReport,
+  main,
+  normalizeDoctorCheck,
+  readStoredJobWithRetry,
+  renderDoctorReport
+};

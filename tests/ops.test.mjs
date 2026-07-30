@@ -15,6 +15,10 @@ import {
   writeJobFile
 } from "../plugins/grok-build/scripts/lib/state.mjs";
 import { createWorktree } from "../plugins/grok-build/scripts/lib/worktree.mjs";
+import {
+  normalizeDoctorCheck,
+  renderDoctorReport
+} from "../plugins/grok-build/scripts/grok-bridge.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "grok-build");
@@ -74,6 +78,101 @@ test("doctor --json emits an object with a checks array", () => {
   const payload = JSON.parse(result.stdout);
   assert.ok(Array.isArray(payload.checks));
   assert.ok(payload.checks.some((check) => /HOME/i.test(check.name)));
+});
+
+test("a warn check advises without condemning the whole environment", () => {
+  // The level exists so an ecosystem probe can say "your engine binary is not
+  // on PATH" without declaring the install broken - a user may legitimately
+  // verify via an absolute path or the bpy pip module.
+  const report = {
+    ok: [{ status: "warn" }].every((check) => check.status !== "fail"),
+    checks: [
+      normalizeDoctorCheck({
+        name: "godot",
+        status: "warn",
+        detail: "godot: not found",
+        fix: "Install Godot or set GROK_BUILD_GODOT_BIN."
+      })
+    ]
+  };
+
+  assert.equal(report.ok, true, "a warn must not flip the overall verdict");
+  assert.equal(report.checks[0].ok, true, "warn keeps the legacy boolean green");
+  assert.equal(report.checks[0].status, "warn");
+
+  const rendered = renderDoctorReport(report);
+  assert.match(rendered, /- \[warn\] godot: godot: not found/);
+  // The whole point of a warn is that it is actionable; withholding the fix
+  // line (which the pre-levels `!check.ok` gate would have done) leaves the
+  // user with a complaint and no remedy.
+  assert.match(rendered, /Fix: Install Godot or set GROK_BUILD_GODOT_BIN\./);
+  assert.match(rendered, /^Status: ok$/m);
+});
+
+test("doctor status levels default from the legacy ok boolean", () => {
+  assert.equal(normalizeDoctorCheck({ name: "a", ok: true }).status, "ok");
+  assert.equal(normalizeDoctorCheck({ name: "a", ok: false }).status, "fail");
+  // A skipped check measured nothing, so it cannot be evidence of a problem.
+  const skipped = normalizeDoctorCheck({ name: "a", status: "skipped", detail: "no binary" });
+  assert.equal(skipped.ok, true);
+  assert.match(renderDoctorReport({ ok: true, checks: [skipped] }), /- \[skip\] a: no binary/);
+  // And a fail still renders the loud marker every existing reader expects.
+  const failed = normalizeDoctorCheck({ name: "a", ok: false, detail: "broken", fix: "do x" });
+  assert.equal(failed.status, "fail");
+  const rendered = renderDoctorReport({ ok: false, checks: [failed] });
+  assert.match(rendered, /- \[FAIL\] a: broken/);
+  assert.match(rendered, /Fix: do x/);
+  assert.match(rendered, /^Status: needs-attention$/m);
+});
+
+test("doctor reports a failing check but still exits 0", () => {
+  // doctor is a report, not a gate: a non-zero exit would render
+  // /grok-build:doctor as a failed command in the Claude Code transcript.
+  const binDir = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const repo = makeTempDir();
+  installFakeGrok(binDir);
+  initGitRepo(repo);
+
+  const jobId = generateJobId("run");
+  withPluginData(pluginDataDir, () => {
+    const job = {
+      id: jobId,
+      status: "running",
+      phase: "running",
+      kind: "task",
+      kindLabel: "delegate",
+      title: "Abandoned seed for doctor",
+      jobClass: "task",
+      bridgePid: 999999,
+      agentPid: 999999,
+      pid: 999999
+    };
+    writeJobFile(repo, jobId, job);
+    upsertJob(repo, job);
+  });
+
+  const result = run("node", [SCRIPT, "doctor", "--json"], {
+    cwd: repo,
+    env: pluginDataEnv(pluginDataDir, binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.equal(payload.ok, false, "an abandoned run is a real fail");
+  const abandoned = payload.checks.find((check) => /abandoned/i.test(check.name));
+  assert.ok(abandoned, "doctor must include an abandoned runs check");
+  assert.equal(abandoned.ok, false);
+  assert.equal(abandoned.status, "fail");
+  // Every check carries both fields, so a reader written against either one
+  // sees the same verdict.
+  for (const check of payload.checks) {
+    assert.ok(
+      ["ok", "fail", "warn", "skipped"].includes(check.status),
+      `unknown status on ${check.name}: ${check.status}`
+    );
+    assert.equal(check.ok, check.status !== "fail", `${check.name}: ok must mirror status`);
+  }
 });
 
 test("prune with no runs reports nothing to do", () => {
