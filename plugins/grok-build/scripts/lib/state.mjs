@@ -417,10 +417,45 @@ export function loadState(cwd) {
   }
 }
 
+// Confirmed in the field: a repo with heavy grok-build usage (dozens of write
+// runs across a session) pushes old jobs past MAX_JOBS while their worktree
+// still exists, sometimes with real unmerged commits on the run branch. The
+// plain slice(0, MAX_JOBS) below used to delete that job's record - the ONLY
+// thing every other command (doctor, prune, runs, show, land) uses to find
+// the worktree - unconditionally. From that point on the worktree and its
+// branch are still sitting on disk, fully intact in git, but PERMANENTLY
+// invisible to every one of those commands: prune's own collectPrunePlan and
+// doctor's stale-worktree/awaiting-land checks both start from listJobs(),
+// so a job that never makes it into that list can never be found, landed, or
+// even reported as stale again. This is the same "never silently destroy
+// unlanded work" invariant land's dirty-tree gate protects - the eviction
+// path here just never knew about it.
+//
+// The fix does not require a git call (which would pull worktree.mjs into a
+// module that is otherwise fs/os/path/crypto only): a job whose recorded
+// worktree directory is still present on disk stays in the index, however
+// far past MAX_JOBS it falls, until prune/land/discard actually removes that
+// directory - at which point it becomes evictable again on the next save,
+// exactly like any other finished job. MAX_JOBS therefore caps the ordinary,
+// already-cleaned-up case; it was never meant to be the thing deciding
+// whether a live worktree's bookkeeping survives.
+function jobHasLiveWorktree(job) {
+  const worktreePath = job?.worktree?.path;
+  if (!worktreePath || typeof worktreePath !== "string") {
+    return false;
+  }
+  try {
+    return fs.existsSync(worktreePath);
+  } catch {
+    return false;
+  }
+}
+
 function pruneJobs(jobs) {
-  return [...jobs]
-    .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")))
-    .slice(0, MAX_JOBS);
+  const sorted = [...jobs].sort(
+    (left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? ""))
+  );
+  return sorted.filter((job, index) => index < MAX_JOBS || jobHasLiveWorktree(job));
 }
 
 function removeFileIfExists(filePath) {

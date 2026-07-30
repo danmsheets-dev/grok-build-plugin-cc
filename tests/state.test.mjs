@@ -121,6 +121,91 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
   );
 });
 
+test("a job past the cap survives eviction while its worktree still exists on disk", () => {
+  // Confirmed in the field, not hypothetical: a repo with heavy grok-build
+  // usage pushed a job with real unmerged commits on its run branch past
+  // MAX_JOBS. The old slice(0, MAX_JOBS) deleted its record on the very next
+  // save - the job file, the log, and its entry in state.json - while the
+  // worktree and branch stayed fully intact in git. From that point doctor,
+  // prune, runs, show and land all start from listJobs(), so none of them
+  // could ever find that worktree again; it was orphaned permanently, not
+  // merely delayed. This test reproduces the eviction moment directly: a job
+  // with a real worktree on disk must NOT be deleted just because it is the
+  // oldest of 52.
+  const workspace = makeTempDir();
+  const stateFile = resolveStateFile(workspace);
+  fs.mkdirSync(path.dirname(stateFile), { recursive: true });
+
+  const worktreeDir = path.join(workspace, "worktree-for-job-0");
+  fs.mkdirSync(worktreeDir, { recursive: true });
+
+  // 52 jobs, not 51: job-0 AND job-1 both need to fall past MAX_JOBS (50) so
+  // job-1 can serve as the "worktree field alone is not enough" control -
+  // with only 51 jobs job-1 would be safely inside the top 50 regardless of
+  // its worktree field, proving nothing.
+  const jobs = Array.from({ length: 52 }, (_, index) => {
+    const jobId = `job-${index}`;
+    const updatedAt = new Date(Date.UTC(2026, 0, 1, 0, index, 0)).toISOString();
+    const logFile = resolveJobLogFile(workspace, jobId);
+    const jobFile = resolveJobFile(workspace, jobId);
+    fs.writeFileSync(logFile, `log ${jobId}\n`, "utf8");
+    const record = { id: jobId, status: "completed", updatedAt, createdAt: updatedAt };
+    // job-0 is the oldest and would normally be the one and only job pruned
+    // (mirrors the test above); giving it a live worktree path is the only
+    // difference. job-1 gets a worktree field pointing at a path that does
+    // NOT exist, so mere presence of the field is not what protects a job -
+    // only an existing directory does.
+    if (index === 0) {
+      record.worktree = { path: worktreeDir, branch: "grok-build/job-0" };
+    }
+    if (index === 1) {
+      record.worktree = { path: path.join(workspace, "never-existed"), branch: "grok-build/job-1" };
+    }
+    fs.writeFileSync(jobFile, JSON.stringify(record, null, 2), "utf8");
+    return { ...record, logFile };
+  });
+
+  fs.writeFileSync(stateFile, JSON.stringify({ version: 1, config: {}, jobs }, null, 2), "utf8");
+
+  saveState(workspace, { version: 1, config: {}, jobs });
+
+  const job0File = resolveJobFile(workspace, "job-0");
+  const job0Log = resolveJobLogFile(workspace, "job-0");
+  const job1File = resolveJobFile(workspace, "job-1");
+
+  assert.equal(fs.existsSync(job0File), true, "job-0's record must survive while its worktree exists");
+  assert.equal(fs.existsSync(job0Log), true, "job-0's log must survive alongside its record");
+  assert.equal(
+    fs.existsSync(job1File),
+    false,
+    "job-1 has a worktree FIELD but no worktree on disk, so it is evicted like any other stale job"
+  );
+
+  let savedState = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  assert.ok(
+    savedState.jobs.some((job) => job.id === "job-0"),
+    "job-0 stays in the index, not just its files on disk"
+  );
+  // The 50 newest (job-51..job-2) plus job-0 (protected past the cap) = 51.
+  // job-1 is evicted (no live worktree), so this is additive protection for
+  // a real worktree, not a blanket cap increase.
+  assert.equal(savedState.jobs.length, 51);
+
+  // Once the worktree is actually removed - exactly what `prune --apply`
+  // does today - the job becomes evictable again on the very next save, the
+  // same as any other finished run. Protection is not permanent amnesty.
+  fs.rmSync(worktreeDir, { recursive: true, force: true });
+  saveState(workspace, { version: 1, config: {}, jobs: savedState.jobs });
+
+  assert.equal(
+    fs.existsSync(job0File),
+    false,
+    "job-0 is evicted once its worktree is actually gone, same as any finished job"
+  );
+  savedState = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+  assert.ok(!savedState.jobs.some((job) => job.id === "job-0"));
+});
+
 test("loadState quarantines corrupt state and throws instead of wiping", () => {
   const workspace = makeTempDir();
   const stateFile = resolveStateFile(workspace);
