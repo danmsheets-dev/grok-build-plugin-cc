@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
+import { spawnSync } from "node:child_process";
 
 import {
   artifactExcludePathspecs,
@@ -937,4 +938,58 @@ test("capChangedFiles caps by entry count and, independently, by bytes", () => {
   assert.equal(huge.truncated, false);
 
   assert.deepEqual(capChangedFiles([]), { entries: [], total: 0, truncated: false });
+});
+
+test("a gitignored provisioned link gets no exclude pathspec, so git add succeeds", () => {
+  // Regression: `git add -A -- . :(exclude,glob)target` exits 1 with
+  // "The following paths are ignored by one of your .gitignore files: target"
+  // whenever a pathspec names an ignored path - even an exclude one. Every
+  // provisioned link is exactly such a path (target, node_modules, .venv), so
+  // the commit died on any isolated run that had work to stage. Measured: 22
+  // files of finished work reported as `changed files: none`.
+  const repo = makeTempDir("ignored-link");
+  const g = (args, cwd = repo) => {
+    const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+    assert.equal(result.status, 0, `git ${args.join(" ")}: ${result.stderr}`);
+    return result.stdout.trim();
+  };
+
+  g(["init", "-q"]);
+  g(["config", "user.email", "t@example.test"]);
+  g(["config", "user.name", "Test"]);
+  fs.writeFileSync(path.join(repo, ".gitignore"), "target/\n");
+  fs.writeFileSync(path.join(repo, "seed.txt"), "seed\n");
+  g(["add", "-A"]);
+  g(["commit", "-qm", "base"]);
+  const baseSha = g(["rev-parse", "HEAD"]);
+
+  // The link the provisioner would create, pointing at a real directory.
+  const linkTarget = makeTempDir("real-target");
+  fs.writeFileSync(path.join(linkTarget, "artifact.bin"), "built\n");
+  try {
+    fs.symlinkSync(linkTarget, path.join(repo, "target"), "junction");
+  } catch {
+    // Symlink creation can be denied on an unprivileged Windows box without
+    // developer mode. The bug needs a link to reproduce, so skip rather than
+    // assert something the environment cannot show.
+    return;
+  }
+
+  // The agent's work, alongside the link.
+  fs.writeFileSync(path.join(repo, "work.txt"), "real work\n");
+
+  const committed = commitWorktreeChanges(repo, "run under test");
+  assert.equal(committed.committed, true, `commit failed: ${committed.error ?? "(no error)"}`);
+  assert.equal(committed.error, undefined);
+
+  const listed = listCommittedChanges(repo, baseSha, committed.sha);
+  assert.equal(listed.total, 1);
+  assert.ok(listed.entries[0].endsWith("work.txt"));
+
+  // The link's contents must never reach the commit.
+  const names = spawnSync("git", ["show", "--name-only", "--format=", committed.sha], {
+    cwd: repo,
+    encoding: "utf8"
+  }).stdout;
+  assert.doesNotMatch(names, /artifact\.bin/);
 });

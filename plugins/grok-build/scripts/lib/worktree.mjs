@@ -436,6 +436,18 @@ function formatGitFailure(operation, result) {
  * Only the worktree root is scanned, because that is the only place
  * `planWorktreeLinks` ever creates a link.
  *
+ * A link git ALREADY ignores gets no pathspec at all, and that omission is the
+ * whole point rather than an optimisation. `git add` fails outright — exit 1,
+ * `The following paths are ignored by one of your .gitignore files: target` —
+ * when a pathspec explicitly names an ignored path, even an `:(exclude)` one.
+ * The provisioned links are exactly the directories a project gitignores
+ * (`target`, `node_modules`, `.venv`), so naming them broke the commit for
+ * every isolated run that had anything to stage. Measured: a Rust run that
+ * produced 22 files of real work committed nothing and reported
+ * `changed files: none`, because `add` aborted on a `:(exclude,glob)target`
+ * pathspec for a link that `.gitignore` already covered. An ignored path cannot
+ * be staged, so it never needed an exclude in the first place.
+ *
  * @param {string} worktreePath
  * @returns {string[]}
  */
@@ -449,12 +461,27 @@ function linkExcludePathspecs(worktreePath) {
     return [];
   }
 
-  return entries
-    .filter((entry) => entry.isSymbolicLink())
-    .flatMap((entry) => [
-      `:(exclude,glob)${entry.name}`,
-      `:(exclude,glob)${entry.name}/**`
-    ]);
+  const links = entries.filter((entry) => entry.isSymbolicLink()).map((entry) => entry.name);
+  if (links.length === 0) {
+    return [];
+  }
+
+  // One `check-ignore` for the whole set: it exits 1 when NOTHING matches, which
+  // is not an error here, and prints one line per ignored path when some do.
+  const ignored = new Set();
+  const check = git(worktreePath, ["check-ignore", "--", ...links]);
+  if (check.status === 0) {
+    for (const line of String(check.stdout ?? "").split(/\r?\n/)) {
+      const name = line.trim();
+      if (name) {
+        ignored.add(name);
+      }
+    }
+  }
+
+  return links
+    .filter((name) => !ignored.has(name))
+    .flatMap((name) => [`:(exclude,glob)${name}`, `:(exclude,glob)${name}/**`]);
 }
 
 /**
@@ -487,7 +514,14 @@ export function commitWorktreeChanges(worktreePath, message = "grok agent change
     ...artifactExcludePathspecs(),
     ...linkExcludePathspecs(worktreePath)
   ]);
-  if (staged.status !== 0) {
+  // Nothing left after excluding artifacts means the run produced only build
+  // output — there is no agent work to commit. Read the index BEFORE deciding
+  // what a non-zero `add` meant: git stages what it can and then complains, so
+  // "add failed" and "nothing was staged" are independent facts.
+  const stagedNames = git(worktreePath, ["diff", "--cached", "--name-only"]);
+  const stagedSomething = stagedNames.status === 0 && Boolean(stagedNames.stdout.trim());
+
+  if (staged.status !== 0 && !stagedSomething) {
     // Deliberately NO fallback to a bare `add -A`: that stages the caches and
     // the linked-in real directories this pathspec list exists to keep out,
     // and `land` then squash-merges them into the user's repository. A `:!`
@@ -496,10 +530,21 @@ export function commitWorktreeChanges(worktreePath, message = "grok agent change
     return { committed: false, sha: headSha(), error: formatGitFailure("add", staged) };
   }
 
-  // Nothing left after excluding artifacts means the run produced only build
-  // output — there is no agent work to commit.
-  const stagedNames = git(worktreePath, ["diff", "--cached", "--name-only"]);
-  if (stagedNames.status === 0 && !stagedNames.stdout.trim()) {
+  if (staged.status !== 0) {
+    // The index received the run's work and git still exited non-zero. That is
+    // the shape of a complaint about a path it declined to stage — an ignored
+    // one, most often — not a failure to stage the work. Throwing the whole
+    // commit away here cost a real run: 22 files of finished work sat
+    // uncommitted in a worktree and the run reported `changed files: none`,
+    // because `add` had aborted over one gitignored link. Commit what is in the
+    // index; linkExcludePathspecs no longer names ignored paths, so reaching
+    // this branch at all should now be rare.
+    process.stderr.write(
+      `Warning: ${formatGitFailure("add", staged)}; the index received this run's work, committing it anyway.\n`
+    );
+  }
+
+  if (!stagedSomething) {
     return { committed: false, sha: headSha() };
   }
 
