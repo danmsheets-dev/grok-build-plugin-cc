@@ -462,6 +462,155 @@ test("real untracked source still blocks land after the artifact filter", () => 
   }
 });
 
+test("an uncommitted edit to a TRACKED file under an artifact path blocks land", () => {
+  // Regression, and the worst one this plugin has had: the dirty gate's
+  // artifact exemption is a PATH filter with no tracked/untracked distinction,
+  // so a tracked-and-modified `assets/obj/hero.obj` (matched by `**/obj/**`)
+  // sailed straight through it - and a conflicting squash merge then ran
+  // `git reset --hard HEAD`, which destroyed the edit with no stash, no reflog
+  // and no mention in the error. `?? .godot/`, the case the filter exists for,
+  // is untracked and a hard reset cannot touch it; tracked dirt is a different
+  // animal and has to block.
+  const repo = makeTempDir("grok-land-tracked-artifact-");
+  const binDir = makeTempDir("grok-land-tracked-artifact-bin-");
+  const pluginDataDir = makeTempDir("grok-land-tracked-artifact-data-");
+  installFakeGrok(binDir);
+  seedRepo(repo);
+
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  try {
+    // A tracked source file that happens to live under an excluded path. Both
+    // this and `test/fixtures/node_modules/...` are routine in real repos.
+    const trackedArtifactPath = path.join(repo, "assets", "obj", "hero.obj");
+    fs.mkdirSync(path.dirname(trackedArtifactPath), { recursive: true });
+    fs.writeFileSync(trackedArtifactPath, "v -1 -1 -1\n");
+
+    // NUL bytes are what make git treat it as binary; binary conflicts are the
+    // deterministic route into recoverFromFailedLandMerge.
+    const asset = (marker) => Buffer.from(`${marker}  payload\n`, "binary");
+    fs.writeFileSync(path.join(repo, "asset.bin"), asset("BASE"));
+    run("git", ["add", "-A"], { cwd: repo });
+    run("git", ["commit", "-m", "add tracked artifact-path file and binary asset"], { cwd: repo });
+
+    const jobId = generateJobId("run");
+    const created = createWorktree({ cwd: repo, runId: jobId, dataDir: pluginDataDir });
+    fs.writeFileSync(path.join(created.worktreePath, "asset.bin"), asset("AGENT"));
+    run("git", ["commit", "-am", "agent rewrote the asset"], { cwd: created.worktreePath });
+
+    seedFinishedJob(repo, pluginDataDir, {
+      id: jobId,
+      worktree: {
+        path: created.worktreePath,
+        branch: created.branchName,
+        baseSha: created.baseSha
+      }
+    });
+
+    // The other side of the conflict.
+    fs.writeFileSync(path.join(repo, "asset.bin"), asset("HUMAN"));
+    run("git", ["commit", "-am", "human rewrote the asset"], { cwd: repo });
+
+    const precious = "v 9 9 9  # PRECIOUS UNCOMMITTED EDIT\n";
+    fs.writeFileSync(trackedArtifactPath, precious);
+
+    // The filtered gate must genuinely be blind to it - otherwise this test
+    // passes for the wrong reason.
+    const filtered = run(
+      "git",
+      ["status", "--porcelain", "--", ".", ":(exclude,glob)**/obj/**"],
+      { cwd: repo }
+    );
+    assert.doesNotMatch(filtered.stdout, /hero\.obj/, "the artifact filter must hide the fixture");
+
+    const result = run("node", [SCRIPT, "land", jobId], {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir)
+    });
+
+    const combined = `${result.stderr}\n${result.stdout}`;
+    assert.notEqual(result.status, 0, combined);
+    assert.match(combined, /Refusing to land/);
+    assert.match(combined, /assets\/obj\/hero\.obj/, "the blocking path must be named");
+    assert.match(combined, /commit or stash/i);
+
+    // The whole point: the uncommitted content is still on disk, byte for byte.
+    assert.equal(fs.readFileSync(trackedArtifactPath, "utf8"), precious);
+    // And nothing was applied or thrown away in the process.
+    assert.equal(fs.existsSync(created.worktreePath), true);
+    assert.equal(run("git", ["diff", "--cached", "--name-only"], { cwd: repo }).stdout.trim(), "");
+  } finally {
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
+});
+
+test("untracked dirt under an artifact path still lands, tracked or not the directory", () => {
+  // The discriminator for the test above: narrowing the exemption to untracked
+  // entries must not narrow it away. `git reset --hard HEAD` cannot touch an
+  // untracked file, so `?? .godot/` - and an untracked build output sitting in
+  // the same directory as a TRACKED file - both stay exempt.
+  const repo = makeTempDir("grok-land-untracked-artifact-");
+  const binDir = makeTempDir("grok-land-untracked-artifact-bin-");
+  const pluginDataDir = makeTempDir("grok-land-untracked-artifact-data-");
+  installFakeGrok(binDir);
+  seedRepo(repo);
+
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  try {
+    // Same tracked-under-an-excluded-path fixture as above, but CLEAN.
+    fs.mkdirSync(path.join(repo, "assets", "obj"), { recursive: true });
+    fs.writeFileSync(path.join(repo, "assets", "obj", "hero.obj"), "v -1 -1 -1\n");
+    run("git", ["add", "-A"], { cwd: repo });
+    run("git", ["commit", "-m", "add tracked artifact-path file"], { cwd: repo });
+
+    const jobId = generateJobId("run");
+    const created = createWorktree({ cwd: repo, runId: jobId, dataDir: pluginDataDir });
+    fs.writeFileSync(path.join(created.worktreePath, "landed.txt"), "landed body\n");
+    run("git", ["add", "landed.txt"], { cwd: created.worktreePath });
+    run("git", ["commit", "-m", "agent change"], { cwd: created.worktreePath });
+
+    seedFinishedJob(repo, pluginDataDir, {
+      id: jobId,
+      worktree: {
+        path: created.worktreePath,
+        branch: created.branchName,
+        baseSha: created.baseSha
+      }
+    });
+
+    fs.mkdirSync(path.join(repo, ".godot", "imported"), { recursive: true });
+    fs.writeFileSync(path.join(repo, ".godot", "imported", "x.ctex"), "cache\n");
+    fs.writeFileSync(path.join(repo, "assets", "obj", "hero.generated.o"), "build output\n");
+
+    const result = run("node", [SCRIPT, "land", jobId, "--json"], {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir)
+    });
+
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    const payload = JSON.parse(result.stdout);
+    assert.equal(payload.action, "apply");
+    const ignored = payload.ignoredDirtyArtifacts.join(" ");
+    assert.match(ignored, /\.godot/);
+    assert.match(ignored, /hero\.generated\.o/);
+    assert.match(
+      run("git", ["diff", "--cached", "--name-only"], { cwd: repo }).stdout,
+      /landed\.txt/
+    );
+  } finally {
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
+});
+
 test("landing a job twice gives a clean error on the second call, not a raw git error", () => {
   // Regression found by a second-round audit: land never cleared the job's
   // worktree field after a successful apply or discard, so a second

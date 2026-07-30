@@ -1430,6 +1430,15 @@ test("a Godot cache that git already checked out is reported, not silently skipp
   // A cache that could not be linked is not shared, so the editor warning
   // must not fire for it.
   assert.deepEqual(payload.provision.notes, []);
+  // Load-bearing for land's dirty gate: because provisioning SKIPS a tracked
+  // `.godot` rather than replacing it, it can never leave the user's repo with
+  // tracked dirt inside an artifact-excluded path - which is the one state
+  // land now refuses outright (a conflicting squash merge hard-resets it away).
+  assert.equal(
+    run("git", ["status", "--porcelain", "--untracked-files=no"], { cwd: repo }).stdout.trim(),
+    "",
+    "provisioning must not leave the user's tracked .godot modified"
+  );
 
   const previous = process.env.CLAUDE_PLUGIN_DATA;
   process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;

@@ -3440,7 +3440,17 @@ async function handleTask(argv) {
   );
 }
 
-function porcelainDirtyPaths(statusOutput) {
+/**
+ * Porcelain lines split into their two-character status code and their path.
+ *
+ * The status code is what distinguishes tracked dirt from untracked dirt - `??`
+ * is untracked, everything else names a tracked file - and land now has to make
+ * that distinction, so the parse cannot throw it away.
+ *
+ * @param {string} statusOutput
+ * @returns {{status: string, path: string}[]}
+ */
+function porcelainEntries(statusOutput) {
   return String(statusOutput ?? "")
     .split(/\r?\n/)
     .map((line) => line.trimEnd())
@@ -3449,29 +3459,55 @@ function porcelainDirtyPaths(statusOutput) {
       // Porcelain: "XY path" or "XY origin -> path"
       const body = line.length >= 3 ? line.slice(3) : line;
       const arrow = body.indexOf(" -> ");
-      return (arrow === -1 ? body : body.slice(arrow + 4)).trim();
+      return {
+        status: line.slice(0, 2),
+        path: (arrow === -1 ? body : body.slice(arrow + 4)).trim()
+      };
     })
-    .filter(Boolean);
+    .filter((entry) => entry.path);
+}
+
+function porcelainDirtyPaths(statusOutput) {
+  return porcelainEntries(statusOutput).map((entry) => entry.path);
 }
 
 /**
- * Which dirty paths the artifact-filtered dirty gate chose to overlook.
+ * Split the dirty paths the artifact-filtered dirty gate overlooked into the
+ * ones it is safe to overlook and the ones it is not.
  *
- * Reported so a land that proceeds over a visibly dirty `git status` says why,
- * rather than looking like the gate silently stopped working. Costs one extra
- * git call, so callers only reach it once the filtered status came back clean.
+ * `artifactExcludePathspecs()` is a PATH filter: it has no idea whether a path
+ * is tracked. That is exactly right for the case it was added for - `?? .godot/`
+ * is permanently untracked in a Godot repo that does not gitignore it - and
+ * actively dangerous for anything tracked, because `recoverFromFailedLandMerge`
+ * runs `git reset --hard HEAD` on the conflict path. A hard reset cannot touch
+ * an untracked file, but it destroys uncommitted changes to a TRACKED one, with
+ * no reflog and no object to recover from. Every artifact pathspec is recursive
+ * (leading double-star), so routinely-tracked paths like
+ * `test/fixtures/node_modules/pkg/index.js` or `assets/obj/hero.obj` fall
+ * inside them.
+ *
+ * Costs one extra git call, so callers only reach it once the filtered status
+ * came back clean.
  *
  * @param {string} repoRoot
  * @param {string[]} filteredDirtyFiles - paths the filtered status still flagged
- * @returns {string[]}
+ * @returns {{untracked: string[], tracked: string[]}}
  */
-function describeIgnoredDirtyArtifacts(repoRoot, filteredDirtyFiles) {
+function classifyIgnoredDirtyArtifacts(repoRoot, filteredDirtyFiles) {
   const unfiltered = git(repoRoot, ["status", "--porcelain"]);
   if (unfiltered.status !== 0) {
-    return [];
+    return { untracked: [], tracked: [] };
   }
   const kept = new Set(filteredDirtyFiles);
-  return porcelainDirtyPaths(unfiltered.stdout).filter((entry) => !kept.has(entry));
+  const untracked = [];
+  const tracked = [];
+  for (const entry of porcelainEntries(unfiltered.stdout)) {
+    if (kept.has(entry.path)) {
+      continue;
+    }
+    (entry.status === "??" ? untracked : tracked).push(entry.path);
+  }
+  return { untracked, tracked };
 }
 
 /**
@@ -3546,9 +3582,14 @@ function readPreviewDiff(repoRoot, diffRange) {
  * to abort". Never suggest it.
  *
  * `reset --hard HEAD` is safe HERE AND ONLY HERE because the dirty-tree gate
- * above already refused to run against uncommitted work. It also clears
- * SQUASH_MSG, MERGE_MSG and AUTO_MERGE on its own (verified), so nothing needs
- * to be hand-deleted from inside .git.
+ * above already refused to run against uncommitted work in any TRACKED file.
+ * That qualifier is load-bearing: the gate exempts generated-artifact paths,
+ * and for a while it exempted them by path alone, which let a tracked-and-dirty
+ * `test/fixtures/node_modules/...` through to be silently destroyed here. The
+ * gate now blocks on exempted-but-tracked dirt, so everything this reset can
+ * still reach is either committed or untracked - and a hard reset cannot touch
+ * an untracked file. It also clears SQUASH_MSG, MERGE_MSG and AUTO_MERGE on its
+ * own (verified), so nothing needs to be hand-deleted from inside .git.
  *
  * @param {string} repoRoot
  * @param {string} jobId
@@ -3735,9 +3776,28 @@ async function handleLand(argv) {
     );
   }
 
-  // Only worth a second git call once the filtered result came back clean:
-  // this is the line that tells the user land proceeded despite visible dirt.
-  const ignoredDirtyArtifacts = describeIgnoredDirtyArtifacts(repoRoot, dirtyFiles);
+  // Only worth a second git call once the filtered result came back clean. It
+  // does two jobs: it tells the user land proceeded despite visible dirt, and
+  // it re-checks the half of that dirt the pathspec filter should never have
+  // waved through.
+  const { untracked: ignoredDirtyArtifacts, tracked: exemptedTrackedDirt } =
+    classifyIgnoredDirtyArtifacts(repoRoot, dirtyFiles);
+
+  // Deliberately BEFORE the merge. The pathspec filter above exempts by path,
+  // never by tracked state, so it also waves through an uncommitted edit to a
+  // TRACKED file that happens to sit under `node_modules/`, `obj/`, `.godot/`
+  // and friends - and if the squash merge then conflicts,
+  // recoverFromFailedLandMerge's `git reset --hard HEAD` destroys exactly that
+  // edit, unrecoverably and without mentioning it. Only the untracked half of
+  // what the filter dropped is safe to land over; a hard reset cannot touch an
+  // untracked file, so `?? .godot/` stays exempt.
+  if (exemptedTrackedDirt.length > 0) {
+    const named = exemptedTrackedDirt.slice(0, 5).join(", ");
+    throw new Error(
+      `Refusing to land: ${named} has uncommitted changes and land may have to hard-reset ` +
+        `to recover from a merge conflict. Commit or stash it first.`
+    );
+  }
 
   // Unchecked on purpose: gitChecked would throw with git's raw stderr and
   // leave the repository sitting in a half-merged state with conflict markers
