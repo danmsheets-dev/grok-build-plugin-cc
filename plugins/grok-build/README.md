@@ -299,7 +299,7 @@ A run also reports what it did to the disk and how it was captured:
 ## Requirements
 
 - Node.js >= 18.18
-- The `grok` CLI on `PATH`, or `GROK_BINARY` pointing at it
+- The `grok` CLI on `PATH`, or `GROK_BINARY` pointing at a compatible CLI (see [Alternate CLIs](#alternate-clis))
 - A logged-in Grok session — `grok models` must succeed
 - `HOME` or `GROK_HOME` must be set. On Windows neither is set by default; the bridge's core paths work without it, but `grok` subcommands such as `grok worktree` fail with `neither $GROK_HOME nor $HOME is set`.
 
@@ -353,11 +353,45 @@ Every run surfaces its Grok session id and a `grok -r <id>` resume line, so a ru
 
 Terminal status is claimed under a lock, and `cancelled` always wins: a run you stopped can never be reported as completed by a worker that finishes moments later.
 
+## Alternate CLIs
+
+`GROK_BINARY` accepts any CLI that speaks the Grok Build command surface, not
+just the first-party `grok`. The bridge only ever calls `version` / `--version`,
+`models`, and the headless flags (`-p`, `-c`, `-r`, `--session-id`), so
+community builds work unmodified.
+
+The common case is [Hyper](https://github.com/DaviRain-Su/hyper-grok-build), a
+multi-provider community build that keeps the same `~/.grok` config, auth, and
+session state — so credentials and sessions are shared with an existing `grok`
+install rather than duplicated.
+
+```bash
+# per shell
+export GROK_BINARY=hyper
+
+# or, for every Claude Code session, in ~/.claude/settings.json:
+#   "env": { "GROK_BINARY": "hyper" }
+```
+
+`/grok-build:check` reports which CLI it resolved and adds a `brand` field, so
+the `grok` entry reading `hyper <version>` is expected and correct rather than a
+misconfiguration. When the configured binary cannot be run, the failure hint
+names *that* binary instead of telling you to install Grok Build.
+
+The test suite clears `GROK_BINARY` for fixture-backed runs, so having it
+exported does not silently point the suite at your real CLI.
+
+**Layer boundary.** This plugin is the Claude Code → CLI bridge. Anything that
+shapes how the *CLI agent itself* behaves — its system prompt, subagents,
+hooks, LSP servers, MCP servers — lives in `~/.grok` and is configured there,
+independent of this plugin. Ecosystem support in this repo (Godot, Blender)
+concerns how the bridge *verifies* a run, not how the agent writes code.
+
 ## Environment
 
 | Variable | Purpose |
 | --- | --- |
-| `GROK_BINARY` | Override the `grok` executable |
+| `GROK_BINARY` | Override the `grok` executable — see [Alternate CLIs](#alternate-clis) |
 | `GROK_CC_SESSION_ID` | Claude session id, set by the SessionStart hook |
 | `GROK_CC_TRANSCRIPT_PATH` | Claude transcript path, set by the SessionStart hook |
 | `CLAUDE_PLUGIN_DATA` | Plugin data root; run state lives under `.../state` |

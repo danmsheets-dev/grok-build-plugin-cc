@@ -20,6 +20,7 @@ import {
 import {
   buildReviewPrompt,
   DEFAULT_CONTINUE_PROMPT,
+  describeMissingBinary,
   getGrokAuthStatus,
   getGrokAvailability,
   parseStructuredOutput,
@@ -863,12 +864,14 @@ async function buildCheckReport(cwd, actionsTaken = []) {
   const authStatus = getGrokAuthStatus(cwd);
 
   const nextSteps = [];
+  const cliName = grokStatus.binary || "grok";
+  const cliLabel = grokStatus.brand?.label || "Grok Build";
   if (!grokStatus.available) {
-    nextSteps.push("Install the Grok Build CLI and ensure `grok` is on PATH (or set GROK_BINARY).");
+    nextSteps.push(describeMissingBinary(grokStatus.binary));
   }
   if (grokStatus.available && !authStatus.loggedIn) {
-    nextSteps.push("Authenticate the Grok CLI (for example by running `grok` interactively and completing login).");
-    nextSteps.push("Verify with `grok models` — a successful run means you are logged in.");
+    nextSteps.push(`Authenticate the ${cliLabel} CLI (for example by running \`${cliName}\` interactively and completing login).`);
+    nextSteps.push(`Verify with \`${cliName} models\` — a successful run means you are logged in.`);
   }
 
   return {
@@ -1477,9 +1480,7 @@ function buildDoctorReport(cwd, options = {}) {
     detail: grok.available
       ? (grok.detail || "available")
       : (grok.detail || "not available"),
-    fix: grok.available
-      ? null
-      : "Install the Grok CLI and ensure `grok` is on PATH (or set GROK_BINARY)."
+    fix: grok.available ? null : describeMissingBinary(grok.binary)
   });
 
   const auth = getGrokAuthStatus(cwd);
@@ -1941,7 +1942,7 @@ function ensureGrokAvailable(cwd) {
   const availability = getGrokAvailability(cwd);
   if (!availability.available) {
     throw new Error(
-      "Grok CLI is not installed or not on PATH. Install it, set GROK_BINARY if needed, then rerun `/grok-build:check`."
+      `${describeMissingBinary(availability.binary)} Then rerun \`/grok-build:check\`.`
     );
   }
 }

@@ -45,6 +45,49 @@ export function runGrok(args = [], options = {}) {
   });
 }
 
+/**
+ * Which CLI is actually behind `GROK_BINARY`.
+ *
+ * `GROK_BINARY` has always accepted any compatible executable, and community
+ * builds of Grok Build ship under their own name (Hyper is the common one:
+ * same CLI surface, same `~/.grok` config and auth, different binary). When the
+ * bridge is driving one of those, saying "install the Grok Build CLI" on
+ * failure sends the user to the wrong product.
+ *
+ * Detection is on the version banner rather than the binary path, because the
+ * path may be a shim, a symlink, or a bare name resolved through PATH.
+ * Unknown output falls back to Grok Build, which is the historical behaviour.
+ *
+ * @param {string | null | undefined} versionDetail Output of `<binary> version`
+ * @returns {{ id: string, label: string }}
+ */
+export function detectCliBrand(versionDetail) {
+  const text = String(versionDetail ?? "").trim().toLowerCase();
+  if (/\bhyper\b/.test(text)) {
+    return { id: "hyper", label: "Hyper" };
+  }
+  return { id: "grok", label: "Grok Build" };
+}
+
+/**
+ * Remediation text for "the CLI is not runnable".
+ *
+ * Branches on whether `GROK_BINARY` is actually overriding the default. Telling
+ * someone who deliberately pointed the bridge at `hyper` to "install the Grok
+ * Build CLI" is wrong twice over: they did not want that product, and the real
+ * fault is almost always a bad path or a binary that is not executable.
+ *
+ * @param {string} binary The binary the bridge tried to run
+ * @returns {string}
+ */
+export function describeMissingBinary(binary) {
+  const name = String(binary ?? "").trim() || DEFAULT_BINARY;
+  if (name === DEFAULT_BINARY) {
+    return "Install the Grok Build CLI and ensure `grok` is on PATH (or point GROK_BINARY at a compatible CLI, e.g. a Hyper build).";
+  }
+  return `\`${name}\` (from GROK_BINARY) could not be run. Check the path is correct and executable, or unset GROK_BINARY to fall back to the default \`grok\` CLI.`;
+}
+
 export function getGrokAvailability(cwd, options = {}) {
   const binary = options.binary ?? resolveGrokBinary(options.env ?? process.env);
   const versionStatus = binaryAvailable(binary, ["version"], { cwd, env: options.env });
@@ -54,19 +97,22 @@ export function getGrokAvailability(cwd, options = {}) {
       return {
         available: false,
         detail: versionStatus.detail,
-        binary
+        binary,
+        brand: detectCliBrand(null)
       };
     }
     return {
       available: true,
       detail: alt.detail,
-      binary
+      binary,
+      brand: detectCliBrand(alt.detail)
     };
   }
   return {
     available: true,
     detail: versionStatus.detail,
-    binary
+    binary,
+    brand: detectCliBrand(versionStatus.detail)
   };
 }
 

@@ -11,7 +11,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" check --json $ARGUMENTS
 ```
 
 If the result says Grok is unavailable:
-- Do not invent an install path. Tell the user to install the Grok Build CLI and ensure `grok` is on PATH (or set `GROK_BINARY`).
+- Do not invent an install path. Report the `fix` text the bridge returns verbatim — it already names the binary that was actually tried, which may be a compatible non-`grok` CLI selected via `GROK_BINARY` (e.g. a Hyper build). Do not tell the user to install Grok Build when they deliberately configured a different CLI.
 - Then rerun `/grok-build:check` after they install it.
 
 If Grok is already installed:

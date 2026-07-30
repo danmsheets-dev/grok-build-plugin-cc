@@ -235,9 +235,25 @@ process.exit(1);
 }
 
 export function buildEnv(binDir, extra = {}) {
-  return {
+  const env = {
     ...process.env,
     PATH: `${binDir}${path.delimiter}${process.env.PATH ?? ""}`,
     ...extra
   };
+
+  // Putting the fake `grok` first on PATH is not enough on its own: GROK_BINARY
+  // outranks PATH entirely, so a developer who has it exported — now a
+  // documented, supported setup for driving a community build such as Hyper —
+  // runs the whole suite against their REAL CLI. The failure is baffling rather
+  // than obvious: fixtures return live model output instead of scripted text,
+  // so assertions fail on content, not on "grok not found".
+  //
+  // Deleted rather than pinned to "grok" so PATH stays the single source of
+  // truth for which binary a test exercises. A test that genuinely wants the
+  // override can still pass it through `extra`, which is applied above.
+  if (!Object.prototype.hasOwnProperty.call(extra, "GROK_BINARY")) {
+    delete env.GROK_BINARY;
+  }
+
+  return env;
 }
