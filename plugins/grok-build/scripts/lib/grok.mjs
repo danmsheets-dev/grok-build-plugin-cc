@@ -154,55 +154,208 @@ function emitProgress(onProgress, message, phase = null, extra = {}) {
   onProgress({ message, phase, ...extra });
 }
 
-function buildHeadlessArgs(prompt, options = {}) {
-  const args = [];
+// Windows does not have one command-line limit, it has two, and both are well
+// under what a review diff can reach. Measured on this box: a single 40 000-char
+// argv element handed straight to CreateProcess fails outright with
+// ENAMETOOLONG; the SAME prompt routed through the `cmd.exe /d /s /c` form that
+// which.mjs:155-167 produces for a `.cmd` shim dies at ~8 500 chars with
+// `The command line is too long.` on stderr, status 1 and NO `error` field - so
+// the user saw nothing but "Grok exited with status 1".
+//
+// POSIX is not exempt, just later: Linux caps a SINGLE argument at
+// MAX_ARG_STRLEN (32 pages = 131 072 bytes) regardless of how much total room
+// ARG_MAX allows, so a large enough prompt is E2BIG there too.
+export const PROMPT_ARGV_BUDGET_WIN32_CMD_SHIM = 7000;
+export const PROMPT_ARGV_BUDGET_WIN32 = 28000;
+export const PROMPT_ARGV_BUDGET_POSIX = 120 * 1024;
+// Floor, so a pathological pile of other flags cannot resolve the prompt's
+// share to zero (or negative) and produce an argument that is nothing but an
+// elision marker. Overflowing is still possible in that degenerate case, but a
+// prompt is not worth sending at all below this.
+const MIN_PROMPT_ARGV_BUDGET = 1024;
+// Rough per-argument cost of the separator and quoting the OS adds around each
+// argv element. Deliberately pessimistic - the point is to stay under a hard
+// limit, not to use every last byte of it.
+const ARGV_ELEMENT_OVERHEAD_BYTES = 3;
+
+function argvBytes(values, initial = 0) {
+  return values.reduce(
+    (total, value) => total + Buffer.byteLength(String(value ?? ""), "utf8") + ARGV_ELEMENT_OVERHEAD_BYTES,
+    initial
+  );
+}
+
+/**
+ * How many bytes the prompt argument may occupy.
+ *
+ * Derived from the invocation SHAPE, not just the platform: the cmd.exe shim
+ * form has roughly a quarter of the direct form's headroom. `otherArgvBytes`
+ * is subtracted because the limit is on the whole command line - the critique
+ * path alone also carries a serialized `--json-schema`, which is far from free.
+ */
+export function resolvePromptArgvBudget(options = {}) {
+  const platform = options.platform ?? process.platform;
+  const explicit = Number(options.argvBudget);
+  const total =
+    Number.isFinite(explicit) && explicit > 0
+      ? Math.floor(explicit)
+      : platform === "win32"
+        ? options.cmdShim
+          ? PROMPT_ARGV_BUDGET_WIN32_CMD_SHIM
+          : PROMPT_ARGV_BUDGET_WIN32
+        : PROMPT_ARGV_BUDGET_POSIX;
+
+  const other = Number(options.otherArgvBytes);
+  const reserved = Number.isFinite(other) && other > 0 ? Math.floor(other) : 0;
+  return Math.max(MIN_PROMPT_ARGV_BUDGET, total - reserved);
+}
+
+/**
+ * Middle-truncate a prompt to fit a byte budget.
+ *
+ * The middle is what goes: the head carries the task framing and the tail
+ * carries the newest hunks, the untracked section and any schema instructions -
+ * i.e. both ends are load-bearing and the interior of a huge diff is the part a
+ * reviewer can re-read from disk.
+ *
+ * @returns {{prompt: string, elidedBytes: number, originalBytes: number}}
+ */
+export function boundPromptForArgv(prompt, budgetBytes) {
+  const raw = String(prompt ?? "");
+  const buffer = Buffer.from(raw, "utf8");
+  if (buffer.length <= budgetBytes) {
+    return { prompt: raw, elidedBytes: 0, originalBytes: buffer.length };
+  }
+
+  const markerFor = (bytes) =>
+    `\n\n[... ${bytes} bytes elided: prompt exceeded the platform command-line limit ...]\n\n`;
+  // Reserve against the LONGEST marker this can produce - the elided count can
+  // never exceed the whole prompt - plus slack for the two cut points: slicing a
+  // Buffer mid-character turns each stray byte into a 3-byte U+FFFD, so the
+  // decoded string can come back slightly longer than the slices were.
+  const reserved = Buffer.byteLength(markerFor(buffer.length), "utf8") + 32;
+  const available = Math.max(0, budgetBytes - reserved);
+  const headBytes = Math.floor(available * 0.35);
+  const tailBytes = available - headBytes;
+  const elidedBytes = buffer.length - headBytes - tailBytes;
+
+  return {
+    prompt:
+      buffer.subarray(0, headBytes).toString("utf8") +
+      markerFor(elidedBytes) +
+      buffer.subarray(buffer.length - tailBytes).toString("utf8"),
+    elidedBytes,
+    originalBytes: buffer.length
+  };
+}
+
+/**
+ * Spill an oversized prompt to disk so `--prompt-file` can carry it verbatim.
+ * The file is kept rather than deleted: it is the exact input of a run that is
+ * about to be logged, and a few tens of KB next to the job records it belongs
+ * with is cheaper than not being able to reproduce the run.
+ */
+function writePromptFile(directory, prompt) {
+  const promptsDir = path.join(String(directory), "prompts");
+  fs.mkdirSync(promptsDir, { recursive: true });
+  const filePath = path.join(promptsDir, `prompt-${Date.now()}-${crypto.randomUUID()}.txt`);
+  fs.writeFileSync(filePath, prompt, "utf8");
+  return filePath;
+}
+
+export function buildHeadlessArgs(prompt, options = {}) {
+  const leading = [];
 
   if (options.resumeSessionId) {
-    args.push("-r", options.resumeSessionId);
+    leading.push("-r", options.resumeSessionId);
   } else if (options.continueLast) {
-    args.push("-c");
+    leading.push("-c");
   } else if (options.sessionId) {
-    args.push("--session-id", options.sessionId);
+    leading.push("--session-id", options.sessionId);
   }
 
-  args.push("-p", prompt);
+  const trailing = [];
 
   if (options.cwd) {
-    args.push("--cwd", options.cwd);
+    trailing.push("--cwd", options.cwd);
   }
   if (options.agent) {
-    args.push("--agent", options.agent);
+    trailing.push("--agent", options.agent);
   }
   if (options.permissionMode) {
-    args.push("--permission-mode", options.permissionMode);
+    trailing.push("--permission-mode", options.permissionMode);
   }
   if (options.sandbox) {
-    args.push("--sandbox", options.sandbox);
+    trailing.push("--sandbox", options.sandbox);
   }
   if (options.alwaysApprove) {
-    args.push("--always-approve");
+    trailing.push("--always-approve");
   }
   if (options.model) {
-    args.push("--model", options.model);
+    trailing.push("--model", options.model);
   }
   if (options.effort) {
-    args.push("--effort", options.effort);
+    trailing.push("--effort", options.effort);
   }
   if (options.outputFormat) {
-    args.push("--output-format", options.outputFormat);
+    trailing.push("--output-format", options.outputFormat);
   } else {
-    args.push("--output-format", "streaming-json");
+    trailing.push("--output-format", "streaming-json");
   }
   if (options.maxTurns != null && Number.isFinite(Number(options.maxTurns)) && Number(options.maxTurns) >= 1) {
-    args.push("--max-turns", String(options.maxTurns));
+    trailing.push("--max-turns", String(options.maxTurns));
   }
   if (options.jsonSchema) {
     const schemaText =
       typeof options.jsonSchema === "string" ? options.jsonSchema : JSON.stringify(options.jsonSchema);
-    args.push("--json-schema", schemaText);
+    trailing.push("--json-schema", schemaText);
   }
 
-  return args;
+  // Everything but the prompt is measured first: the platform limit applies to
+  // the whole command line, and `argvOverheadBytes` lets the caller add what the
+  // resolver prepends (node + a script path, or cmd.exe /d /s /c).
+  const otherArgvBytes = argvBytes(
+    [...leading, ...trailing, "-p"],
+    Number.isFinite(Number(options.argvOverheadBytes)) ? Number(options.argvOverheadBytes) : 0
+  );
+  const budgetBytes = resolvePromptArgvBudget({
+    platform: options.platform,
+    cmdShim: options.cmdShim,
+    argvBudget: options.argvBudget,
+    otherArgvBytes
+  });
+
+  const raw = String(prompt ?? "");
+  const promptBytes = Buffer.byteLength(raw, "utf8");
+  let promptArgs = null;
+  const transport = { mode: "inline", promptBytes, budgetBytes, elidedBytes: 0, promptFile: null };
+
+  if (promptBytes <= budgetBytes) {
+    promptArgs = ["-p", raw];
+  } else if (options.promptFileDir) {
+    // Preferred over truncating: `--prompt-file` takes the prompt out of argv
+    // entirely, so nothing is lost. Falls through to truncation if the spill
+    // cannot be written - a full or read-only state dir must not fail the run.
+    try {
+      const promptFile = writePromptFile(options.promptFileDir, raw);
+      promptArgs = ["--prompt-file", promptFile];
+      transport.mode = "prompt-file";
+      transport.promptFile = promptFile;
+    } catch {
+      promptArgs = null;
+    }
+  }
+
+  if (!promptArgs) {
+    const bounded = boundPromptForArgv(raw, budgetBytes);
+    promptArgs = ["-p", bounded.prompt];
+    transport.mode = "truncated";
+    transport.elidedBytes = bounded.elidedBytes;
+  }
+
+  options.onPromptBounded?.(transport);
+
+  return [...leading, ...promptArgs, ...trailing];
 }
 
 export function runHeadlessAgent(cwd, options = {}) {
@@ -216,16 +369,29 @@ export function runHeadlessAgent(cwd, options = {}) {
     ? options.resumeSessionId
     : options.sessionId || (options.assignSessionId === false ? null : crypto.randomUUID());
 
+  const platform = options.platform ?? process.platform;
+  const detached = options.detached ?? platform !== "win32";
+  const spawnEnv = options.env ?? process.env;
+
+  // The prompt's argv budget depends on HOW the binary gets launched, so the
+  // invocation shape has to be known before the args are built. Resolving with
+  // an empty arg list is enough to learn that and to measure the prefix the
+  // resolver prepends (cmd.exe /d /s /c, or node + a script path).
+  const invocationShape = resolveSpawnInvocation(binary, [], spawnEnv, platform);
+  let promptTransport = null;
+
   const args = buildHeadlessArgs(prompt, {
     ...options,
     cwd: options.cwd ?? cwd,
-    sessionId: options.resumeSessionId || options.continueLast ? undefined : sessionId
+    sessionId: options.resumeSessionId || options.continueLast ? undefined : sessionId,
+    platform,
+    cmdShim: invocationShape.windowsVerbatimArguments === true,
+    argvOverheadBytes: argvBytes([invocationShape.executable, ...invocationShape.args]),
+    onPromptBounded: (info) => {
+      promptTransport = info;
+    }
   });
 
-  const platform = options.platform ?? process.platform;
-  const detached = options.detached ?? platform !== "win32";
-
-  const spawnEnv = options.env ?? process.env;
   // Resolve through PATH/PATHEXT so an extensionless shebang script on PATH is
   // honoured. Without this, Windows CreateProcess skips it and silently runs a
   // real `grok.exe` from elsewhere on PATH instead.
@@ -249,6 +415,25 @@ export function runHeadlessAgent(cwd, options = {}) {
       agentPid,
       pid: agentPid
     });
+
+    // An elided prompt changes what the model was asked, so it must never be
+    // silent. The prompt-file case is non-lossy but still worth saying, because
+    // the path is the only way to see what was actually sent.
+    if (promptTransport?.mode === "prompt-file") {
+      emitProgress(
+        options.onProgress,
+        `Prompt was ${promptTransport.promptBytes} bytes, over the ${promptTransport.budgetBytes} byte command-line budget; sent via --prompt-file ${promptTransport.promptFile}.`,
+        "starting",
+        { threadId: sessionId, agentPid }
+      );
+    } else if (promptTransport?.mode === "truncated") {
+      emitProgress(
+        options.onProgress,
+        `Prompt was ${promptTransport.promptBytes} bytes, over the ${promptTransport.budgetBytes} byte command-line budget; ${promptTransport.elidedBytes} bytes were elided from the middle.`,
+        "starting",
+        { threadId: sessionId, agentPid }
+      );
+    }
 
     let stdout = "";
     let stderr = "";
@@ -327,7 +512,8 @@ export function runHeadlessAgent(cwd, options = {}) {
         stopReason: result?.stopReason ?? null,
         unknownEventTypes: result?.unknownTypes ?? [],
         args,
-        binary
+        binary,
+        promptTransport
       });
     });
   });

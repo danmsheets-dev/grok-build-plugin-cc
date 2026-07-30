@@ -492,10 +492,34 @@ function resolveIsolateOption(options, write, configIsolate = undefined) {
   });
 }
 
+// How much of a failing command's output the fix prompt carries. The function
+// has claimed to be "bounded" since it was written but embedded the whole
+// capture, which after item 6's head+tail ring can still be ~320 KB - enough on
+// its own to blow the Windows command line. The TAIL is kept because that is
+// where the failure summary, the assertion and the exit line live; a compiler's
+// opening banner is not what the fix turn needs.
+const VERIFY_FIX_OUTPUT_TAIL_BYTES = 4 * 1024;
+
+function tailBytesOf(text, maxBytes) {
+  const buffer = Buffer.from(String(text ?? ""), "utf8");
+  if (buffer.length <= maxBytes) {
+    return String(text ?? "");
+  }
+  // Decoded once at the end, so only the single cut point can land mid-character.
+  const tail = buffer.subarray(buffer.length - maxBytes).toString("utf8");
+  return `[... ${buffer.length - maxBytes} earlier bytes elided; showing the last ${maxBytes} bytes ...]\n${tail}`;
+}
+
 function buildBoundedVerifyFixPrompt(command, output) {
   // Verify stdout/stderr can echo real secrets (env dumps, config prints). Scrub
   // before embedding in the next model prompt so a leaked key is not re-sent.
-  const safeOutput = redactSecretsDeep(output == null ? "" : String(output));
+  // Redact BEFORE truncating: truncating first would leave a secret that happens
+  // to sit in the discarded head unredacted in the persisted capture, and could
+  // split a token so the redactor no longer recognizes it.
+  const safeOutput = tailBytesOf(
+    redactSecretsDeep(output == null ? "" : String(output)),
+    VERIFY_FIX_OUTPUT_TAIL_BYTES
+  );
   return (
     `The verify command \`${command}\` failed. Fix the cause, then re-run only that exact command until it passes. ` +
     `Do not investigate unrelated failures, do not run the full test suite, and do not change any test to make it pass.\n\n` +
@@ -1328,6 +1352,11 @@ async function executeReviewRun(request) {
     // review path streams so it reports live phases and usage like delegate runs.
     outputFormat: structured ? "json" : "streaming-json",
     jsonSchema: structured ? readOutputSchema(REVIEW_SCHEMA) : undefined,
+    // Review prompts are the ones that actually reach the command-line limit:
+    // they carry a whole diff, and the critique path adds a serialized schema on
+    // top. Handing over a spill directory lets an oversized prompt travel via
+    // --prompt-file intact instead of being truncated.
+    promptFileDir: resolveStateDir(request.cwd),
     onProgress: request.onProgress
   });
 
@@ -1614,6 +1643,10 @@ async function executeTaskRun(request) {
       maxTurns,
       outputFormat: "streaming-json",
       onProgress: request.onProgress,
+      // Spill target for a prompt too large for argv. Anchored on the workspace
+      // state dir, not runCwd: an isolated run's cwd is a throwaway worktree
+      // that land or cleanup will delete out from under the record.
+      promptFileDir: resolveStateDir(workspaceRoot),
       cwd: runCwd
     },
     maxDurationSeconds
@@ -1821,6 +1854,7 @@ async function executeTaskRun(request) {
           maxTurns,
           cwd: runCwd,
           outputFormat: "streaming-json",
+          promptFileDir: resolveStateDir(workspaceRoot),
           onProgress: request.onProgress
         },
         maxDurationSeconds
@@ -3118,4 +3152,4 @@ if (isMain) {
   });
 }
 
-export { main, readStoredJobWithRetry };
+export { buildBoundedVerifyFixPrompt, main, readStoredJobWithRetry };

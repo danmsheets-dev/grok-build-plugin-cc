@@ -4,7 +4,7 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { main } from "../plugins/grok-build/scripts/grok-bridge.mjs";
+import { buildBoundedVerifyFixPrompt, main } from "../plugins/grok-build/scripts/grok-bridge.mjs";
 import { PROJECT_CONFIG_FILENAME } from "../plugins/grok-build/scripts/lib/project-config.mjs";
 import { makeTempDir } from "./helpers.mjs";
 
@@ -301,4 +301,36 @@ test("an unusable --verify-timeout falls through to the config rather than overr
   const payload = await runBridgeJson(["verify-plan", "--cwd", root, "--verify-timeout", "abc"]);
   assert.equal(payload.timeoutSeconds, 300);
   assert.equal(payload.timeoutSource, "config");
+});
+
+test("the verify fix prompt keeps the tail of a huge capture, not all of it", () => {
+  // The async runner's head+tail ring retains up to ~320 KB, and the fix prompt
+  // embedded every byte of it - on its own more than the Windows command line
+  // can carry, before the task prompt is even considered.
+  const output = `first line of the build banner\n${"noise\n".repeat(50000)}FAILED: assert 1 === 2\n`;
+  const prompt = buildBoundedVerifyFixPrompt("npm test", output);
+
+  assert.ok(Buffer.byteLength(prompt, "utf8") < 8192, `fix prompt was ${Buffer.byteLength(prompt, "utf8")} bytes`);
+  assert.match(prompt, /FAILED: assert 1 === 2/, "the tail carries the actual failure");
+  assert.match(prompt, /earlier bytes elided; showing the last 4096 bytes/);
+  assert.doesNotMatch(prompt, /first line of the build banner/);
+  assert.match(prompt, /`npm test`/, "the command being fixed is still named");
+});
+
+test("a short verify capture reaches the fix turn untouched", () => {
+  const prompt = buildBoundedVerifyFixPrompt("cargo test", "error[E0308]: mismatched types\n");
+
+  assert.match(prompt, /error\[E0308\]: mismatched types/);
+  assert.doesNotMatch(prompt, /elided/);
+});
+
+test("the fix prompt still redacts before it truncates", () => {
+  // Redaction has to see the whole capture: a secret sitting in the discarded
+  // head must not be the reason it was never scrubbed, and a token split by the
+  // cut point must not become unrecognizable to the redactor.
+  const output = `Authorization: Bearer sk-abcdefghijklmnopqrstuvwxyz012345\n${"pad\n".repeat(20000)}FAILED\n`;
+  const prompt = buildBoundedVerifyFixPrompt("npm test", output);
+
+  assert.doesNotMatch(prompt, /sk-abcdefghijklmnopqrstuvwxyz012345/);
+  assert.match(prompt, /FAILED/);
 });

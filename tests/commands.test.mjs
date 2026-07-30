@@ -267,3 +267,13 @@ test("the README tells the truth about a conflicted land", () => {
   assert.match(readme, /merge --abort` does not work here/);
   assert.match(readme, /--discard/);
 });
+
+test("the README says binaries are described rather than inlined into the prompt", () => {
+  const readme = fs.readFileSync(path.join(PLUGIN_ROOT, "README.md"), "utf8");
+
+  assert.match(readme, /Binary files are described, never inlined/i);
+  assert.match(readme, /## Binary Assets/);
+  // The two bounds a user can actually be surprised by.
+  assert.match(readme, /40 files and 64 KB/);
+  assert.match(readme, /--prompt-file/);
+});

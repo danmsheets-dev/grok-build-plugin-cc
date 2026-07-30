@@ -8,11 +8,16 @@ import { resolveExecutable } from "../plugins/grok-build/scripts/lib/which.mjs";
 import { buildEnv, installFakeGrok } from "./fake-grok-fixture.mjs";
 import { makeTempDir, run } from "./helpers.mjs";
 import {
+  PROMPT_ARGV_BUDGET_POSIX,
+  PROMPT_ARGV_BUDGET_WIN32,
+  PROMPT_ARGV_BUDGET_WIN32_CMD_SHIM,
+  buildHeadlessArgs,
   buildReviewPrompt,
   getGrokAuthStatus,
   getGrokAvailability,
   parseStructuredOutput,
   resolveGrokBinary,
+  resolvePromptArgvBudget,
   runHeadlessAgent,
   runImport
 } from "../plugins/grok-build/scripts/lib/grok.mjs";
@@ -137,6 +142,124 @@ test("buildReviewPrompt includes target and focus", () => {
   assert.match(prompt, /working tree diff/);
   assert.match(prompt, /auth boundaries/);
   assert.match(prompt, /Git Status/);
+});
+
+function promptArgOf(args) {
+  const index = args.indexOf("-p");
+  assert.notEqual(index, -1, "expected the prompt to travel in argv");
+  return args[index + 1];
+}
+
+test("an oversized prompt is bounded to what the command line can carry", () => {
+  const args = buildHeadlessArgs("x".repeat(500000), {});
+  const prompt = promptArgOf(args);
+  const budget = resolvePromptArgvBudget({});
+
+  assert.ok(
+    Buffer.byteLength(prompt, "utf8") <= budget,
+    `prompt was ${Buffer.byteLength(prompt, "utf8")} bytes against a ${budget} byte budget`
+  );
+  // Not merely "small": the whole budget minus the other flags should be used.
+  assert.ok(Buffer.byteLength(prompt, "utf8") > budget - 500, "the budget should be nearly filled, not thrown away");
+  assert.match(prompt, /\[\.\.\. \d+ bytes elided: prompt exceeded the platform command-line limit \.\.\.\]/);
+  // Middle-truncated: both ends of the original survive.
+  assert.ok(prompt.startsWith("x"), "the head of the prompt must survive");
+  assert.ok(prompt.endsWith("x"), "the tail of the prompt must survive");
+});
+
+test("the argv budgets cannot drift out of their platform limits", () => {
+  // 32767 is the documented Windows CreateProcess command-line ceiling; the
+  // cmd.exe shim form measured far lower still, hence the second, smaller cap.
+  assert.ok(PROMPT_ARGV_BUDGET_WIN32 < 32767);
+  assert.ok(PROMPT_ARGV_BUDGET_WIN32_CMD_SHIM < PROMPT_ARGV_BUDGET_WIN32);
+  // Linux MAX_ARG_STRLEN is 32 pages for a SINGLE argument, whatever ARG_MAX says.
+  assert.ok(PROMPT_ARGV_BUDGET_POSIX < 32 * 4096);
+
+  assert.equal(resolvePromptArgvBudget({ platform: "win32" }), PROMPT_ARGV_BUDGET_WIN32);
+  assert.equal(
+    resolvePromptArgvBudget({ platform: "win32", cmdShim: true }),
+    PROMPT_ARGV_BUDGET_WIN32_CMD_SHIM
+  );
+  assert.equal(resolvePromptArgvBudget({ platform: "linux" }), PROMPT_ARGV_BUDGET_POSIX);
+  assert.equal(resolvePromptArgvBudget({ platform: "win32", otherArgvBytes: 1000 }), PROMPT_ARGV_BUDGET_WIN32 - 1000);
+});
+
+test("the cmd.exe shim form gets the smaller budget, not the CreateProcess one", () => {
+  const shimmed = buildHeadlessArgs("x".repeat(500000), { platform: "win32", cmdShim: true });
+  const direct = buildHeadlessArgs("x".repeat(500000), { platform: "win32", cmdShim: false });
+
+  assert.ok(Buffer.byteLength(promptArgOf(shimmed), "utf8") <= PROMPT_ARGV_BUDGET_WIN32_CMD_SHIM);
+  assert.ok(Buffer.byteLength(promptArgOf(direct), "utf8") > PROMPT_ARGV_BUDGET_WIN32_CMD_SHIM);
+  assert.ok(Buffer.byteLength(promptArgOf(direct), "utf8") <= PROMPT_ARGV_BUDGET_WIN32);
+});
+
+test("a serialized --json-schema comes out of the prompt's share of the budget", () => {
+  // The critique path passes both. Budgeting the prompt alone against the
+  // platform limit would still overflow the command line by the schema's size.
+  const jsonSchema = { type: "object", description: "d".repeat(8000) };
+  const args = buildHeadlessArgs("x".repeat(500000), { platform: "win32", jsonSchema });
+
+  const totalBytes = args.reduce((sum, arg) => sum + Buffer.byteLength(String(arg), "utf8") + 3, 0);
+  assert.ok(totalBytes <= PROMPT_ARGV_BUDGET_WIN32, `whole argv was ${totalBytes} bytes`);
+  assert.ok(Buffer.byteLength(promptArgOf(args), "utf8") < PROMPT_ARGV_BUDGET_WIN32 - 8000);
+});
+
+test("a prompt that fits is passed through byte for byte", () => {
+  const prompt = "review the diff\n\nwith a couple of lines";
+  const args = buildHeadlessArgs(prompt, { platform: "win32", cmdShim: true });
+
+  assert.equal(promptArgOf(args), prompt);
+  assert.doesNotMatch(args.join(" "), /elided/);
+  assert.ok(!args.includes("--prompt-file"), "a normal prompt must not spill to disk");
+});
+
+test("an oversized prompt travels intact via --prompt-file when a spill dir exists", async () => {
+  const dir = makeTempDir();
+  const binDir = path.join(dir, "bin");
+  installFakeGrok(binDir);
+  const spillDir = path.join(dir, "state");
+  const logPath = path.join(dir, "invocations.log");
+  const prompt = `Reviewing a huge diff.\n${"x".repeat(500000)}`;
+
+  const result = await runHeadlessAgent(dir, {
+    prompt,
+    binary: path.join(binDir, "grok"),
+    env: buildEnv(binDir, { FAKE_GROK_LOG: logPath }),
+    promptFileDir: spillDir,
+    outputFormat: "plain"
+  });
+
+  assert.equal(result.status, 0);
+  assert.ok(!result.args.includes("-p"), "the prompt must not also be in argv");
+  const promptFile = result.args[result.args.indexOf("--prompt-file") + 1];
+  assert.equal(fs.readFileSync(promptFile, "utf8"), prompt, "the spilled prompt must be lossless");
+  assert.equal(result.promptTransport.mode, "prompt-file");
+  assert.equal(result.promptTransport.elidedBytes, 0);
+  // The fake reads --prompt-file, so this proves the CLI really saw the prompt.
+  assert.match(result.finalMessage, /Reviewed uncommitted changes/);
+});
+
+test("without a spill dir the prompt is truncated and the user is told", async () => {
+  const dir = makeTempDir();
+  const binDir = path.join(dir, "bin");
+  installFakeGrok(binDir);
+  const messages = [];
+
+  const result = await runHeadlessAgent(dir, {
+    prompt: "y".repeat(500000),
+    binary: path.join(binDir, "grok"),
+    env: buildEnv(binDir),
+    outputFormat: "plain",
+    onProgress: (event) => messages.push(typeof event === "string" ? event : event?.message)
+  });
+
+  assert.equal(result.status, 0);
+  assert.equal(result.promptTransport.mode, "truncated");
+  assert.ok(result.promptTransport.elidedBytes > 400000);
+  assert.ok(
+    messages.some((message) => /bytes were elided from the middle/.test(String(message))),
+    `expected an elision notice, saw: ${messages.join(" | ")}`
+  );
 });
 
 test("live grok --help advertises headless flags when grok is on PATH", () => {

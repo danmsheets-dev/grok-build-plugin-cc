@@ -77,14 +77,20 @@ if (argv[0] === "import") {
 
 // Headless print / prompt modes
 const printIndex = argv.indexOf("-p");
-const isPrint = printIndex !== -1 || hasFlag("--print");
+// The real CLI takes an oversized prompt from a file instead of argv; the bridge
+// switches to it when the prompt would blow the platform command-line limit.
+const promptFile = flagValue("--prompt-file");
+const isPrint = printIndex !== -1 || hasFlag("--print") || promptFile !== null;
 if (isPrint || hasFlag("-r") || hasFlag("--resume") || hasFlag("-c") || hasFlag("--continue")) {
   if (scenario === "fail-print") {
     process.stderr.write("fake grok failed the print run\\n");
     process.exit(2);
   }
 
-  const prompt = printIndex !== -1 ? (argv[printIndex + 1] ?? "") : "";
+  let prompt = printIndex !== -1 ? (argv[printIndex + 1] ?? "") : "";
+  if (promptFile) {
+    prompt = fs.readFileSync(promptFile, "utf8");
+  }
   const wantsJson = hasFlag("--json-schema") || flagValue("--output-format") === "json";
 
   if (flagValue("--output-format") === "streaming-json") {

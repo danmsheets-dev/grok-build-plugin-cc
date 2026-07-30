@@ -150,6 +150,27 @@ recorded against the file's sha256 in the plugin's state directory — outside t
 clone cannot ship its own trust record, and any later edit to the file withdraws it automatically.
 `trust-config --revoke` withdraws it by hand.
 
+## What a review sends, and how big it can get
+
+`/grok-build:review` and `/grok-build:critique` build their context from git, so a binary-heavy
+project used to pay for it twice — once in tokens, once in a prompt too long for the OS to accept.
+
+- **Binary files are described, never inlined.** The diff carries git's own
+  `Binary files a/tex.png and b/tex.png differ`, plus a `## Binary Assets` section giving each
+  side's size in bytes. Embedding the base85 patch inflated a 100 KB texture to ~145 KB of
+  characters the model cannot decode, and it inflated the *measurement* too, so one re-exported
+  texture silently demoted a whole review to "go read the diff yourself".
+- **Untracked files are capped** at 40 files and 64 KB in total, and bare path listings at 200
+  paths. A Godot import cache or a Blender bake directory holds thousands of untracked sidecars;
+  whatever is dropped is named in an omission line.
+- **An oversized prompt is not silently mangled.** Windows rejects a long command line — ~32767
+  characters via `CreateProcess`, far less through a `.cmd` shim — and Linux caps any single
+  argument at 128 KB. A prompt over the budget is written to the plugin's state directory and
+  passed with `--prompt-file`, so nothing is lost. If that spill cannot be written, the middle is
+  elided with a marker saying how many bytes went, and the run reports it.
+- **Verify output reaching a fix turn is tail-truncated** to the last 4 KB — the end is where the
+  assertion and the exit line are. It is redacted first, then truncated.
+
 ## Requirements
 
 - Node.js >= 18.18
