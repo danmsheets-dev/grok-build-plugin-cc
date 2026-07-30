@@ -109,6 +109,11 @@ export function createStreamTranscript() {
   const unknownTypes = new Set();
   let current = "";
   let lastType = null;
+  // How many events this parser actually understood. The ONLY safe signal for
+  // "the stream was in a format we do not speak": `messages.length` is not, and
+  // gating a raw-stdout fallback on it would dump the whole NDJSON at the user
+  // for a legitimate tool-only run that never emitted a line of prose.
+  let recognizedEvents = 0;
   let sessionId = null;
   let stopReason = null;
   let usage = null;
@@ -127,6 +132,12 @@ export function createStreamTranscript() {
     accept(event) {
       const type = typeof event?.type === "string" ? event.type : "";
       const result = { phase: PHASE_BY_TYPE[type] ?? null, textDelta: "", messageCompleted: null };
+
+      // Counted before the branch below, so a `thought`-only turn (a run that
+      // did all its work through tools) still counts as understood.
+      if (type === "text" || type === "thought" || type === "end") {
+        recognizedEvents += 1;
+      }
 
       if (type === "text") {
         if (lastType !== "text") {
@@ -175,7 +186,12 @@ export function createStreamTranscript() {
         sessionId,
         stopReason,
         usage,
-        unknownTypes: [...unknownTypes]
+        unknownTypes: [...unknownTypes],
+        // Zero means the CLI emitted a stream this parser understood nothing
+        // of - a renamed event vocabulary, or not NDJSON at all. Callers use it
+        // to decide whether the transcript above is empty because the run was
+        // quiet, or because it was never read.
+        recognizedEvents
       };
     }
   };

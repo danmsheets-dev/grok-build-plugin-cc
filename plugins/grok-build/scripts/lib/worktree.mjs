@@ -501,3 +501,83 @@ export function commitWorktreeChanges(worktreePath, message = "grok agent change
 
   return { committed: true, sha: headSha() };
 }
+
+/**
+ * Hard caps on the changed-files manifest.
+ *
+ * Two of them, because either one alone is insufficient. A Godot re-import or a
+ * Blender asset pass can touch thousands of files (entry cap), and a single
+ * Blender path — nested collections, long asset names — runs well past 200
+ * characters, so a few hundred of those alone would be a wall of text in a job
+ * record and in the terminal (byte cap).
+ */
+export const CHANGED_FILES_MAX_ENTRIES = 200;
+export const CHANGED_FILES_MAX_BYTES = 32 * 1024;
+
+/**
+ * Apply both caps to a list of `<status>\t<path>` manifest entries.
+ *
+ * @param {string[]} all
+ * @param {{maxEntries?: number, maxBytes?: number}} [options]
+ * @returns {{entries: string[], total: number, truncated: boolean}}
+ */
+export function capChangedFiles(all, options = {}) {
+  const maxEntries = Number.isFinite(options.maxEntries) ? options.maxEntries : CHANGED_FILES_MAX_ENTRIES;
+  const maxBytes = Number.isFinite(options.maxBytes) ? options.maxBytes : CHANGED_FILES_MAX_BYTES;
+  const entries = [];
+  let bytes = 0;
+  for (const entry of all) {
+    if (entries.length >= maxEntries) {
+      break;
+    }
+    bytes += Buffer.byteLength(entry, "utf8") + 1;
+    if (bytes > maxBytes && entries.length > 0) {
+      break;
+    }
+    entries.push(entry);
+  }
+  return { entries, total: all.length, truncated: entries.length < all.length };
+}
+
+/**
+ * What the agent's commit actually changed, as a `<status>\t<path>` manifest.
+ *
+ * For a Godot or Blender run the artifact IS the deliverable, and until now the
+ * only thing a write run reported was "here is a worktree path, go look" — the
+ * user had no way to tell a run that rebuilt a scene from one that produced
+ * nothing but an import cache. The commit has already filtered the caches out
+ * (`commitWorktreeChanges`), so this range is exactly the agent's work.
+ *
+ * `--no-renames` on purpose: a rename otherwise prints `R100\told\tnew`, a
+ * three-field line in a two-field list. Splitting it into a D and an A is
+ * marginally noisier and unambiguously parseable.
+ *
+ * Best-effort — a failure here costs the manifest, never the run.
+ *
+ * @param {string} worktreePath
+ * @param {string} baseSha
+ * @param {string} headSha
+ * @param {{maxEntries?: number, maxBytes?: number}} [options]
+ * @returns {{entries: string[], total: number, truncated: boolean, error?: string}}
+ */
+export function listCommittedChanges(worktreePath, baseSha, headSha, options = {}) {
+  if (!baseSha || !headSha || baseSha === headSha) {
+    return { entries: [], total: 0, truncated: false };
+  }
+  const diff = git(
+    worktreePath,
+    ["diff", "--name-status", "--no-renames", `${baseSha}..${headSha}`],
+    // Explicit because runCommand restores spawnSync's 1 MiB default when the
+    // caller supplies nothing, and one line per changed file across a large
+    // asset import can exceed it.
+    { maxBuffer: 8 * 1024 * 1024 }
+  );
+  if (diff.status !== 0 || diff.error) {
+    return { entries: [], total: 0, truncated: false, error: formatGitFailure("diff", diff) };
+  }
+  const all = String(diff.stdout ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter(Boolean);
+  return capChangedFiles(all, options);
+}

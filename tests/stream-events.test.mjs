@@ -221,3 +221,48 @@ test("a transcript with no end event yields null usage", () => {
   assert.equal(result.usage, null);
   assert.equal(result.sessionId, null);
 });
+
+test("a stream of nothing but unknown events recognizes none of them", () => {
+  // The whole point of the counter: an empty transcript here means the parser
+  // never understood a word, not that the run was quiet.
+  const transcript = createStreamTranscript();
+  feed(transcript, [
+    { type: "assistant_message", content: "Rebuilt the scene." },
+    { type: "done" }
+  ]);
+  const result = transcript.finish();
+
+  assert.equal(result.recognizedEvents, 0);
+  assert.deepEqual(result.unknownTypes.sort(), ["assistant_message", "done"]);
+  assert.deepEqual(result.messages, []);
+});
+
+test("a tool-only turn is recognized even though it produced no message", () => {
+  // The discriminator for the raw-stdout fallback. Gating that fallback on
+  // `messages.length` instead of this counter would dump the entire NDJSON
+  // stream at the user for a perfectly healthy run that just did not narrate.
+  const transcript = createStreamTranscript();
+  feed(transcript, [
+    { type: "thought", data: "running the command" },
+    { type: "end", stopReason: "EndTurn" }
+  ]);
+  const result = transcript.finish();
+
+  assert.equal(result.recognizedEvents, 2);
+  assert.deepEqual(result.messages, []);
+  assert.deepEqual(result.unknownTypes, []);
+});
+
+test("a mixed stream counts the events it knows and names the ones it does not", () => {
+  const transcript = createStreamTranscript();
+  feed(transcript, [
+    { type: "text", data: "Working." },
+    { type: "tool_call", name: "edit" },
+    { type: "end", stopReason: "EndTurn" }
+  ]);
+  const result = transcript.finish();
+
+  assert.equal(result.recognizedEvents, 2);
+  assert.deepEqual(result.unknownTypes, ["tool_call"]);
+  assert.deepEqual(result.messages, ["Working."]);
+});

@@ -20,6 +20,12 @@ export const DEFAULT_CONTINUE_PROMPT =
 const DEFAULT_BINARY = "grok";
 const BINARY_ENV = "GROK_BINARY";
 
+// How much raw stdout is shown when the streaming parser recognized nothing at
+// all. Enough to carry a final answer and the context around it; small enough
+// that a run which streamed megabytes of an unknown format does not push all of
+// it into a job record, through redaction, and into the terminal.
+const RAW_STDOUT_FALLBACK_LINES = 200;
+
 export function resolveGrokBinary(env = process.env) {
   const override = env?.[BINARY_ENV];
   if (override && String(override).trim()) {
@@ -509,6 +515,25 @@ export function runHeadlessAgent(cwd, options = {}) {
       // text, so all four text fields collapse onto it. Only `finalReport` can
       // still differ, because the fence may or may not be in there.
       const plainText = stdout.trimEnd();
+
+      // Did the streaming parser understand ANY of what came back? A CLI update
+      // that renames the event vocabulary turns every text field empty while
+      // stdout is full of the answer, and the user gets "Grok did not return a
+      // final message." for a run that said plenty. Gate on "nothing was
+      // recognized at all" rather than on an empty transcript: a tool-only run
+      // legitimately produces no messages, and dumping raw NDJSON at it would
+      // be strictly worse than the silence.
+      const streamParsed = streaming ? result.recognizedEvents > 0 : true;
+      const streamFallback =
+        streaming && result.recognizedEvents === 0 && stdout.trim()
+          ? // Bounded: unparsed stdout is the whole run, which on a long agentic
+            // session is megabytes of machine output. The tail is the part that
+            // carries the answer.
+            plainText.split(/\r?\n/).slice(-RAW_STDOUT_FALLBACK_LINES).join("\n")
+          : "";
+      // One body of text that every text field collapses onto, or null when a
+      // parsed transcript is available and should be used instead.
+      const collapsedText = streamFallback || (result ? null : plainText);
       emitProgress(
         options.onProgress,
         status === 0 ? "Grok finished." : `Grok exited with status ${status}.`,
@@ -524,18 +549,24 @@ export function runHeadlessAgent(cwd, options = {}) {
         sessionId: resolvedThreadId,
         threadId: resolvedThreadId,
         agentPid,
-        finalMessage: result ? result.finalMessage : plainText,
+        finalMessage: collapsedText ?? result.finalMessage,
         // Additive companions to finalMessage: the whole narration, the final
         // assistant message, and the delimited report when the model emitted
         // one. finalMessage keeps meaning "the joined transcript" so no existing
         // consumer changes meaning under it.
-        transcript: result ? result.transcript : plainText,
-        lastMessage: result ? result.lastMessage : plainText,
-        finalReport: result ? result.finalReport : extractFinalReport(plainText),
+        transcript: collapsedText ?? result.transcript,
+        lastMessage: collapsedText ?? result.lastMessage,
+        finalReport:
+          collapsedText == null ? result.finalReport : extractFinalReport(collapsedText),
         messages: result ? result.messages : null,
         usage: result?.usage ?? null,
         stopReason: result?.stopReason ?? null,
         unknownEventTypes: result?.unknownTypes ?? [],
+        // False only when a streaming run's events were all unrecognized, i.e.
+        // when the four text fields above are raw stdout rather than a parsed
+        // transcript. The renderer says so out loud rather than passing off
+        // machine output as the model's answer.
+        streamParsed,
         args,
         binary,
         promptTransport

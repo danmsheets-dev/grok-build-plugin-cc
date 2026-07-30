@@ -333,3 +333,20 @@ test("the docs explain why a delegate run used to look like it returned nothing"
   assert.match(skill, /## Artifacts/, "artifact paths are the deliverable for Godot and Blender");
   assert.match(skill, /do not invent one/i);
 });
+
+test("the docs promise a changed-files manifest, including for a run that changed nothing", () => {
+  const readme = fs.readFileSync(path.join(PLUGIN_ROOT, "README.md"), "utf8");
+
+  assert.match(readme, /Changed files/);
+  // The Godot import-cache case, which is where a silent result is most
+  // confusing: the worktree is full of files and the commit is empty.
+  assert.match(readme, /none \(run produced only excluded build artifacts\)/);
+  // The non-isolated path cannot tell the user's in-flight edits from the
+  // agent's, and has to say which is which rather than claim them all.
+  assert.match(readme, /already dirty/i);
+  assert.match(readme, /Log: <path>/);
+
+  const skill = read("skills/grok-run-output/SKILL.md");
+  assert.match(skill, /measured from git, not claimed by the model/);
+  assert.match(skill, /showing raw stdout/);
+});

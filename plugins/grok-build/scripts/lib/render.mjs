@@ -506,7 +506,88 @@ function pushProvisionLines(lines, provision) {
   }
 }
 
-function buildTaskStatusLines(meta = {}) {
+/**
+ * How many manifest entries reach the terminal. The payload keeps up to
+ * CHANGED_FILES_MAX_ENTRIES (worktree.mjs); this is the reading limit, and the
+ * remainder is reported as a count so the number is never silently wrong.
+ */
+const CHANGED_FILES_RENDER_LIMIT = 40;
+
+/**
+ * What the run actually changed on disk.
+ *
+ * For a Godot or Blender run this is the whole deliverable, and the status
+ * block used to report only Verified/Worktree/Budget - a user could not tell a
+ * run that rebuilt a scene from one that produced nothing but an import cache.
+ * The empty case is therefore rendered EXPLICITLY rather than omitted: "none"
+ * with the reason is an answer, a missing block is the silent-result complaint
+ * all over again in exactly the import-cache case.
+ */
+function pushChangedFileLines(lines, changed) {
+  if (!changed || typeof changed !== "object") {
+    return;
+  }
+  const entries = Array.isArray(changed.entries) ? changed.entries : [];
+  const total = Number.isFinite(Number(changed.total)) ? Number(changed.total) : entries.length;
+  const label = changed.source === "working-tree" ? "Working tree changes" : "Changed files";
+
+  if (entries.length === 0) {
+    lines.push(
+      changed.source === "working-tree"
+        ? `${label}: none (the agent wrote nothing outside excluded build artifacts).`
+        : `${label}: none (run produced only excluded build artifacts).`
+    );
+  } else {
+    lines.push(`${label} (${total}):`);
+    for (const entry of entries.slice(0, CHANGED_FILES_RENDER_LIMIT)) {
+      // git's own `<status>\t<path>` shape; the tab renders as an alignment gap
+      // nowhere in particular, so make it a plain space.
+      lines.push(`  ${String(entry).replace(/\t/g, " ")}`);
+    }
+    const remaining = total - Math.min(entries.length, CHANGED_FILES_RENDER_LIMIT);
+    if (remaining > 0) {
+      lines.push(`  ... ${remaining} more`);
+    }
+  }
+
+  // Only the non-isolated path can have these: paths that were already dirty
+  // when the run started are excluded from the manifest, because a bare
+  // post-run `git status` cannot tell the agent's edits from the user's.
+  const preexisting = Number(changed.preexistingDirty);
+  if (Number.isFinite(preexisting) && preexisting > 0) {
+    lines.push(
+      `  (${preexisting} path${preexisting === 1 ? " was" : "s were"} already modified before the run and ${preexisting === 1 ? "is" : "are"} not listed)`
+    );
+  }
+}
+
+/**
+ * Diagnostics about the run's own machinery, as opposed to its result.
+ *
+ * `unknownEventTypes` was computed by the stream parser and had ZERO consumers
+ * repo-wide: a CLI release that renames an event type degraded the transcript
+ * silently, and the only symptom was output that looked thin. It is noise on a
+ * healthy run though, so it is only surfaced when it might actually explain
+ * something - the stream did not parse, or parsed and still produced no answer.
+ *
+ * The log path is unconditional. tracked-jobs appends the complete rendered
+ * result to that file, which makes it the durable artifact of the run, and a
+ * path the user never saw is a path they cannot read.
+ */
+function pushRunDiagnosticLines(lines, meta, rawOutput) {
+  const unknown = Array.isArray(meta.unknownEventTypes) ? meta.unknownEventTypes.filter(Boolean) : [];
+  if (unknown.length > 0 && (meta.streamParsed === false || !rawOutput)) {
+    lines.push(
+      `Stream: ${unknown.length} unrecognized event type${unknown.length === 1 ? "" : "s"} from the grok CLI (${unknown.join(", ")}) - this build may be newer than the bridge.`
+    );
+  }
+
+  if (meta.logFile) {
+    lines.push(`Log: ${meta.logFile}`);
+  }
+}
+
+export function buildTaskStatusLines(meta = {}, rawOutput = "") {
   const lines = [];
 
   pushVerifyPlanLines(lines, meta);
@@ -543,6 +624,10 @@ function buildTaskStatusLines(meta = {}) {
 
   pushProvisionLines(lines, meta.provision);
 
+  // Before the worktree line on purpose: what changed is the answer to "what
+  // did this run do", and the path is only where to go and look at it.
+  pushChangedFileLines(lines, meta.changedFiles);
+
   if (meta.worktree?.path) {
     lines.push(`Worktree: ${meta.worktree.path} (branch ${meta.worktree.branch ?? "unknown"})`);
     if (meta.worktree.commitError) {
@@ -562,16 +647,50 @@ function buildTaskStatusLines(meta = {}) {
     lines.push(`Budget: run stopped early (${meta.budgetStopped}).`);
   }
 
+  pushRunDiagnosticLines(lines, meta, rawOutput);
+
   return lines;
 }
 
-export function renderTaskResult(parsedResult, meta) {
+/**
+ * How much of a failing run's stderr is shown when there is no answer to show.
+ * The interesting part of a CLI's stderr is always the end of it.
+ */
+const STDERR_TAIL_LINES = 20;
+
+function tailLines(text, limit) {
+  return String(text ?? "")
+    .split(/\r?\n/)
+    .map((line) => line.trimEnd())
+    .filter(Boolean)
+    .slice(-limit)
+    .join("\n");
+}
+
+export function renderTaskResult(parsedResult, meta = {}) {
   const rawOutput = typeof parsedResult?.rawOutput === "string" ? parsedResult.rawOutput : "";
-  const base = rawOutput
+  let base = rawOutput
     ? (rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`)
     : `${String(parsedResult?.failureMessage ?? "").trim() || "Grok did not return a final message."}\n`;
 
-  const statusLines = buildTaskStatusLines(meta);
+  // The text above is raw stdout, not a parsed transcript, so say so - passing
+  // machine output off as the model's answer is worse than either alternative.
+  if (rawOutput && meta.streamParsed === false) {
+    base = `Note: the grok stream produced no recognized assistant messages; showing raw stdout.\n\n${base}`;
+  }
+
+  // stderr was dropped entirely whenever the process exited 0, which is exactly
+  // the shape a truncated or rate-limited response takes: status 0, no text,
+  // and the only explanation on the channel nobody read. Only shown when there
+  // is no answer, so a healthy run is not padded with warnings.
+  if (!rawOutput) {
+    const stderrTail = tailLines(parsedResult?.stderr, STDERR_TAIL_LINES);
+    if (stderrTail) {
+      base = `${base}\nstderr (last ${STDERR_TAIL_LINES} lines):\n\n\`\`\`text\n${stderrTail}\n\`\`\`\n`;
+    }
+  }
+
+  const statusLines = buildTaskStatusLines(meta, rawOutput);
   if (statusLines.length === 0) {
     return base;
   }
@@ -659,7 +778,14 @@ export function renderStoredJobResult(job, storedJob) {
     return `${output}\nGrok session ID: ${threadId}\nResume in Grok: ${resumeCommand}\n`;
   }
 
+  // The delimited report first when the model honoured the contract, because
+  // that is the answer the run was asked for. `lastMessage` is deliberately NOT
+  // in this chain: preferring a bare trailing line over the stored rawOutput
+  // would make /grok-build:show print LESS than it does today. `grok.stdout`
+  // stays last so stored *review* jobs, whose payload has no rawOutput at all,
+  // render exactly as before.
   const rawOutput =
+    (typeof storedJob?.result?.finalReport === "string" && storedJob.result.finalReport) ||
     (typeof storedJob?.result?.rawOutput === "string" && storedJob.result.rawOutput) ||
     (typeof storedJob?.result?.grok?.stdout === "string" && storedJob.result.grok.stdout) ||
     "";

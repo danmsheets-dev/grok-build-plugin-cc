@@ -196,6 +196,23 @@ Three things changed:
   that did the work and then passed verification reported *"Grok did not return a final message."*
   The text channel now accumulates across turns; the newest non-empty answer wins.
 
+A run also reports what it did to the disk and how it was captured:
+
+- **Changed files.** A write run lists what it changed — `A`/`M`/`D` plus the path, first 40 in the
+  terminal and up to 200 in `payload.changedFiles`. An isolated run reads them out of the agent's
+  commit, so build artifacts are already excluded; a `--no-isolate` run diffs the working tree
+  against a snapshot taken before the agent started, and reports separately how many paths were
+  already dirty at that point. **A run that changed nothing says so**:
+  `Changed files: none (run produced only excluded build artifacts)` is the honest answer for a
+  Godot run whose entire output was an import cache.
+- **The log path.** Every run prints `Log: <path>`. That file holds the run's progress lines and the
+  complete rendered result, and it outlives the terminal.
+- **stderr and unrecognized events.** When a run produces no answer at all, the last 20 lines of the
+  CLI's stderr are shown — an exit-0 run with empty output and a warning on stderr is what a
+  truncated response looks like. If the CLI streams event types this bridge does not know, they are
+  named, and if *nothing* in the stream was recognized the raw stdout is shown (last 200 lines)
+  under an explicit `showing raw stdout` note rather than being silently discarded.
+
 ## Requirements
 
 - Node.js >= 18.18

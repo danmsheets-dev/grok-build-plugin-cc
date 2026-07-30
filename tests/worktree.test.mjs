@@ -5,8 +5,11 @@ import test from "node:test";
 
 import {
   artifactExcludePathspecs,
+  capChangedFiles,
+  CHANGED_FILES_MAX_ENTRIES,
   commitWorktreeChanges,
   createWorktree,
+  listCommittedChanges,
   removeWorktree,
   resolveWorktreePath
 } from "../plugins/grok-build/scripts/lib/worktree.mjs";
@@ -786,4 +789,110 @@ test("a rejected artifact-filtered add reports an error instead of staging every
     worktreePath: created.worktreePath,
     branchName: created.branchName
   });
+});
+
+test("a Godot write run's manifest names the scene it changed and nothing from the cache", () => {
+  // For a Godot or Blender project the artifact IS the deliverable, and the run
+  // used to report only a worktree path - a user could not tell a run that
+  // rebuilt a scene from one that produced nothing but an import cache.
+  const cwd = makeTempDir("grok-wt-manifest-");
+  const dataDir = makeTempDir("grok-wt-manifest-data-");
+  initGitRepo(cwd);
+  fs.writeFileSync(path.join(cwd, "project.godot"), 'config_version=5\n');
+  fs.mkdirSync(path.join(cwd, "assets"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, "assets", "model.glb"), "glTF-v1\n");
+  run("git", ["add", "."], { cwd });
+  run("git", ["commit", "-m", "init"], { cwd });
+
+  const created = createWorktree({ cwd, runId: "manifest-1", dataDir });
+  const wt = created.worktreePath;
+
+  // What the agent did...
+  writeFileIn(wt, "scenes/Player.tscn", '[gd_scene load_steps=1 format=3]\n');
+  writeFileIn(wt, "assets/model.glb", "glTF-v2\n");
+  // ...and what running the project did.
+  writeFileIn(wt, ".godot/imported/model.glb-abc.scn", "cache\n");
+  writeFileIn(wt, ".godot/uid_cache.bin", "uids\n");
+
+  const committed = commitWorktreeChanges(wt, "godot manifest");
+  assert.equal(committed.committed, true);
+
+  const manifest = listCommittedChanges(wt, created.baseSha, committed.sha);
+  assert.equal(manifest.error, undefined);
+  assert.ok(manifest.entries.includes("A\tscenes/Player.tscn"), manifest.entries.join(" | "));
+  assert.ok(manifest.entries.includes("M\tassets/model.glb"), manifest.entries.join(" | "));
+  assert.ok(
+    manifest.entries.every((entry) => !entry.includes(".godot/")),
+    `the import cache is not the deliverable, got: ${manifest.entries.join(" | ")}`
+  );
+  assert.equal(manifest.total, 2);
+  assert.equal(manifest.truncated, false);
+
+  removeWorktree({
+    repoRoot: created.repoRoot,
+    worktreePath: created.worktreePath,
+    branchName: created.branchName
+  });
+});
+
+test("listCommittedChanges is empty, not wrong, when there is no range to diff", () => {
+  const cwd = makeTempDir("grok-wt-manifest-empty-");
+  const dataDir = makeTempDir("grok-wt-manifest-empty-data-");
+  seedRepo(cwd);
+
+  const created = createWorktree({ cwd, runId: "manifest-empty-1", dataDir });
+  // The clean-tree case: commitWorktreeChanges returns {committed:false,
+  // sha:HEAD}, so base and head are the same commit.
+  const manifest = listCommittedChanges(created.worktreePath, created.baseSha, created.baseSha);
+  assert.deepEqual(manifest, { entries: [], total: 0, truncated: false });
+
+  removeWorktree({
+    repoRoot: created.repoRoot,
+    worktreePath: created.worktreePath,
+    branchName: created.branchName
+  });
+});
+
+test("listCommittedChanges reports a diff failure rather than claiming nothing changed", () => {
+  const cwd = makeTempDir("grok-wt-manifest-fail-");
+  const dataDir = makeTempDir("grok-wt-manifest-fail-data-");
+  seedRepo(cwd);
+
+  const created = createWorktree({ cwd, runId: "manifest-fail-1", dataDir });
+  // A sha that does not exist. An empty manifest here would be a claim about
+  // the run; the error is a claim about the measurement.
+  const manifest = listCommittedChanges(created.worktreePath, created.baseSha, "0".repeat(40));
+  assert.deepEqual(manifest.entries, []);
+  assert.match(manifest.error ?? "", /git diff failed/);
+
+  removeWorktree({
+    repoRoot: created.repoRoot,
+    worktreePath: created.worktreePath,
+    branchName: created.branchName
+  });
+});
+
+test("capChangedFiles caps by entry count and, independently, by bytes", () => {
+  // Both caps are needed: a Godot re-import trips the entry count, and a
+  // handful of deeply nested Blender asset paths trips the byte budget first.
+  const many = Array.from({ length: 500 }, (_, index) => `A\tsrc/file_${index}.gd`);
+  const byCount = capChangedFiles(many);
+  assert.equal(byCount.entries.length, CHANGED_FILES_MAX_ENTRIES);
+  assert.equal(byCount.total, 500);
+  assert.equal(byCount.truncated, true);
+
+  const long = Array.from({ length: 50 }, (_, index) => `M\t${"collections/".repeat(40)}asset_${index}.blend`);
+  const byBytes = capChangedFiles(long, { maxBytes: 2048 });
+  assert.ok(byBytes.entries.length < 50, `expected a byte-capped list, got ${byBytes.entries.length}`);
+  assert.ok(byBytes.entries.length > 0, "the byte cap must never produce an empty manifest from a non-empty one");
+  assert.equal(byBytes.total, 50);
+  assert.equal(byBytes.truncated, true);
+
+  // A single entry larger than the whole budget is still reported: an empty
+  // manifest would read as "nothing changed".
+  const huge = capChangedFiles([`A\t${"x".repeat(5000)}.blend`], { maxBytes: 128 });
+  assert.equal(huge.entries.length, 1);
+  assert.equal(huge.truncated, false);
+
+  assert.deepEqual(capChangedFiles([]), { entries: [], total: 0, truncated: false });
 });

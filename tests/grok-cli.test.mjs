@@ -454,3 +454,86 @@ test("a headless run with the fake on PATH never touches the real CLI", async ()
   // The fake logs every invocation. If the real CLI had run, this file would be absent.
   assert.ok(fs.existsSync(logPath), "the fake grok must be the binary that ran");
 });
+
+test("a stream in an unknown vocabulary falls back to raw stdout instead of nothing", async () => {
+  // A grok release that renames its event types. Every field the bridge reads
+  // comes back empty while stdout carries the answer, and the user is told
+  // "Grok did not return a final message." for a run that said plenty.
+  const dir = makeTempDir();
+  const binDir = path.join(dir, "bin");
+  installFakeGrok(binDir, "streaming-alien");
+
+  const result = await runHeadlessAgent(dir, {
+    prompt: "do the task",
+    binary: path.join(binDir, "grok"),
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.streamParsed, false);
+  assert.deepEqual([...result.unknownEventTypes].sort(), ["assistant_message", "done"]);
+  assert.match(result.finalMessage, /Rebuilt the scene\./);
+  // Every text field collapses onto the same fallback - there is no parsed
+  // transcript to distinguish them with.
+  assert.equal(result.transcript, result.finalMessage);
+  assert.equal(result.lastMessage, result.finalMessage);
+});
+
+test("the raw-stdout fallback is bounded to the tail of the stream", async () => {
+  // Unparsed stdout is the WHOLE run. On a long agentic session that is
+  // megabytes of machine output, and it would go into the job record, through
+  // redaction, and into the terminal.
+  const dir = makeTempDir();
+  const binDir = path.join(dir, "bin");
+  installFakeGrok(binDir, "streaming-alien");
+
+  const result = await runHeadlessAgent(dir, {
+    prompt: "do the task",
+    binary: path.join(binDir, "grok"),
+    env: buildEnv(binDir, { FAKE_GROK_ALIEN_LINES: "500" })
+  });
+
+  const lines = result.finalMessage.split("\n");
+  assert.equal(lines.length, 200, "the fallback keeps exactly the last 200 lines");
+  assert.match(lines.at(-1), /"done"/, "the tail is what survives");
+  assert.ok(
+    !result.finalMessage.includes("filler line 0\""),
+    "the head of a 502-line stream must have been dropped"
+  );
+  assert.equal(result.streamParsed, false);
+});
+
+test("a run that narrated nothing is not mistaken for an unparseable stream", async () => {
+  // The false positive the recognizedEvents counter exists to prevent: a turn
+  // that did all its work through tools emits a thought and an end and no
+  // prose at all. Its transcript is legitimately empty, and dumping raw NDJSON
+  // over it would be strictly worse than the silence.
+  const dir = makeTempDir();
+  const binDir = path.join(dir, "bin");
+  installFakeGrok(binDir, "silent-fix");
+
+  const result = await runHeadlessAgent(dir, {
+    prompt: "The verify command `npm test` failed. Fix it.",
+    binary: path.join(binDir, "grok"),
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.streamParsed, true);
+  assert.equal(result.finalMessage, "");
+  assert.ok(result.stdout.includes('"thought"'), "there really was unparsed-looking stdout to fall back to");
+});
+
+test("a plain non-streaming run is never reported as an unparsed stream", async () => {
+  const dir = makeTempDir();
+  const binDir = path.join(dir, "bin");
+  installFakeGrok(binDir);
+
+  const result = await runHeadlessAgent(dir, {
+    prompt: "do the task",
+    outputFormat: "plain",
+    binary: path.join(binDir, "grok"),
+    env: buildEnv(binDir)
+  });
+
+  assert.equal(result.streamParsed, true, "there was no stream to fail at parsing");
+  assert.equal(result.finalMessage, "Handled the requested task.");
+});

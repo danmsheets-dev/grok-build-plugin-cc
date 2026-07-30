@@ -1,7 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { renderReviewResult, renderStoredJobResult, renderTaskResult } from "../plugins/grok-build/scripts/lib/render.mjs";
+import {
+  buildTaskStatusLines,
+  renderReviewResult,
+  renderStoredJobResult,
+  renderTaskResult
+} from "../plugins/grok-build/scripts/lib/render.mjs";
 
 test("renderReviewResult degrades gracefully when JSON is missing required review fields", () => {
   const output = renderReviewResult(
@@ -472,4 +477,180 @@ test("a non-isolated write run keeps the review/critique hint", () => {
   });
   assert.match(output, /\/grok-build:review --wait/);
   assert.match(output, /\/grok-build:critique --wait/);
+});
+
+test("renderTaskResult surfaces stderr and the log path when the run said nothing", () => {
+  // stderr was dropped entirely whenever the process exited 0, which is exactly
+  // the shape a truncated or rate-limited response takes: status 0, no text,
+  // and the only explanation on the channel nobody read.
+  const output = renderTaskResult(
+    { rawOutput: "", stderr: "warning: response truncated" },
+    { title: "Grok Build Delegate", logFile: "C:/x/run.log" }
+  );
+
+  assert.match(output, /Grok did not return a final message/);
+  assert.match(output, /warning: response truncated/);
+  assert.match(output, /Log: C:\/x\/run\.log/);
+});
+
+test("renderTaskResult keeps a healthy run's stderr out of the way", () => {
+  const output = renderTaskResult(
+    { rawOutput: "Rebuilt the scene.", stderr: "npm notice a new version is available" },
+    { title: "Grok Build Delegate" }
+  );
+  assert.doesNotMatch(output, /npm notice/);
+});
+
+test("renderTaskResult shows only the tail of a long stderr", () => {
+  const stderr = Array.from({ length: 60 }, (_, index) => `line ${index}`).join("\n");
+  const output = renderTaskResult({ rawOutput: "", stderr }, { title: "Grok Build Delegate" });
+
+  assert.match(output, /line 59/);
+  assert.match(output, /line 40/);
+  assert.doesNotMatch(output, /line 39\b/);
+});
+
+test("renderTaskResult always names the log file, even on a healthy run", () => {
+  // tracked-jobs appends the complete rendered result there, which makes it the
+  // durable artifact of the run - and useless if nobody is told where it is.
+  const output = renderTaskResult(
+    { rawOutput: "Did the work." },
+    { title: "Grok Build Delegate", logFile: "/var/data/jobs/run-1.log" }
+  );
+  assert.match(output, /Log: \/var\/data\/jobs\/run-1\.log/);
+});
+
+test("renderTaskResult admits when its output is raw stdout rather than a transcript", () => {
+  const output = renderTaskResult(
+    { rawOutput: '{"type":"assistant_message","content":"Rebuilt the scene."}' },
+    {
+      title: "Grok Build Delegate",
+      streamParsed: false,
+      unknownEventTypes: ["assistant_message", "done"]
+    }
+  );
+
+  assert.match(output, /no recognized assistant messages; showing raw stdout/);
+  assert.match(output, /Rebuilt the scene/);
+  assert.match(output, /unrecognized event types.*assistant_message, done/);
+  assert.match(output, /newer than the bridge/);
+});
+
+test("buildTaskStatusLines names an unrecognized event type that produced no answer", () => {
+  // The `!streamParsed`-only gate would hide the diagnostic for a build that
+  // emits recognized AND unknown types and still returns nothing useful.
+  const lines = buildTaskStatusLines({ unknownEventTypes: ["assistant_message"], streamParsed: true }, "");
+  assert.ok(lines.some((line) => line.includes("assistant_message")), lines.join("\n"));
+});
+
+test("buildTaskStatusLines stays silent about unknown events on a healthy run", () => {
+  const lines = buildTaskStatusLines(
+    { unknownEventTypes: ["tool_call"], streamParsed: true },
+    "Rebuilt the scene."
+  );
+  assert.ok(!lines.some((line) => line.startsWith("Stream:")), lines.join("\n"));
+});
+
+test("buildTaskStatusLines lists what changed before it says where the worktree is", () => {
+  // For a Godot or Blender run the artifact IS the deliverable, and the status
+  // block used to report only Verified/Worktree/Budget.
+  const lines = buildTaskStatusLines({
+    jobId: "run-godot",
+    worktree: {
+      path: "/tmp/wt/run-godot",
+      branch: "grok-build/run-godot",
+      changedFiles: ["A\tscenes/Player.tscn", "M\tassets/model.glb"]
+    },
+    changedFiles: {
+      source: "commit",
+      entries: ["A\tscenes/Player.tscn", "M\tassets/model.glb"],
+      total: 2,
+      truncated: false
+    }
+  });
+
+  const manifestIndex = lines.findIndex((line) => line.startsWith("Changed files (2)"));
+  const worktreeIndex = lines.findIndex((line) => line.startsWith("Worktree:"));
+  assert.ok(manifestIndex >= 0, lines.join("\n"));
+  assert.ok(worktreeIndex > manifestIndex, "the manifest comes before the path to it");
+  assert.ok(lines.includes("  A scenes/Player.tscn"));
+  assert.ok(lines.includes("  M assets/model.glb"));
+});
+
+test("buildTaskStatusLines caps the rendered manifest and counts the remainder", () => {
+  const entries = Array.from({ length: 120 }, (_, index) => `A\tassets/mesh_${index}.glb`);
+  const lines = buildTaskStatusLines({
+    changedFiles: { source: "commit", entries, total: 137, truncated: true }
+  });
+
+  const rendered = lines.filter((line) => line.startsWith("  A assets/"));
+  assert.equal(rendered.length, 40);
+  assert.ok(lines.includes("  ... 97 more"), lines.join("\n"));
+});
+
+test("an empty manifest is reported as none, never omitted", () => {
+  // Omitting the block is how the silent-result complaint reappears in exactly
+  // the Godot import-cache case: a run whose every output was excluded.
+  const lines = buildTaskStatusLines({
+    changedFiles: { source: "commit", entries: [], total: 0, truncated: false }
+  });
+  assert.ok(
+    lines.some((line) => /Changed files: none \(run produced only excluded build artifacts\)/.test(line)),
+    lines.join("\n")
+  );
+});
+
+test("a non-isolated run labels its manifest as working-tree and counts pre-existing edits", () => {
+  const lines = buildTaskStatusLines({
+    changedFiles: {
+      source: "working-tree",
+      entries: ["A\tsrc/new.py"],
+      total: 1,
+      truncated: false,
+      preexistingDirty: 2
+    }
+  });
+
+  assert.ok(lines.some((line) => line.startsWith("Working tree changes (1):")), lines.join("\n"));
+  assert.ok(
+    lines.some((line) => /2 paths were already modified before the run/.test(line)),
+    lines.join("\n")
+  );
+});
+
+test("buildTaskStatusLines says nothing about changed files when nothing measured them", () => {
+  const lines = buildTaskStatusLines({ verified: true });
+  assert.ok(!lines.some((line) => /Changed files|Working tree changes/.test(line)), lines.join("\n"));
+});
+
+test("renderStoredJobResult prefers the final report over the stored narration", () => {
+  const output = renderStoredJobResult(
+    { id: "run-1", status: "completed", title: "Grok Build Delegate" },
+    {
+      result: {
+        finalReport: "## Result\nRebuilt the scene.",
+        rawOutput: "Let me look at the project structure.",
+        transcript: "Let me look at the project structure."
+      }
+    }
+  );
+
+  assert.match(output, /Rebuilt the scene\./);
+  assert.doesNotMatch(output, /Let me look at/);
+});
+
+test("renderStoredJobResult still falls back to rawOutput, then to a review's stdout", () => {
+  // lastMessage is deliberately absent from that chain: preferring a bare
+  // trailing line over the stored output would make show print LESS than today.
+  const noReport = renderStoredJobResult(
+    { id: "run-2", status: "completed", title: "Grok Build Delegate" },
+    { result: { finalReport: "", rawOutput: "Handled the requested task.", lastMessage: "ok" } }
+  );
+  assert.match(noReport, /Handled the requested task\./);
+
+  const review = renderStoredJobResult(
+    { id: "run-3", status: "completed", title: "Grok Build Review" },
+    { result: { grok: { stdout: "Reviewed uncommitted changes." } } }
+  );
+  assert.match(review, /Reviewed uncommitted changes\./);
 });

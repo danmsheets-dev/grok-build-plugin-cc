@@ -1297,3 +1297,212 @@ test("a project config can trade the shared Godot cache for a private copy", () 
     ".godot/imported is the gigabyte part and is never copied"
   );
 });
+
+test("an isolated Godot write run reports what it changed, not just where it went", () => {
+  // Item 24 end to end: the payload used to carry a worktree path and nothing
+  // about the artifact, which for a Godot project IS the deliverable.
+  const repo = makeTempDir("grok-manifest-iso-");
+  const binDir = makeTempDir("grok-manifest-iso-bin-");
+  const pluginDataDir = makeTempDir("grok-manifest-iso-data-");
+  installFakeGrok(binDir, "writes-files");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "project.godot"), "config_version=5\n");
+  fs.mkdirSync(path.join(repo, "assets"), { recursive: true });
+  fs.writeFileSync(path.join(repo, "assets", "model.glb"), "glTF-v1\n");
+  run("git", ["add", "."], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const written = JSON.stringify({
+    "scenes/Player.tscn": "[gd_scene load_steps=1 format=3]\n",
+    "assets/model.glb": "glTF-v2\n",
+    // What running the project produces. Never the deliverable.
+    ".godot/imported/model.glb-abc.scn": "cache\n"
+  });
+
+  const result = run(
+    "node",
+    [SCRIPT, "run", "--json", "--write", "--no-verify", "rebuild the player scene"],
+    {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir, { FAKE_GROK_WRITE_FILES: written })
+    }
+  );
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+
+  assert.equal(payload.changedFiles.source, "commit");
+  assert.ok(
+    payload.changedFiles.entries.includes("A\tscenes/Player.tscn"),
+    payload.changedFiles.entries.join(" | ")
+  );
+  assert.ok(
+    payload.changedFiles.entries.includes("M\tassets/model.glb"),
+    payload.changedFiles.entries.join(" | ")
+  );
+  assert.ok(
+    payload.changedFiles.entries.every((entry) => !entry.includes(".godot/")),
+    payload.changedFiles.entries.join(" | ")
+  );
+  // Mirrored onto the worktree descriptor, which is what land reads back.
+  assert.deepEqual(payload.worktree.changedFiles, payload.changedFiles.entries);
+  assert.equal(payload.worktree.changedFileCount, 2);
+
+  // And the same run in text mode, which is what the user actually sees.
+  const rendered = run(
+    "node",
+    [SCRIPT, "run", "--write", "--no-verify", "rebuild the player scene"],
+    {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir, { FAKE_GROK_WRITE_FILES: written })
+    }
+  );
+  assert.equal(rendered.status, 0, rendered.stderr);
+  assert.match(rendered.stdout, /Changed files \(2\):/);
+  assert.match(rendered.stdout, /A scenes\/Player\.tscn/);
+  assert.doesNotMatch(rendered.stdout, /\.godot\/imported/);
+});
+
+test("a write run that produced only build artifacts says so, rather than going quiet", () => {
+  // The silent-result complaint in its most confusing form: the agent ran, the
+  // worktree has files in it, and the commit is legitimately empty because
+  // every one of them was an excluded import cache.
+  const repo = makeTempDir("grok-manifest-none-");
+  const binDir = makeTempDir("grok-manifest-none-bin-");
+  const pluginDataDir = makeTempDir("grok-manifest-none-data-");
+  installFakeGrok(binDir, "writes-files");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "project.godot"), "config_version=5\n");
+  run("git", ["add", "."], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run(
+    "node",
+    [SCRIPT, "run", "--write", "--no-verify", "reimport the assets"],
+    {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir, {
+        FAKE_GROK_WRITE_FILES: JSON.stringify({ ".godot/imported/blob.ctex": "cache\n" })
+      })
+    }
+  );
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /Changed files: none \(run produced only excluded build artifacts\)/);
+});
+
+test("a non-isolated write run separates its own edits from what was already dirty", () => {
+  // A bare post-run `git status --porcelain` also lists every edit the user had
+  // in flight before the run started, and calling those the agent's work is a
+  // lie in the one direction that matters.
+  const repo = makeTempDir("grok-manifest-wt-");
+  const binDir = makeTempDir("grok-manifest-wt-bin-");
+  const pluginDataDir = makeTempDir("grok-manifest-wt-data-");
+  installFakeGrok(binDir, "writes-files");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "# seed\n");
+  fs.writeFileSync(path.join(repo, "notes.txt"), "original\n");
+  run("git", ["add", "."], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  // The user's own uncommitted edit, in flight before the run starts.
+  fs.writeFileSync(path.join(repo, "notes.txt"), "half-written thought\n");
+
+  const result = run(
+    "node",
+    [SCRIPT, "run", "--json", "--write", "--no-isolate", "--no-verify", "add a module"],
+    {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir, {
+        FAKE_GROK_WRITE_FILES: JSON.stringify({ "src/new_module.py": "print(1)\n" })
+      })
+    }
+  );
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+
+  assert.equal(payload.changedFiles.source, "working-tree");
+  // Per-file, not `A src/`: git collapses a wholly untracked directory into one
+  // entry unless it is asked for all of them, and a directory name is not a
+  // manifest. This assertion is the guard on that flag.
+  assert.deepEqual(payload.changedFiles.entries, ["A\tsrc/new_module.py"]);
+  assert.equal(payload.changedFiles.preexistingDirty, 1, "notes.txt was dirty before the run");
+  assert.equal(payload.worktree, null, "--no-isolate means no worktree at all");
+});
+
+test("a stream the bridge cannot parse still reaches the user, labelled as raw stdout", () => {
+  // The end-to-end shape of a grok release that renames its event vocabulary:
+  // every text field empty, stdout full of the answer, and the run reported as
+  // "Grok did not return a final message."
+  const repo = makeTempDir("grok-alien-");
+  const binDir = makeTempDir("grok-alien-bin-");
+  const pluginDataDir = makeTempDir("grok-alien-data-");
+  installFakeGrok(binDir, "streaming-alien");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "run", "--json", "--no-verify", "do something"], {
+    cwd: repo,
+    env: pluginDataEnv(pluginDataDir, binDir)
+  });
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+
+  assert.equal(payload.streamParsed, false);
+  assert.deepEqual(payload.unknownEventTypes, ["assistant_message", "done"]);
+  assert.match(payload.rawOutput, /Rebuilt the scene\./);
+  assert.equal(payload.stderr, "");
+  // The log path is computed rather than plumbed - meta.logFile does not exist
+  // yet where executeTaskRun runs - so assert it is both present and real.
+  assert.ok(payload.logFile, "the run must name its own log file");
+  assert.ok(fs.existsSync(payload.logFile), `${payload.logFile} should exist`);
+
+  const rendered = run("node", [SCRIPT, "run", "--no-verify", "do something"], {
+    cwd: repo,
+    env: pluginDataEnv(pluginDataDir, binDir)
+  });
+  assert.equal(rendered.status, 0, rendered.stderr);
+  assert.match(rendered.stdout, /no recognized assistant messages; showing raw stdout/);
+  assert.match(rendered.stdout, /unrecognized event type/);
+  assert.doesNotMatch(rendered.stdout, /Grok did not return a final message/);
+});
+
+test("the runs table titles a compliant run by its report, not by its first thought", () => {
+  // firstMeaningfulLine used to hand job.summary the first sentence the model
+  // ever emitted; once the report contract shipped, the first line of that
+  // report became the literal heading `## Result`. Neither is a title.
+  const repo = makeTempDir("grok-summary-");
+  const binDir = makeTempDir("grok-summary-bin-");
+  const pluginDataDir = makeTempDir("grok-summary-data-");
+  installFakeGrok(binDir, "reporting");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const task = run("node", [SCRIPT, "run", "--json", "--no-verify", "rebuild the scene"], {
+    cwd: repo,
+    env: pluginDataEnv(pluginDataDir, binDir)
+  });
+  assert.equal(task.status, 0, task.stderr || task.stdout);
+
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  try {
+    const jobs = listJobs(repo);
+    assert.equal(jobs.length, 1);
+    assert.equal(jobs[0].summary, "Rebuilt the scene.");
+    assert.ok(!jobs[0].summary.startsWith("##"), "the heading is not a summary");
+    assert.ok(!/Let me look at/.test(jobs[0].summary), "nor is the model clearing its throat");
+  } finally {
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
+});

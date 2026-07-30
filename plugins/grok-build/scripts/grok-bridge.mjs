@@ -59,6 +59,7 @@ import {
   isTerminalJobStatus,
   listJobs,
   patchJobIfActive,
+  resolveJobLogFile,
   resolveStateDir,
   upsertJob,
   writeJobFile
@@ -90,8 +91,10 @@ import {
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import {
   artifactExcludePathspecs,
+  capChangedFiles,
   commitWorktreeChanges,
   createWorktree,
+  listCommittedChanges,
   removeWorktree
 } from "./lib/worktree.mjs";
 import {
@@ -688,6 +691,28 @@ function firstMeaningfulLine(text, fallback) {
     .map((value) => value.trim())
     .find(Boolean);
   return line ?? fallback;
+}
+
+/**
+ * One-line summary of a run, taken from the `## Result` section of the report
+ * the run-report contract asks for (prompts/run-report.md).
+ *
+ * `firstMeaningfulLine` on its own returns the first sentence the model ever
+ * emitted - "Let me look at the project structure." - and that string becomes
+ * job.summary, i.e. the title of the run in /grok-build:runs. Once the contract
+ * is honoured its first line is worse still: the literal heading `## Result`.
+ *
+ * Returns "" when there is no such section, which every caller treats as
+ * "fall back to the plain text".
+ *
+ * @param {string} report
+ * @returns {string}
+ */
+export function summarizeFinalReport(report) {
+  // JS has no \Z; (?![\s\S]) is the end-of-input assertion that does exist, and
+  // it is what stops the last section from being greedy past the end.
+  const match = String(report ?? "").match(/^##[ \t]*Result[ \t]*\r?\n([\s\S]*?)(?=^##[ \t]|(?![\s\S]))/mi);
+  return match ? shorten(match[1]) : "";
 }
 
 async function buildCheckReport(cwd, actionsTaken = []) {
@@ -1449,16 +1474,115 @@ async function executeReviewRun(request) {
     turnId: null,
     payload,
     rendered,
-    summary: firstMeaningfulLine(result.finalMessage, `${reviewName} completed.`),
+    // A native review has no JSON summary to read, so the report contract's
+    // `## Result` section is the best one-liner available; the first line of
+    // the transcript is the model clearing its throat. Deliberately NOT applied
+    // to the structured branch above, where parsed.summary already wins and
+    // firstMeaningfulLine is only the unparsable-output fallback.
+    summary:
+      summarizeFinalReport(result.finalReport) ||
+      firstMeaningfulLine(result.finalMessage, `${reviewName} completed.`),
     jobTitle: `Grok Build ${reviewName}`,
     jobClass: "review",
     targetLabel: target.label
   };
 }
 
+/**
+ * Working-tree changes as a `path -> status letter` map, with the SAME artifact
+ * filter the commit path applies inside a worktree.
+ *
+ * Filtered rather than raw so a non-isolated Godot run does not report five
+ * hundred `.godot/` cache files as its deliverable - the manifest has to mean
+ * the same thing on both paths, or the isolated and non-isolated forms of the
+ * same run would describe themselves differently.
+ *
+ * Returns null when git cannot be asked at all, which callers treat as "no
+ * manifest", never as "nothing changed".
+ *
+ * @param {string} cwd
+ * @returns {Map<string, string>|null}
+ */
+function porcelainChangeEntries(cwd) {
+  // -uall because git otherwise collapses a wholly untracked directory to a
+  // single `src/` entry, and "the agent created src/" is not a manifest. The
+  // extra walk is bounded by the same artifact excludes as the commit path, so
+  // the heavyweight directories (node_modules, target, .godot) are not
+  // enumerated, and this only runs on a --write --no-isolate run.
+  const args = ["status", "--porcelain", "--untracked-files=all"];
+  let status = git(cwd, [...args, "--", ".", ...artifactExcludePathspecs()]);
+  if (status.status !== 0) {
+    // Mirror the land gate's fallback: an ancient git that rejects pathspec
+    // magic degrades to an unfiltered listing rather than losing the manifest.
+    status = git(cwd, args);
+  }
+  if (status.status !== 0 || status.error) {
+    return null;
+  }
+
+  const entries = new Map();
+  for (const line of String(status.stdout ?? "").split(/\r?\n/)) {
+    const trimmed = line.trimEnd();
+    if (!trimmed) {
+      continue;
+    }
+    const code = trimmed.slice(0, 2);
+    const body = trimmed.length >= 3 ? trimmed.slice(3) : trimmed;
+    const arrow = body.indexOf(" -> ");
+    const filePath = (arrow === -1 ? body : body.slice(arrow + 4)).trim();
+    if (!filePath) {
+      continue;
+    }
+    // Normalized to git's own --name-status vocabulary so both manifest paths
+    // render identically. An untracked file is an addition from the user's
+    // point of view, whatever the index thinks.
+    const letter = code.trim() === "??" ? "A" : (code.trim()[0] ?? "M");
+    entries.set(filePath, letter);
+  }
+  return entries;
+}
+
+/**
+ * What a NON-isolated write run changed, relative to what was already dirty.
+ *
+ * A bare post-run `git status --porcelain` also lists every edit the user had
+ * in flight before the run started, and presenting those as the agent's work is
+ * a lie in the one direction that matters. Paths dirty at both ends are dropped
+ * and counted instead: the agent may well have touched them too, and there is
+ * no way to tell from status alone.
+ *
+ * @param {string} cwd
+ * @param {Set<string>|null} before - paths dirty before the agent started
+ * @returns {{source: string, entries: string[], total: number, truncated: boolean, preexistingDirty: number}|null}
+ */
+function collectWorkingTreeChanges(cwd, before) {
+  const after = porcelainChangeEntries(cwd);
+  if (!after || !before) {
+    return null;
+  }
+  const fresh = [];
+  let preexistingDirty = 0;
+  for (const [filePath, letter] of after) {
+    if (before.has(filePath)) {
+      preexistingDirty += 1;
+      continue;
+    }
+    fresh.push(`${letter}\t${filePath}`);
+  }
+  return { source: "working-tree", ...capChangedFiles(fresh), preexistingDirty };
+}
+
 async function executeTaskRun(request) {
   const workspaceRoot = resolveWorkspaceRoot(request.cwd);
   ensureGrokAvailable(request.cwd);
+
+  // Derived rather than plumbed: `meta.logFile` is created in
+  // runForegroundCommand AFTER the runner closure that calls this function is
+  // built, so it is genuinely not available to be passed in. This is the same
+  // path resolveJobLogFile hands tracked-jobs, which appends the complete
+  // rendered result to it - the durable artifact of the run, and useless if the
+  // user is never told where it is.
+  const logFile = request.jobId ? resolveJobLogFile(workspaceRoot, request.jobId) : null;
 
   const taskMetadata = buildTaskRunMetadata({
     prompt: request.prompt,
@@ -1650,6 +1774,13 @@ async function executeTaskRun(request) {
       message: `Verify baseline: measured in ${baselineProbeMs}ms (${baselines.filter((entry) => entry.ok).length}/${baselines.length} already passing)`
     });
   }
+
+  // Snapshotted BEFORE the agent runs, and only where it is needed: an isolated
+  // run gets its manifest from the commit range, which cannot contain anything
+  // that was already there. Taken after the baseline probe on purpose - a verify
+  // command that writes build output would otherwise show up as the agent's work.
+  const dirtyBeforeRun = write && !created ? porcelainChangeEntries(runCwd) : null;
+  const dirtyBeforeRunPaths = dirtyBeforeRun ? new Set(dirtyBeforeRun.keys()) : null;
 
   const firstAgent = await runHeadlessAgentWithDurationBudget(
     runCwd,
@@ -1918,11 +2049,26 @@ async function executeTaskRun(request) {
   }
 
   let worktree = null;
+  /** @type {{source: string, entries: string[], total: number, truncated: boolean, preexistingDirty?: number}|null} */
+  let changedFiles = null;
   if (created) {
     const committed = commitWorktreeChanges(
       created.worktreePath,
       `grok-build ${request.jobId}`
     );
+    // Guarded on the commit actually happening. commitWorktreeChanges returns
+    // {committed:false, sha:HEAD} both when the tree was clean and when
+    // everything staged was an excluded artifact, and diffing HEAD..HEAD in
+    // that state would be a wasted git call - but the EMPTY manifest is still
+    // the answer, and is rendered as such rather than omitted.
+    if (committed.committed) {
+      const listed = listCommittedChanges(created.worktreePath, created.baseSha, committed.sha);
+      // A diff that failed is NOT an empty change set - reporting "none" for it
+      // would claim the run produced nothing when nobody managed to look.
+      changedFiles = listed.error ? null : { source: "commit", ...listed };
+    } else if (!committed.error) {
+      changedFiles = { source: "commit", entries: [], total: 0, truncated: false };
+    }
     worktree = {
       path: created.worktreePath,
       branch: created.branchName,
@@ -1932,8 +2078,14 @@ async function executeTaskRun(request) {
       // throwing here discarded an otherwise complete run: tracked-jobs flattens
       // a thrown error to an errorMessage, losing rawOutput/threadId/usage/
       // verify.results. Carry the reason instead and let the run finish.
-      commitError: committed.error ?? null
+      commitError: committed.error ?? null,
+      // The deliverable, named. For a Godot or Blender run this is the whole
+      // point of the run, and the payload used to carry only a path.
+      changedFiles: changedFiles?.entries ?? null,
+      changedFileCount: changedFiles?.total ?? null
     };
+  } else if (write) {
+    changedFiles = collectWorkingTreeChanges(runCwd, dirtyBeforeRunPaths);
   }
 
   // The text channel is the ONE thing that accumulates across turns. `result`
@@ -1963,6 +2115,13 @@ async function executeTaskRun(request) {
   // what today's behaviour was, so a model that ignores the contract still
   // prints exactly what it used to rather than nothing.
   const rawOutput = finalReport || lastMessage || transcript;
+  // Diagnostics about the machinery, aggregated the pessimistic way across
+  // turns: one unparseable turn means the text channel is not wholly a parsed
+  // transcript, and an event type that confused any turn confused the bridge.
+  const streamParsed = agentResults.every((entry) => entry?.streamParsed !== false);
+  const unknownEventTypes = [
+    ...new Set(agentResults.flatMap((entry) => entry?.unknownEventTypes ?? []))
+  ].sort();
   const failureMessage = timedOut
     ? `Run timed out after ${maxDurationSeconds}s (--max-duration).`
     : result.status === 0
@@ -1973,11 +2132,19 @@ async function executeTaskRun(request) {
     : renderTaskResult(
         {
           rawOutput,
-          failureMessage
+          failureMessage,
+          // Only ever shown when there is no answer at all: a truncated or
+          // rate-limited response exits 0 with empty text and puts the only
+          // explanation on the channel that used to be dropped.
+          stderr: result.stderr ?? ""
         },
         {
           title: taskMetadata.title,
           jobId: request.jobId ?? null,
+          logFile,
+          streamParsed,
+          unknownEventTypes,
+          changedFiles,
           write,
           verified,
           verifyNote,
@@ -2046,6 +2213,26 @@ async function executeTaskRun(request) {
     // nothing is lost by rawOutput now preferring the answer. This is what a
     // caller reads when it wants to know what the agent actually did.
     transcript,
+    // Scalars only. `messages` is deliberately NOT persisted: it duplicates the
+    // transcript into jobs/<id>.json and pushes an unbounded array through
+    // redactSecretsDeep on every terminal claim.
+    finalReport,
+    lastMessage,
+    // Kept even on a zero exit. "Exited 0, said nothing, warned on stderr" is
+    // the exact shape of a truncated response, and dropping the warning left
+    // the run inexplicable.
+    stderr: result.stderr ?? "",
+    // Did the streaming parser understand the CLI, and what did it not
+    // understand? Both were computed and had no consumer at all, so a grok
+    // release that renames an event type degraded output silently.
+    streamParsed,
+    unknownEventTypes,
+    // Where the durable copy of this run's rendered result lives.
+    logFile,
+    // What the run changed on disk - the deliverable itself for an engine
+    // project. Null when there was nothing to measure (a read-only run) or
+    // nobody could measure it (a failed commit or diff).
+    changedFiles,
     verified,
     worktree,
     // What the worktree was seeded with, and what could not be. Null on a
@@ -2067,12 +2254,14 @@ async function executeTaskRun(request) {
     rendered,
     summary: timedOut
       ? failureMessage
-      // Off lastMessage rather than rawOutput: rawOutput now prefers the final
-      // report, whose first line is the literal heading `## Result`, and that
-      // would become the title of every compliant run in /grok-build:runs.
-      // rawOutput stays as the fallback for a run that produced no trailing
-      // prose at all.
-      : firstMeaningfulLine(
+      // The report's own `## Result` section first - that is the run saying
+      // what it did. Then lastMessage rather than rawOutput: rawOutput prefers
+      // the final report, whose first line is the literal heading `## Result`,
+      // and that would become the title of every compliant run in
+      // /grok-build:runs. rawOutput stays as the fallback for a run that
+      // produced no trailing prose at all.
+      : summarizeFinalReport(finalReport) ||
+        firstMeaningfulLine(
           lastMessage || rawOutput,
           firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)
         ),

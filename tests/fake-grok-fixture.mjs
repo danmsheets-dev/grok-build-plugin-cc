@@ -12,9 +12,15 @@ import { writeExecutable } from "./helpers.mjs";
  *   carried the contract - so a test using it proves the bridge injected it.
  * - `silent-fix` answers a verify fix prompt with a thought and nothing else,
  *   which is the shape that used to erase the original run's answer.
+ * - `streaming-alien` speaks an event vocabulary the bridge does not know, the
+ *   shape a future CLI release takes. FAKE_GROK_ALIEN_LINES pads it out so the
+ *   raw-stdout fallback's cap can be observed.
+ * - `writes-files` creates whatever FAKE_GROK_WRITE_FILES names (a JSON object
+ *   of repo-relative path -> contents), so a write run has real changes to
+ *   report.
  *
  * @param {string} binDir directory that will be prepended to PATH
- * @param {"default"|"not-logged-in"|"fail-print"|"import-ok"|"reporting"|"silent-fix"} scenario
+ * @param {"default"|"not-logged-in"|"fail-print"|"import-ok"|"reporting"|"silent-fix"|"streaming-alien"|"writes-files"} scenario
  */
 export function installFakeGrok(binDir, scenario = "default") {
   fs.mkdirSync(binDir, { recursive: true });
@@ -98,6 +104,17 @@ if (isPrint || hasFlag("-r") || hasFlag("--resume") || hasFlag("-c") || hasFlag(
   if (promptFile) {
     prompt = fs.readFileSync(promptFile, "utf8");
   }
+
+  // Real edits on disk, so a write run has a manifest to build. Done before any
+  // output so it is in place whichever output mode the caller asked for.
+  if (scenario === "writes-files" && process.env.FAKE_GROK_WRITE_FILES) {
+    const files = JSON.parse(process.env.FAKE_GROK_WRITE_FILES);
+    for (const [relative, contents] of Object.entries(files)) {
+      const target = path.resolve(process.cwd(), relative);
+      fs.mkdirSync(path.dirname(target), { recursive: true });
+      fs.writeFileSync(target, contents);
+    }
+  }
   const wantsJson = hasFlag("--json-schema") || flagValue("--output-format") === "json";
 
   if (flagValue("--output-format") === "streaming-json") {
@@ -117,6 +134,20 @@ if (isPrint || hasFlag("-r") || hasFlag("--resume") || hasFlag("-c") || hasFlag(
       num_turns: 2,
       total_cost_usd: 0.0123
     };
+
+    // A CLI whose streaming vocabulary the bridge has never heard of. Every
+    // event is unrecognized, so the transcript comes back empty while stdout is
+    // full of the answer - the shape a grok release that renames its events
+    // takes, which used to render as "Grok did not return a final message."
+    if (scenario === "streaming-alien") {
+      const filler = Number(process.env.FAKE_GROK_ALIEN_LINES ?? 0);
+      for (let i = 0; i < filler; i += 1) {
+        emit({ type: "assistant_message", content: "filler line " + i });
+      }
+      emit({ type: "assistant_message", content: "Rebuilt the scene." });
+      emit({ type: "done" });
+      process.exit(0);
+    }
 
     // A verify fix turn that ends on a tool call with no trailing prose. Real
     // and common: the fix prompt asks for an edit and a re-run, not an essay.
