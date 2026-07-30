@@ -9,10 +9,13 @@ import {
   GODOT_SHARED_CACHE_NOTE,
   PROVISION_COPY_PATHS,
   PROVISION_LINK_DIRS,
+  injectRuntimePlugin,
   planBlenderScriptSandbox,
   planWorktreeLinks,
-  provisionWorktree
+  provisionWorktree,
+  shouldAutoBlenderSandbox
 } from "../plugins/grok-build/scripts/lib/provision.mjs";
+import { artifactExcludePathspecs } from "../plugins/grok-build/scripts/lib/worktree.mjs";
 import { makeTempDir } from "./helpers.mjs";
 
 /**
@@ -74,10 +77,16 @@ describe("planWorktreeLinks", () => {
   });
 
   test("uses junction on windows, symlink on linux", () => {
-    const existsSync = mock.method(fs, "existsSync", () => true);
+    // Non-Godot dirs only: the isolated default treats .godot as a private
+    // copy, which would make kind assertions false for engine caches.
+    const existsSync = mock.method(fs, "existsSync", (p) => {
+      const s = String(p);
+      return s.endsWith("node_modules") || s.endsWith("target");
+    });
     const statSync = mock.method(fs, "statSync", () => ({ isDirectory: () => true }));
     const win = planWorktreeLinks("/repo", "/wt", { platform: "win32", existsSync, statSync });
     const lin = planWorktreeLinks("/repo", "/wt", { platform: "linux", existsSync, statSync });
+    assertModule.ok(win.links.length > 0);
     for (const link of win.links) {
       assertModule.strictEqual(link.kind, "junction");
     }
@@ -182,26 +191,46 @@ describe("Godot import cache tier", () => {
   const godotOnly = (p) => String(p).endsWith(".godot") || String(p).includes(".godot" + path.sep);
   const dirStat = () => ({ isDirectory: () => true });
 
-  test("the default is still a link, and it carries the shared-cache warning", () => {
-    // The default must not move. Two other suites assert `.godot` is linked
-    // (tests/provision.test.mjs PROVISION_LINK_DIRS coverage and
-    // tests/worktree.test.mjs), and dropping the link reverses a deliberate,
-    // documented optimisation for the plugin's primary ecosystem.
+  test("the isolated default is a private cache, not a shared link", () => {
+    // Field session: concurrent editor + headless import clobbered
+    // global_script_class_cache.cfg and produced bogus parse errors. Private
+    // by default under isolation; GROK_BUILD_LINK_GODOT_CACHE=1 opts back in.
     const plan = planWorktreeLinks("/repo", "/wt", {
       platform: "linux",
-      existsSync: (p) => String(p).endsWith(".godot"),
+      existsSync: (p) => String(p).endsWith(".godot") || String(p).includes(".godot" + path.sep),
       statSync: dirStat,
       env: {}
     });
 
+    assertModule.ok(!plan.links.some((link) => path.basename(link.from) === ".godot"));
+    assertModule.ok(
+      plan.notes.some((note) => /Godot cache: private to this run/i.test(note)),
+      `expected private-cache line, got: ${JSON.stringify(plan.notes)}`
+    );
+    assertModule.ok(
+      plan.notes.some((note) => /Shared-cache lock skipped/i.test(note)),
+      `private cache must say the lock is skipped, got: ${JSON.stringify(plan.notes)}`
+    );
+    assertModule.ok(!plan.notes.includes(GODOT_SHARED_CACHE_NOTE));
+  });
+
+  test("GROK_BUILD_LINK_GODOT_CACHE=1 restores the shared link and warning", () => {
+    const plan = planWorktreeLinks("/repo", "/wt", {
+      platform: "linux",
+      existsSync: (p) => String(p).endsWith(".godot"),
+      statSync: dirStat,
+      env: { GROK_BUILD_LINK_GODOT_CACHE: "1" }
+    });
+
     const godot = plan.links.find((link) => path.basename(link.from) === ".godot");
-    assertModule.ok(godot, "the default must still link .godot");
+    assertModule.ok(godot, "explicit link opt-in must still link .godot");
     assertModule.strictEqual(godot.kind, "symlink");
     assertModule.ok(
       plan.notes.includes(GODOT_SHARED_CACHE_NOTE),
-      `the shared-cache warning is mandatory, got: ${JSON.stringify(plan.notes)}`
+      `the shared-cache warning is mandatory when shared, got: ${JSON.stringify(plan.notes)}`
     );
     assertModule.match(GODOT_SHARED_CACHE_NOTE, /close the Godot editor/i);
+    assertModule.ok(plan.notes.some((note) => /shared with your working copy/i.test(note)));
   });
 
   test("a linked repo with no Godot cache gets no warning", () => {
@@ -232,7 +261,7 @@ describe("Godot import cache tier", () => {
       assertModule.strictEqual(link.kind, "copy");
     }
     assertModule.ok(
-      plan.notes.some((note) => note.includes("copied, not shared")),
+      plan.notes.some((note) => /private to this run|not shared|seeded/i.test(note)),
       `the opt-out has to explain itself, got: ${JSON.stringify(plan.notes)}`
     );
     // The warning is about a SHARED cache; a copied one is not shared.

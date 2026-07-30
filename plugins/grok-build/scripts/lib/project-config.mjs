@@ -175,6 +175,10 @@ const SCHEMA = Object.freeze({
   isolate: { normalize: normalizeBoolean, expected: "true or false" },
   linkDirs: { normalize: normalizeStringArray, expected: "an array of directory names" },
   provision: { normalize: normalizeProvision, expected: "an object with a boolean copy" },
+  // Opt-in Godot headless export smoke when export_presets.cfg exists. Never
+  // an executable key: it only adds a default verify command shape, and the
+  // bridge still resolves the binary literally.
+  exportSmoke: { normalize: normalizeBoolean, expected: "true or false" },
   artifactExcludes: { normalize: normalizeStringArray, expected: "an array of pathspec strings" },
   maxDurationSeconds: { normalize: normalizePositiveNumber, expected: "a positive number of seconds" },
   maxTurns: { normalize: normalizePositiveInteger, expected: "an integer >= 1" },

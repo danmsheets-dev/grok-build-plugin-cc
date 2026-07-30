@@ -350,7 +350,9 @@ A run also reports what it did to the disk and how it was captured:
 | `--baseline-timeout <seconds>` | Budget for the pre-run baseline probe. Only ever raises the 900s default |
 | `--verify-max-buffer <megabytes>` | How much verify output to keep. Output over the budget is not an error: the head and tail are kept and the middle is elided |
 | `--env KEY=VALUE` | Set a variable for the verify commands **and** the agent (repeatable). Split on the first `=` only, so a value may contain more. The full process environment is inherited; these are overrides on top of it |
-| `--blender-sandbox` | Give the run a private Blender add-on directory inside the worktree (see below). Opt-in, and only meaningful for an isolated write run |
+| `--blender-sandbox` | Give the run a private Blender add-on directory inside the worktree (see below). Auto-enabled for isolated add-on/extension runs; this flag forces it on |
+| `--no-blender-sandbox` | Disable the Blender sandbox even when auto-enabled |
+| `--godot-export-smoke` | When `export_presets.cfg` exists, add a headless export smoke step (never touches `export_credentials.cfg`) |
 | `--no-isolate` | Edit the working tree directly instead of using a worktree |
 | `--max-duration <seconds>` | Stop the run after a wall-clock limit |
 | `--max-turns <n>` | Cap agent turns (passed through to the CLI) |

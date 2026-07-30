@@ -49,7 +49,7 @@ Command selection:
 - `run --resume-last`: internal helper for "keep going", "resume", "apply the top fix", or "dig deeper" after a previous delegate run.
 
 Passthrough flags (forward verbatim, never fold into the task text):
-- `--verify` (repeatable — forward every occurrence), `--verify-attempts`, `--verify-ignore` (repeatable), `--verify-timeout`, `--baseline-timeout`, `--verify-max-buffer`, `--no-verify`, `--no-verify-baseline`, `--env` (repeatable), `--blender-sandbox`, `--no-isolate`, `--max-duration`, `--max-turns`, `--max-cost`.
+- `--verify` (repeatable — forward every occurrence), `--verify-attempts`, `--verify-ignore` (repeatable), `--verify-timeout`, `--baseline-timeout`, `--verify-max-buffer`, `--no-verify`, `--no-verify-baseline`, `--env` (repeatable), `--blender-sandbox`, `--no-blender-sandbox`, `--godot-export-smoke`, `--no-isolate`, `--max-duration`, `--max-turns`, `--max-cost`.
 - Strip each one out of the preserved task text before writing it to the prompt file, exactly like `--model`/`--effort`/`--resume`/`--fresh` are already stripped.
 - `--prompt-file` is not on this list — it is the delivery mechanism for the task text itself, not a flag a user types into a delegate request.
 

@@ -495,10 +495,14 @@ test("a Godot import cache is linked in, excluded from commits, and survives tea
 
   const dataDir = makeTempDir();
   const created = createWorktree({ cwd, runId: "godot-e2e", dataDir });
-  const plan = planWorktreeLinks(created.repoRoot, created.worktreePath);
+  // Explicit shared-cache opt-in: the isolated default is now a private copy,
+  // and this test is specifically about the link-and-survive-teardown path.
+  const plan = planWorktreeLinks(created.repoRoot, created.worktreePath, {
+    env: { GROK_BUILD_LINK_GODOT_CACHE: "1" }
+  });
   assert.ok(
     plan.links.some((link) => path.basename(link.from) === ".godot"),
-    ".godot must be planned for linking"
+    ".godot must be planned for linking when shared cache is opted in"
   );
   provisionWorktree(plan);
 
@@ -874,8 +878,15 @@ test("a Godot write run's manifest names the scene it changed and nothing from t
 
   const manifest = listCommittedChanges(wt, created.baseSha, committed.sha);
   assert.equal(manifest.error, undefined);
-  assert.ok(manifest.entries.includes("A\tscenes/Player.tscn"), manifest.entries.join(" | "));
-  assert.ok(manifest.entries.includes("M\tassets/model.glb"), manifest.entries.join(" | "));
+  // Added .tscn lines may include a cheap "scene edit" annotation after the path.
+  assert.ok(
+    manifest.entries.some((entry) => entry.startsWith("A\tscenes/Player.tscn")),
+    manifest.entries.join(" | ")
+  );
+  assert.ok(
+    manifest.entries.some((entry) => entry.startsWith("M\tassets/model.glb")),
+    manifest.entries.join(" | ")
+  );
   assert.ok(
     manifest.entries.every((entry) => !entry.includes(".godot/")),
     `the import cache is not the deliverable, got: ${manifest.entries.join(" | ")}`

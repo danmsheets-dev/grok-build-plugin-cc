@@ -208,6 +208,17 @@ function parseGodotFeatures(text) {
   return { features, minor: Number.isInteger(minor) ? minor : null };
 }
 
+/**
+ * First named export preset in export_presets.cfg, if any.
+ *
+ * Only the name is needed for a headless smoke export. Credentials live in the
+ * sibling export_credentials.cfg (never committed, never read here).
+ */
+function parseFirstExportPresetName(text) {
+  const match = /^\s*name\s*=\s*"([^"]+)"/m.exec(String(text ?? ""));
+  return match ? match[1] : null;
+}
+
 function detectGodot(root, io) {
   const projectFile = path.join(root, GODOT_PROJECT_FILE);
   // project.godot is the only marker that means "this is a Godot project". A
@@ -238,6 +249,17 @@ function detectGodot(root, io) {
     }
   }
 
+  // export_presets.cfg is normal tracked source; export_credentials.cfg is the
+  // machine-local sibling that must never be read or staged. Presence of the
+  // presets file only enables an OPT-IN smoke export (see exportSmoke option
+  // on defaultVerifyCommands) — never an automatic one, because a headless
+  // export needs a configured template and can take minutes.
+  const exportPresetsPath = path.join(root, "export_presets.cfg");
+  const hasExportPresets = exists(io, exportPresetsPath);
+  const exportPresetName = hasExportPresets
+    ? parseFirstExportPresetName(readText(io, exportPresetsPath) ?? "")
+    : null;
+
   return {
     id: "godot",
     root,
@@ -251,6 +273,13 @@ function detectGodot(root, io) {
     // Godot 3 imports into .import, Godot 4 into .godot. Unknown major gets
     // the modern one - the same default the version branches below use.
     cacheDir: major === 3 ? ".import" : ".godot",
+    hasExportPresets,
+    exportPresetName,
+    // --check-only is Godot 4 only (added alongside --headless). Godot 3 has
+    // no equivalent; emitting it would fail the verify plan on a healthy 3.x
+    // project. Unknown major takes the Godot 4 branch, matching every other
+    // flag choice in this module.
+    supportsCheckOnly: major !== 3,
     exeHint: resolveBinaryHint("godot", io.env)
   };
 }
@@ -293,6 +322,24 @@ function inspectBlenderDir(dir, rel, io) {
   return null;
 }
 
+/**
+ * blender_version_min from blender_manifest.toml — recorded on the descriptor
+ * so a pre-flight guard can refuse (or at least warn) before a verify that
+ * would only fail with a version error after Blender starts.
+ */
+function parseBlenderManifestVersionMin(text) {
+  const match = /^\s*blender_version_min\s*=\s*"(\d+)\.(\d+)(?:\.(\d+))?"/m.exec(String(text ?? ""));
+  if (!match) {
+    return null;
+  }
+  return {
+    major: Number.parseInt(match[1], 10),
+    minor: Number.parseInt(match[2], 10),
+    patch: Number.parseInt(match[3] ?? "0", 10),
+    raw: match[3] ? `${match[1]}.${match[2]}.${match[3]}` : `${match[1]}.${match[2]}`
+  };
+}
+
 function detectBlender(root, io) {
   let hit = inspectBlenderDir(root, "", io);
   if (!hit) {
@@ -317,15 +364,55 @@ function detectBlender(root, io) {
     }
   }
 
+  let blenderVersionMin = null;
+  if (hit.manifestPath) {
+    const manifestText = readText(io, path.join(root, ...hit.manifestPath.split("/"))) ?? "";
+    blenderVersionMin = parseBlenderManifestVersionMin(manifestText);
+  }
+
   return {
     id: "blender",
     root,
     detectedBy: hit.detectedBy,
     manifestPath: hit.manifestPath,
     addonInitPath: hit.addonInitPath,
+    // True when there is a module to sandbox (extension or legacy add-on). A
+    // bare .blend project is NOT an add-on — auto-sandbox must not claim it.
+    isAddon: Boolean(hit.manifestPath || hit.addonInitPath),
     testScript,
+    blenderVersionMin,
     exeHint: resolveBinaryHint("blender", io.env)
   };
+}
+
+/**
+ * Package manager for a Node project: lockfile first, then packageManager field.
+ *
+ * Workspaces are detected so the verify plan stays at the root rather than
+ * descending into every package — `pnpm -r test` would re-run the same suite
+ * N times and is never what a default plan should do.
+ */
+function detectPackageManager(root, io, packageManagerField) {
+  if (exists(io, path.join(root, "pnpm-lock.yaml"))) {
+    return "pnpm";
+  }
+  if (exists(io, path.join(root, "yarn.lock"))) {
+    return "yarn";
+  }
+  if (exists(io, path.join(root, "bun.lockb")) || exists(io, path.join(root, "bun.lock"))) {
+    return "bun";
+  }
+  if (exists(io, path.join(root, "package-lock.json"))) {
+    return "npm";
+  }
+  const field = typeof packageManagerField === "string" ? packageManagerField.trim() : "";
+  if (field) {
+    const name = field.split("@")[0].trim().toLowerCase();
+    if (name === "pnpm" || name === "yarn" || name === "npm" || name === "bun") {
+      return name;
+    }
+  }
+  return "npm";
 }
 
 function detectNode(root, io) {
@@ -335,9 +422,23 @@ function detectNode(root, io) {
   }
 
   let scripts = {};
+  let dependencies = {};
+  let devDependencies = {};
+  let packageManagerField = null;
+  let workspaces = null;
   try {
     const parsed = JSON.parse(readText(io, packageJson) ?? "{}");
     scripts = parsed && typeof parsed.scripts === "object" && parsed.scripts ? parsed.scripts : {};
+    dependencies =
+      parsed && typeof parsed.dependencies === "object" && parsed.dependencies
+        ? parsed.dependencies
+        : {};
+    devDependencies =
+      parsed && typeof parsed.devDependencies === "object" && parsed.devDependencies
+        ? parsed.devDependencies
+        : {};
+    packageManagerField = typeof parsed.packageManager === "string" ? parsed.packageManager : null;
+    workspaces = parsed.workspaces ?? null;
   } catch {
     // A malformed package.json still identifies a Node project; it just cannot
     // contribute a verify command.
@@ -345,30 +446,205 @@ function detectNode(root, io) {
   }
 
   const testScript = typeof scripts.test === "string" ? scripts.test : "";
+  const hasTestScript = Boolean(testScript) && !/no test specified/i.test(testScript);
+  const packageManager = detectPackageManager(root, io, packageManagerField);
+
+  // When scripts.test is absent, call the runner directly only when a real
+  // config file says the project uses it. Guessing `npx jest` on every repo
+  // with a jest dependency that is only used for one package would fail most
+  // workspace roots.
+  let directTestRunner = null;
+  if (!hasTestScript) {
+    if (
+      exists(io, path.join(root, "vitest.config.ts")) ||
+      exists(io, path.join(root, "vitest.config.js")) ||
+      exists(io, path.join(root, "vitest.config.mjs")) ||
+      exists(io, path.join(root, "vite.config.ts")) ||
+      exists(io, path.join(root, "vite.config.js"))
+    ) {
+      // vite.config alone is not enough to prove vitest — only when vitest is
+      // also a dependency, so a plain Vite app does not get a bogus plan.
+      if (dependencies.vitest || devDependencies.vitest) {
+        directTestRunner = "vitest";
+      }
+    } else if (
+      exists(io, path.join(root, "jest.config.js")) ||
+      exists(io, path.join(root, "jest.config.ts")) ||
+      exists(io, path.join(root, "jest.config.mjs")) ||
+      exists(io, path.join(root, "jest.config.cjs"))
+    ) {
+      directTestRunner = "jest";
+    }
+  }
+
+  const hasTypeScript =
+    Boolean(dependencies.typescript || devDependencies.typescript) &&
+    exists(io, path.join(root, "tsconfig.json"));
+
+  const isWorkspace =
+    workspaces != null ||
+    exists(io, path.join(root, "pnpm-workspace.yaml")) ||
+    exists(io, path.join(root, "lerna.json"));
+
   return {
     id: "node",
     root,
     // `npm init` writes a placeholder test script that exits 1 on purpose.
     // Emitting `npm test` for it would fail every run of a project that has
     // simply never added tests.
-    hasTestScript: Boolean(testScript) && !/no test specified/i.test(testScript)
+    hasTestScript,
+    packageManager,
+    directTestRunner,
+    hasTypeScript,
+    isWorkspace
+  };
+}
+
+/**
+ * Resolve how Python commands should be prefixed for this project.
+ *
+ * Prefer project-local runners (uv / Poetry / PDM / .venv) over a bare
+ * `python` on PATH: the latter is frequently the wrong interpreter on a
+ * machine with several toolchains, and on Windows it may be the Store stub.
+ *
+ * Pure and fs-only — never probes the binary.
+ *
+ * @param {string} root
+ * @param {{ existsSync: Function, platform?: string }} io
+ * @returns {{ kind: string, python: string, prefix: string[] }}
+ */
+export function resolvePythonInterpreter(root, io = {}) {
+  // Default to real fs.existsSync: callers that only pass `platform` (tests,
+  // verify-plan previews) still need to see lockfiles and venvs on disk. The
+  // injectable override remains for fully virtual fixtures.
+  const existsSync = io.existsSync ?? fs.existsSync;
+  const platform = io.platform ?? process.platform;
+  const join = (...parts) => path.join(root, ...parts);
+
+  if (existsSync(join("uv.lock"))) {
+    return { kind: "uv", python: "python", prefix: ["uv", "run"] };
+  }
+  if (existsSync(join("poetry.lock"))) {
+    return { kind: "poetry", python: "python", prefix: ["poetry", "run"] };
+  }
+  if (existsSync(join("pdm.lock"))) {
+    return { kind: "pdm", python: "python", prefix: ["pdm", "run"] };
+  }
+
+  for (const venvName of [".venv", "venv"]) {
+    const winPy = join(venvName, "Scripts", "python.exe");
+    const posixPy = join(venvName, "bin", "python");
+    if (platform === "win32" && existsSync(winPy)) {
+      // Quoted later only when needed; store the absolute path as the token.
+      return { kind: "venv", python: winPy, prefix: [] };
+    }
+    if (platform !== "win32" && existsSync(posixPy)) {
+      return { kind: "venv", python: posixPy, prefix: [] };
+    }
+    // Cross-platform fixtures and unusual layouts: accept either shape.
+    if (existsSync(winPy)) {
+      return { kind: "venv", python: winPy, prefix: [] };
+    }
+    if (existsSync(posixPy)) {
+      return { kind: "venv", python: posixPy, prefix: [] };
+    }
+  }
+
+  return {
+    kind: "system",
+    python: platform === "win32" ? "python" : "python3",
+    prefix: []
+  };
+}
+
+function formatPythonCommand(interpreter, args) {
+  const tokens = [];
+  for (const part of interpreter.prefix ?? []) {
+    tokens.push(part);
+  }
+  let python = String(interpreter.python ?? "python");
+  if (/\s/.test(python) && !/^".*"$/.test(python)) {
+    python = `"${python}"`;
+  }
+  tokens.push(python, ...args);
+  return tokens.join(" ");
+}
+
+/**
+ * Django is a Python subtype: same ecosystem id so priority and tooling stay
+ * coherent, with `framework: "django"` selecting the manage.py verify plan.
+ */
+function detectDjangoSignals(root, io, pyproject, requirements) {
+  if (!exists(io, path.join(root, "manage.py"))) {
+    return null;
+  }
+
+  const hasSettingsFile = exists(io, path.join(root, "settings.py"));
+  const hasSettingsPkg =
+    exists(io, path.join(root, "settings", "__init__.py")) ||
+    // Common layout: <project>/settings.py one level down.
+    childDirs(root, io).some((child) =>
+      exists(io, path.join(child.dir, "settings.py")) ||
+      exists(io, path.join(child.dir, "settings", "__init__.py"))
+    );
+
+  const depText = `${pyproject}\n${requirements}`;
+  const hasDjangoDep =
+    /^\s*django\s*[>=<\[]/im.test(depText) ||
+    /^\s*["']Django["']\s*[>=,<]/im.test(depText) ||
+    /["']django["']\s*[>=,<]/i.test(depText) ||
+    /^\s*django\s*$/im.test(requirements);
+
+  if (!hasSettingsFile && !hasSettingsPkg && !hasDjangoDep) {
+    return null;
+  }
+
+  return {
+    framework: "django",
+    managePy: "manage.py"
   };
 }
 
 function detectPython(root, io) {
-  const markers = ["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt"];
+  const markers = ["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "manage.py"];
   if (!markers.some((marker) => exists(io, path.join(root, marker)))) {
     return null;
   }
 
   const pyproject = readText(io, path.join(root, "pyproject.toml")) ?? "";
+  const requirements = readText(io, path.join(root, "requirements.txt")) ?? "";
+  const platform = io.env?.GROK_BUILD_DETECT_PLATFORM || process.platform;
+  const interpreter = resolvePythonInterpreter(root, {
+    existsSync: (target) => exists(io, target),
+    platform
+  });
+
+  const hasPytest =
+    exists(io, path.join(root, "pytest.ini")) ||
+    exists(io, path.join(root, "conftest.py")) ||
+    /^\s*\[tool\.pytest/m.test(pyproject);
+  const hasTestsDir = exists(io, path.join(root, "tests")) || exists(io, path.join(root, "test"));
+  const hasRuff =
+    /^\s*\[tool\.ruff/m.test(pyproject) ||
+    exists(io, path.join(root, "ruff.toml")) ||
+    exists(io, path.join(root, ".ruff.toml"));
+  const hasMypy =
+    /^\s*\[tool\.mypy/m.test(pyproject) ||
+    exists(io, path.join(root, "mypy.ini")) ||
+    exists(io, path.join(root, ".mypy.ini"));
+
+  const django = detectDjangoSignals(root, io, pyproject, requirements);
+
   return {
     id: "python",
     root,
-    hasTests:
-      exists(io, path.join(root, "tests")) ||
-      exists(io, path.join(root, "pytest.ini")) ||
-      /^\s*\[tool\.pytest/m.test(pyproject)
+    framework: django?.framework ?? null,
+    managePy: django?.managePy ?? null,
+    interpreter,
+    hasTests: hasPytest || hasTestsDir,
+    hasPytest,
+    hasRuff,
+    hasMypy
   };
 }
 
@@ -523,13 +799,24 @@ function preferWindowsConsoleExe(value, existsSync) {
   }
 }
 
-function godotVerifyCommands(exe, descriptor) {
+function godotVerifyCommands(exe, descriptor, options = {}) {
   const commands = [];
   const major = descriptor.major;
   // Unknown major takes the Godot 4 branch: 4.x is what a project detected
   // today is overwhelmingly likely to be, and its flags are the ones a
   // config_version we failed to parse would most likely accept.
   const headless = major === 3 ? "--no-window" : "--headless";
+
+  // --check-only parses GDScript without running or importing. A broken script
+  // fails in seconds rather than after a full asset import. Godot 3 has no
+  // such flag; supportsCheckOnly is set on the descriptor so a caller that
+  // only has a major can still gate correctly.
+  const supportsCheckOnly =
+    descriptor.supportsCheckOnly === true ||
+    (descriptor.supportsCheckOnly !== false && major !== 3);
+  if (supportsCheckOnly) {
+    commands.push(`${exe} --headless --path . --check-only`);
+  }
 
   if (major === 3) {
     // Godot 3 has neither --headless (4.0) nor --quit-after. Editor mode plus
@@ -550,6 +837,31 @@ function godotVerifyCommands(exe, descriptor) {
     commands.push(
       `${exe} ${headless} --path . -s addons/gdUnit4/bin/GdUnitCmdTool.gd -a ${descriptor.testDir}`
     );
+  }
+
+  // Opt-in export smoke. Never touches export_credentials.cfg — that file is
+  // machine-local secrets and already in worktree.mjs's never-commit list.
+  // Output lands under the run scratch dir so a successful smoke cannot stage
+  // a binary into the commit.
+  if (options.exportSmoke && descriptor.hasExportPresets && descriptor.exportPresetName) {
+    const preset = descriptor.exportPresetName;
+    const safePreset = SAFE_COMMAND_PATH_PATTERN.test(preset) ? preset : null;
+    if (safePreset) {
+      const quoted = quoteCommandPath(safePreset);
+      const out =
+        major === 3
+          ? `.grok-build/export-smoke.zip`
+          : `.grok-build/export-smoke.zip`;
+      if (major === 3) {
+        commands.push(
+          `${exe} --no-window --path . --export ${quoted} ${out}`
+        );
+      } else {
+        commands.push(
+          `${exe} --headless --path . --export-release ${quoted} ${out}`
+        );
+      }
+    }
   }
 
   return commands;
@@ -636,6 +948,93 @@ function blenderVerifyCommands(exe, descriptor) {
   return commands;
 }
 
+function nodeVerifyCommands(descriptor) {
+  const commands = [];
+  const pm = descriptor.packageManager || "npm";
+
+  if (descriptor.hasTestScript) {
+    // Always at the workspace root. `pnpm -r test` / per-package descent is
+    // never the default: it multiplies wall-clock by the package count and is
+    // not what a monorepo's root scripts.test is for.
+    commands.push(`${pm} test`);
+  } else if (descriptor.directTestRunner === "vitest") {
+    commands.push(pm === "npm" ? "npx vitest run" : `${pm} exec vitest run`);
+  } else if (descriptor.directTestRunner === "jest") {
+    commands.push(pm === "npm" ? "npx jest" : `${pm} exec jest`);
+  }
+
+  if (descriptor.hasTypeScript) {
+    // tsc --noEmit is the cheap typecheck; only when TypeScript is actually a
+    // dependency AND tsconfig.json exists (both gated at detection time).
+    commands.push(pm === "npm" ? "npx tsc --noEmit" : `${pm} exec tsc --noEmit`);
+  }
+
+  return commands;
+}
+
+function pythonVerifyCommands(descriptor, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const interpreter =
+    descriptor.interpreter && typeof descriptor.interpreter === "object"
+      ? descriptor.interpreter
+      : resolvePythonInterpreter(descriptor.root ?? "", {
+          existsSync: options.existsSync ?? fs.existsSync,
+          platform
+        });
+
+  const commands = [];
+
+  if (descriptor.framework === "django" && descriptor.managePy) {
+    // Order matters: `check` is seconds, `makemigrations --check` is the
+    // classic silent breakage (model changed, migration not committed), then
+    // the project's tests. DJANGO_SETTINGS_MODULE is not set here — it comes
+    // from the project config's trust-gated `env` block when present.
+    commands.push(formatPythonCommand(interpreter, [descriptor.managePy, "check"]));
+    commands.push(
+      formatPythonCommand(interpreter, [
+        descriptor.managePy,
+        "makemigrations",
+        "--check",
+        "--dry-run"
+      ])
+    );
+    if (descriptor.hasPytest) {
+      commands.push(formatPythonCommand(interpreter, ["-m", "pytest", "-q"]));
+    } else {
+      commands.push(formatPythonCommand(interpreter, [descriptor.managePy, "test"]));
+    }
+  } else if (descriptor.hasTests) {
+    commands.push(formatPythonCommand(interpreter, ["-m", "pytest", "-q"]));
+  }
+
+  // Linters only when the project configures them — emitting ruff/mypy on a
+  // repo that never opted in turns a healthy run red for style noise.
+  if (descriptor.hasRuff) {
+    if ((interpreter.prefix ?? [])[0] === "uv") {
+      commands.push("uv run ruff check .");
+    } else if ((interpreter.prefix ?? [])[0] === "poetry") {
+      commands.push("poetry run ruff check .");
+    } else if ((interpreter.prefix ?? [])[0] === "pdm") {
+      commands.push("pdm run ruff check .");
+    } else {
+      commands.push(formatPythonCommand(interpreter, ["-m", "ruff", "check", "."]));
+    }
+  }
+  if (descriptor.hasMypy) {
+    if ((interpreter.prefix ?? [])[0] === "uv") {
+      commands.push("uv run mypy .");
+    } else if ((interpreter.prefix ?? [])[0] === "poetry") {
+      commands.push("poetry run mypy .");
+    } else if ((interpreter.prefix ?? [])[0] === "pdm") {
+      commands.push("pdm run mypy .");
+    } else {
+      commands.push(formatPythonCommand(interpreter, ["-m", "mypy", "."]));
+    }
+  }
+
+  return commands;
+}
+
 /**
  * Default verify commands for a descriptor, as ready-to-run command strings.
  *
@@ -653,26 +1052,29 @@ function blenderVerifyCommands(exe, descriptor) {
  * project would be a regression, not a feature.
  *
  * @param {{id?: string}|null|undefined} descriptor
- * @param {{env?: NodeJS.ProcessEnv, platform?: string, existsSync?: typeof fs.existsSync, override?: string}} [options]
+ * @param {{
+ *   env?: NodeJS.ProcessEnv,
+ *   platform?: string,
+ *   existsSync?: typeof fs.existsSync,
+ *   override?: string,
+ *   exportSmoke?: boolean
+ * }} [options]
  * @returns {string[]}
  */
 export function defaultVerifyCommands(descriptor, options = {}) {
   if (!descriptor || typeof descriptor !== "object") {
     return [];
   }
-  const platform = options.platform ?? process.platform;
 
   switch (descriptor.id) {
     case "godot":
-      return godotVerifyCommands(resolveEcosystemBinary(descriptor, options), descriptor);
+      return godotVerifyCommands(resolveEcosystemBinary(descriptor, options), descriptor, options);
     case "blender":
       return blenderVerifyCommands(resolveEcosystemBinary(descriptor, options), descriptor);
     case "node":
-      return descriptor.hasTestScript ? ["npm test"] : [];
+      return nodeVerifyCommands(descriptor);
     case "python":
-      // `python` is the launcher name on Windows; `python3` is the one that is
-      // reliably present on POSIX, where a bare `python` is frequently absent.
-      return descriptor.hasTests ? [`${platform === "win32" ? "python" : "python3"} -m pytest -q`] : [];
+      return pythonVerifyCommands(descriptor, options);
     case "rust":
       return ["cargo test"];
     default:

@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 
+import { summarizeSceneResourceChange } from "./engine-runtime.mjs";
 import { ensureGitRepository, git, gitChecked } from "./git.mjs";
 
 /**
@@ -78,7 +79,15 @@ const GENERATED_ARTIFACT_PATTERNS = Object.freeze([
   // A directory pattern, and only a directory pattern: the project config file
   // `.grok-build.json` is a SIBLING with a longer name, it is normal tracked
   // source, and `**/.grok-build` never matches it.
-  ".grok-build/"
+  ".grok-build/",
+  // Per-run runtime plugin injection lands under `.grok/plugins/grok-build-runtime/`
+  // (provision.mjs injectRuntimePlugin). Hyper discovers project plugins from
+  // `.grok/plugins/*/`, so the pack has to live there for the agent to see it —
+  // and must NEVER be committed as the user's work. Same directory-pattern
+  // form as `.grok-build/`: the project config is `.grok-build.json` (different
+  // name), and a future user-authored `.grok/config.toml` would be a sibling
+  // of `plugins/` that we also do not want staged from a run worktree.
+  ".grok/"
 ]);
 
 /**
@@ -760,6 +769,87 @@ export function capChangedFiles(all, options = {}) {
  * @param {{maxEntries?: number, maxBytes?: number}} [options]
  * @returns {{entries: string[], total: number, truncated: boolean, error?: string}}
  */
+/**
+ * How many `.tscn`/`.tres` files get an ext_resource annotation in the
+ * changed-files manifest. Bounded deliberately: each annotation may show
+ * git show of two blob versions, and a bulk scene rewrite is not helped by
+ * a thousand-line digression inside the run record.
+ */
+const SCENE_ANNOTATION_MAX = 12;
+
+/**
+ * Annotate modified/added scene and resource files with a cheap ext_resource
+ * summary. Keeps the existing caps; annotations replace the bare path line
+ * rather than adding a second entry, so the entry count does not grow.
+ *
+ * @param {string} worktreePath
+ * @param {string} baseSha
+ * @param {string[]} entries
+ * @param {{ gitImpl?: typeof git }} [options]
+ * @returns {string[]}
+ */
+export function annotateGodotChangedFiles(worktreePath, baseSha, entries, options = {}) {
+  const gitImpl = options.gitImpl ?? git;
+  if (!Array.isArray(entries) || entries.length === 0) {
+    return entries ?? [];
+  }
+
+  let annotated = 0;
+  return entries.map((entry) => {
+    if (annotated >= SCENE_ANNOTATION_MAX) {
+      return entry;
+    }
+    const tab = entry.indexOf("\t");
+    if (tab < 0) {
+      return entry;
+    }
+    const status = entry.slice(0, tab).trim();
+    const rel = entry.slice(tab + 1).trim();
+    if (!/\.(tscn|tres)$/i.test(rel)) {
+      return entry;
+    }
+    // Only M and A carry a useful before/after; D is just a deletion.
+    if (status !== "M" && status !== "A" && !/^M/.test(status)) {
+      return entry;
+    }
+
+    let beforeText = "";
+    let afterText = "";
+    if (status === "M" || /^M/.test(status)) {
+      const before = gitImpl(worktreePath, ["show", `${baseSha}:${rel}`], {
+        maxBuffer: 512 * 1024
+      });
+      if (before.status === 0) {
+        beforeText = String(before.stdout ?? "");
+      }
+    }
+    const after = gitImpl(worktreePath, ["show", `HEAD:${rel}`], {
+      maxBuffer: 512 * 1024
+    });
+    if (after.status === 0) {
+      afterText = String(after.stdout ?? "");
+    } else {
+      // Fall back to the working tree file when HEAD:path fails (rare for a
+      // just-committed tree, but cheap insurance).
+      try {
+        afterText = fs.readFileSync(path.join(worktreePath, rel), "utf8");
+      } catch {
+        return entry;
+      }
+    }
+
+    const summary = summarizeSceneResourceChange(beforeText, afterText, rel);
+    if (!summary) {
+      // Still mark the kind so a reviewer sees "scene" rather than a bare path.
+      const kind = /\.tscn$/i.test(rel) ? "scene" : "resource";
+      annotated += 1;
+      return `${status}\t${rel} (${kind} edit)`;
+    }
+    annotated += 1;
+    return `${status}\t${rel} (${summary})`;
+  });
+}
+
 export function listCommittedChanges(worktreePath, baseSha, headSha, options = {}) {
   if (!baseSha || !headSha || baseSha === headSha) {
     return { entries: [], total: 0, truncated: false };
@@ -779,5 +869,11 @@ export function listCommittedChanges(worktreePath, baseSha, headSha, options = {
     .split(/\r?\n/)
     .map((line) => line.trimEnd())
     .filter(Boolean);
-  return capChangedFiles(all, options);
+  // Annotate before capping so a scene rewrite near the end of a large change
+  // set still has a chance to explain itself within the byte budget.
+  const annotated =
+    options.annotateGodot === false
+      ? all
+      : annotateGodotChangedFiles(worktreePath, baseSha, all, options);
+  return capChangedFiles(annotated, options);
 }

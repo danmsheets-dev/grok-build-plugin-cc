@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 
 import { detectEcosystems } from "./ecosystem.mjs";
 
@@ -54,27 +55,78 @@ export const PROVISION_COPY_PATHS = Object.freeze([
 ]);
 
 const LINK_GODOT_CACHE_ENV = "GROK_BUILD_LINK_GODOT_CACHE";
+const INJECT_RUNTIME_ENV = "GROK_BUILD_INJECT_RUNTIME";
 
 /**
  * The warning that has to reach the run header whenever `.godot` is linked.
  *
- * The README already promises that writes reach the real directories; nothing
- * said it at the moment it matters, which is when a Godot editor is open on the
- * same cache a headless verify run is about to reimport into.
+ * Concurrent Godot access clobbers `.godot/global_script_class_cache.cfg` and
+ * then produces parse errors against files git reports as unmodified — a single
+ * `--import` repairs it, but the failure is indistinguishable from real broken
+ * code. Emit this at provisioning time (progress channel) AND in the final
+ * report; "at the end only" is how a field session burned a full run fighting
+ * the editor.
  */
 export const GODOT_SHARED_CACHE_NOTE =
   ".godot is shared with your working copy; close the Godot editor before running verify.";
 
-function godotCacheIsCopied(options, env) {
+/**
+ * Resolve whether an isolated run should use a private Godot cache.
+ *
+ * Default under isolation is PRIVATE. Sharing the user's `.godot` with a
+ * headless import is the corruption vector above; a cold first import is slow
+ * but honest. Explicit opt-in still works:
+ *
+ *   - `GROK_BUILD_LINK_GODOT_CACHE=1` / `true` / `yes` → shared link
+ *   - `GROK_BUILD_LINK_GODOT_CACHE=0` / `false` / `no` → private (same as default)
+ *   - `provision.copy: true` in `.grok-build.json` → private
+ *   - `provision.copy: false` → shared
+ *   - `options.copyGodotCache` boolean from the bridge (project config) wins
+ *     over the env var when set
+ *
+ * @returns {{ private: boolean, reason: string, cacheLine: string }}
+ */
+export function resolveGodotCacheMode(options = {}, env = process.env) {
+  let privateCache;
+  let reason;
+
   if (options.copyGodotCache !== undefined) {
-    return Boolean(options.copyGodotCache);
+    privateCache = Boolean(options.copyGodotCache);
+    reason = privateCache
+      ? "provision.copy=true in project config"
+      : "provision.copy=false in project config";
+  } else {
+    const raw = env?.[LINK_GODOT_CACHE_ENV];
+    if (raw !== undefined && raw !== null && String(raw).trim() !== "") {
+      const normalized = String(raw).trim().toLowerCase();
+      if (normalized === "0" || normalized === "false" || normalized === "no") {
+        privateCache = true;
+        reason = `${LINK_GODOT_CACHE_ENV}=${String(raw).trim()}`;
+      } else if (normalized === "1" || normalized === "true" || normalized === "yes") {
+        privateCache = false;
+        reason = `${LINK_GODOT_CACHE_ENV}=${String(raw).trim()}`;
+      } else {
+        // Unrecognised value: fail safe to private rather than share.
+        privateCache = true;
+        reason = `${LINK_GODOT_CACHE_ENV} unrecognised (${String(raw).trim()}); defaulting to private`;
+      }
+    } else {
+      // Isolated-run default. planWorktreeLinks is only called for isolated
+      // write runs, so "default private" is the isolation default.
+      privateCache = true;
+      reason = "default for isolated runs";
+    }
   }
-  const raw = env?.[LINK_GODOT_CACHE_ENV];
-  if (raw === undefined || raw === null || String(raw).trim() === "") {
-    return false;
-  }
-  const normalized = String(raw).trim().toLowerCase();
-  return normalized === "0" || normalized === "false" || normalized === "no";
+
+  const cacheLine = privateCache
+    ? `Godot cache: private to this run (${reason}; first import into a cold cache is slow)`
+    : `Godot cache: shared with your working copy (${reason})`;
+
+  return { private: privateCache, reason, cacheLine };
+}
+
+function godotCacheIsCopied(options, env) {
+  return resolveGodotCacheMode(options, env).private;
 }
 
 export function planWorktreeLinks(repoRoot, worktreePath, options = {}) {
@@ -85,7 +137,8 @@ export function planWorktreeLinks(repoRoot, worktreePath, options = {}) {
   // be the real environment rather than an empty object.
   const env = options.env ?? process.env;
   const kind = platform === "win32" ? "junction" : "symlink";
-  const copyGodotCache = godotCacheIsCopied(options, env);
+  const cacheMode = resolveGodotCacheMode(options, env);
+  const copyGodotCache = cacheMode.private;
 
   const root = path.resolve(String(repoRoot ?? ""));
   const wt = path.resolve(String(worktreePath ?? ""));
@@ -95,10 +148,11 @@ export function planWorktreeLinks(repoRoot, worktreePath, options = {}) {
 
   if (!repoRoot || !worktreePath) {
     notes.push("planWorktreeLinks: repoRoot and worktreePath are required");
-    return { links, notes };
+    return { links, notes, godotCache: cacheMode };
   }
 
   let linkedGodotCache = false;
+  let sawGodotCacheSource = false;
 
   for (const name of PROVISION_LINK_DIRS) {
     const from = path.join(root, name);
@@ -121,6 +175,10 @@ export function planWorktreeLinks(repoRoot, worktreePath, options = {}) {
       continue;
     }
 
+    if (GODOT_CACHE_DIRS.includes(name)) {
+      sawGodotCacheSource = true;
+    }
+
     if (copyGodotCache && GODOT_CACHE_DIRS.includes(name)) {
       // No entry in `links` for the directory itself. A `kind` provisionWorktree
       // does not recognise lands in its `unknown kind:` failure branch and would
@@ -135,7 +193,7 @@ export function planWorktreeLinks(repoRoot, worktreePath, options = {}) {
     }
   }
 
-  if (copyGodotCache) {
+  if (copyGodotCache && sawGodotCacheSource) {
     const copied = [];
     for (const relativePath of PROVISION_COPY_PATHS) {
       const segments = relativePath.split("/");
@@ -147,16 +205,20 @@ export function planWorktreeLinks(repoRoot, worktreePath, options = {}) {
       links.push({ from, to, kind: "copy" });
       copied.push(relativePath);
     }
+    // Visible, single-line choice. The cold-import warning is part of the same
+    // sentence so wall-clock on the first verify is explained up front.
+    notes.push(cacheMode.cacheLine);
     notes.push(
       copied.length > 0
-        ? `Godot import cache is copied, not shared (${LINK_GODOT_CACHE_ENV}=0): seeded ${copied.join(", ")}. The first verify may re-import assets.`
-        : `Godot import cache is copied, not shared (${LINK_GODOT_CACHE_ENV}=0): nothing to seed, so the first verify runs a cold import.`
+        ? `Godot import cache seeded (not shared): ${copied.join(", ")}. Shared-cache lock skipped (private to this run).`
+        : "Godot import cache is empty in the worktree; first verify runs a cold import. Shared-cache lock skipped (private to this run)."
     );
   } else if (linkedGodotCache) {
+    notes.push(cacheMode.cacheLine);
     notes.push(GODOT_SHARED_CACHE_NOTE);
   }
 
-  return { links, notes };
+  return { links, notes, godotCache: cacheMode };
 }
 
 /**
@@ -184,6 +246,44 @@ export const BLENDER_SANDBOX_ENABLE_NOTE =
   "a sandboxed add-on is auto-enabled in neither startup mode - the test script must call addon_utils.enable(\"<module>\", default_set=False, persistent=True).";
 
 /**
+ * Whether an isolated write run should auto-enable the Blender sandbox.
+ *
+ * Default ON for a detected add-on/extension under isolation: without it the
+ * headless verify loads the add-on from the user's real scripts/addons symlink
+ * and exercises pre-agent code. Still skip for bare `.blend` projects (no
+ * module to link). `--no-blender-sandbox` is the escape hatch; `--blender-sandbox`
+ * remains the explicit opt-in for older call paths.
+ *
+ * @param {{ id?: string, isAddon?: boolean, manifestPath?: string|null, addonInitPath?: string|null }|null|undefined} descriptor
+ * @param {{ isolate?: boolean, write?: boolean, explicit?: boolean|null, noSandbox?: boolean }} [flags]
+ */
+export function shouldAutoBlenderSandbox(descriptor, flags = {}) {
+  if (flags.noSandbox) {
+    return false;
+  }
+  if (flags.explicit === true) {
+    return true;
+  }
+  if (flags.explicit === false) {
+    return false;
+  }
+  if (!flags.isolate || !flags.write) {
+    return false;
+  }
+  if (!descriptor || descriptor.id !== "blender") {
+    return false;
+  }
+  // Prefer the explicit isAddon flag; fall back to the path fields for older
+  // descriptors serialised without it.
+  if (descriptor.isAddon === false) {
+    return false;
+  }
+  return Boolean(
+    descriptor.isAddon || descriptor.manifestPath || descriptor.addonInitPath
+  );
+}
+
+/**
  * Plan an in-worktree Blender add-on scripts directory.
  *
  * The standard Blender add-on workflow symlinks the per-user
@@ -194,9 +294,9 @@ export const BLENDER_SANDBOX_ENABLE_NOTE =
  * directory"; the only lever is the BLENDER_USER_* environment, which is why
  * this returns an `env` rather than command arguments (see item 25's --env).
  *
- * Deliberately opt-in (`--blender-sandbox`). Applying it automatically would
- * hide every OTHER add-on the user's verify script depends on and turn working
- * verify commands red.
+ * Auto-enabled for isolated write runs on a detected add-on/extension
+ * (`shouldAutoBlenderSandbox`). `--no-blender-sandbox` opts out; a failed link
+ * still refuses to claim the sandbox env (see the bridge).
  *
  * Only BLENDER_USER_SCRIPTS and BLENDER_USER_EXTENSIONS are set.
  * BLENDER_USER_CONFIG is deliberately NOT set: Cycles' GPU device selection and
@@ -395,4 +495,184 @@ export function provisionWorktree(plan, options = {}) {
     failed,
     notes: godotLinked ? notes : notes.filter((note) => note !== GODOT_SHARED_CACHE_NOTE)
   };
+}
+
+// Runtime capability packs shipped with the plugin and injected into an
+// isolated worktree so the agent (not just the bridge) knows Godot/Blender
+// facts that otherwise only live in this repo's comments.
+//
+// Hyper discovers project plugins under .grok/plugins/<name>/ (see
+// xai-grok-agent plugins/discovery.rs). Layout is a normal project plugin:
+// plugin.json + skills/ (+ agents/ when needed). Never create .mcp.json
+// here — nested-delegation owns that file.
+//
+// Line comments on purpose: a block comment cannot mention the path pattern
+// ".grok/plugins/*/" because the "/*" sequence would close the comment early.
+export const RUNTIME_PLUGIN_DIRNAME = "grok-build-runtime";
+export const RUNTIME_PLUGIN_RELATIVE = ".grok/plugins/" + RUNTIME_PLUGIN_DIRNAME;
+
+/** Map ecosystem id → skill directory names under runtime-plugin/skills/. */
+export const RUNTIME_SKILL_PACKS = Object.freeze({
+  godot: Object.freeze(["godot-engine"]),
+  blender: Object.freeze(["blender-addon"]),
+  python: Object.freeze(["python-django"]),
+  node: Object.freeze(["node-workspace"]),
+  rust: Object.freeze(["rust-cargo"])
+});
+
+/**
+ * Absolute path of the shipped runtime-plugin templates.
+ *
+ * @param {{ pluginRoot?: string }} [options]
+ */
+export function resolveRuntimePluginSource(options = {}) {
+  if (options.pluginRoot) {
+    return path.join(options.pluginRoot, "runtime-plugin");
+  }
+  // provision.mjs lives at plugins/grok-build/scripts/lib/ — two levels up is
+  // the plugin root. Tests inject pluginRoot / sourceDir rather than relying
+  // on this default.
+  return path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "runtime-plugin");
+}
+
+function runtimeInjectionEnabled(env) {
+  const raw = env?.[INJECT_RUNTIME_ENV];
+  if (raw === undefined || raw === null || String(raw).trim() === "") {
+    return true;
+  }
+  const normalized = String(raw).trim().toLowerCase();
+  return !(normalized === "0" || normalized === "false" || normalized === "no");
+}
+
+/**
+ * Copy (never link) the ecosystem-relevant runtime skills into the worktree.
+ *
+ * Linking would make agent edits to the injected skill write back into the
+ * plugin install; copy keeps the pack a pure run artefact, and `.grok/` is
+ * excluded from the commit (worktree.mjs GENERATED_ARTIFACT_PATTERNS) so it
+ * never becomes the user's work.
+ *
+ * @param {string} worktreePath
+ * @param {string[]|string|null} ecosystemIds
+ * @param {{
+ *   env?: NodeJS.ProcessEnv,
+ *   pluginRoot?: string,
+ *   sourceDir?: string,
+ *   existsSync?: typeof fs.existsSync,
+ *   mkdirSync?: typeof fs.mkdirSync,
+ *   readdirSync?: typeof fs.readdirSync,
+ *   statSync?: typeof fs.statSync,
+ *   copyFileSync?: typeof fs.copyFileSync,
+ *   writeFileSync?: typeof fs.writeFileSync,
+ *   readFileSync?: typeof fs.readFileSync
+ * }} [options]
+ * @returns {{ injected: boolean, packs: string[], target: string|null, notes: string[] }}
+ */
+export function injectRuntimePlugin(worktreePath, ecosystemIds, options = {}) {
+  const env = options.env ?? process.env;
+  const notes = [];
+
+  if (!runtimeInjectionEnabled(env)) {
+    return {
+      injected: false,
+      packs: [],
+      target: null,
+      notes: [`Runtime plugin: disabled (${INJECT_RUNTIME_ENV}=0)`]
+    };
+  }
+
+  if (!worktreePath) {
+    return { injected: false, packs: [], target: null, notes: ["Runtime plugin: no worktree"] };
+  }
+
+  const ids = (Array.isArray(ecosystemIds) ? ecosystemIds : [ecosystemIds])
+    .map((id) => String(id ?? "").trim().toLowerCase())
+    .filter(Boolean);
+  const packs = [];
+  for (const id of ids) {
+    for (const pack of RUNTIME_SKILL_PACKS[id] ?? []) {
+      if (!packs.includes(pack)) {
+        packs.push(pack);
+      }
+    }
+  }
+  // Always include a tiny core skill so the agent knows the pack exists even
+  // when detection returned nothing useful.
+  if (!packs.includes("runtime-core")) {
+    packs.unshift("runtime-core");
+  }
+
+  const existsSync = options.existsSync ?? fs.existsSync;
+  const mkdirSync = options.mkdirSync ?? fs.mkdirSync;
+  const readdirSync = options.readdirSync ?? fs.readdirSync;
+  const statSync = options.statSync ?? fs.statSync;
+  const copyFileSync = options.copyFileSync ?? fs.copyFileSync;
+  const writeFileSync = options.writeFileSync ?? fs.writeFileSync;
+  const readFileSync = options.readFileSync ?? fs.readFileSync;
+
+  const source = path.resolve(
+    options.sourceDir ?? resolveRuntimePluginSource({ pluginRoot: options.pluginRoot })
+  );
+
+  if (!existsSync(source)) {
+    notes.push(`Runtime plugin: source missing at ${source}`);
+    return { injected: false, packs, target: null, notes };
+  }
+
+  const target = path.join(path.resolve(String(worktreePath)), ...RUNTIME_PLUGIN_RELATIVE.split("/"));
+  const io = { existsSync, mkdirSync, readdirSync, statSync, copyFileSync };
+
+  try {
+    mkdirSync(target, { recursive: true });
+    // Manifest first so discovery sees a complete plugin even if a later skill
+    // copy fails mid-way.
+    const manifestSrc = path.join(source, "plugin.json");
+    if (existsSync(manifestSrc)) {
+      copyFileSync(manifestSrc, path.join(target, "plugin.json"));
+    } else {
+      writeFileSync(
+        path.join(target, "plugin.json"),
+        JSON.stringify(
+          {
+            name: RUNTIME_PLUGIN_DIRNAME,
+            version: "0.1.0",
+            description: "Per-run ecosystem capability pack injected by grok-build."
+          },
+          null,
+          2
+        ),
+        "utf8"
+      );
+    }
+
+    const skillsSrc = path.join(source, "skills");
+    const skillsDst = path.join(target, "skills");
+    mkdirSync(skillsDst, { recursive: true });
+
+    for (const pack of packs) {
+      const from = path.join(skillsSrc, pack);
+      if (!existsSync(from)) {
+        notes.push(`Runtime plugin: pack "${pack}" not found in source, skipped`);
+        continue;
+      }
+      copyPathSync(from, path.join(skillsDst, pack), io);
+    }
+
+    // agents/ is optional; copy whole tree when present.
+    const agentsSrc = path.join(source, "agents");
+    if (existsSync(agentsSrc)) {
+      copyPathSync(agentsSrc, path.join(target, "agents"), io);
+    }
+  } catch (error) {
+    notes.push(
+      `Runtime plugin: injection failed (${error instanceof Error ? error.message : String(error)})`
+    );
+    return { injected: false, packs, target: null, notes };
+  }
+
+  notes.push(`Runtime plugin: injected capability pack(s) [${packs.join(", ")}] into ${RUNTIME_PLUGIN_RELATIVE}`);
+  // Silence unused readFileSync when no future caller needs it; kept in the
+  // options surface for symmetry with other injectable helpers.
+  void readFileSync;
+  return { injected: true, packs, target, notes };
 }

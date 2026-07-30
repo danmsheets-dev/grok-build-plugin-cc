@@ -1,0 +1,5 @@
+{
+  "name": "grok-build-runtime",
+  "version": "0.1.0",
+  "description": "Per-run ecosystem capability pack injected by grok-build into isolated worktrees. Not user source — never commit."
+}

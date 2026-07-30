@@ -1,6 +1,6 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up work to the Grok Build delegate subagent
-argument-hint: "[--background|--wait|--foreground] [--resume|--fresh] [--model <model>] [--effort <low|medium|high>] [--verify <cmd>] [--no-verify] [--env KEY=VALUE] [--blender-sandbox] [--no-isolate] [--max-duration <s>] [what Grok should investigate, solve, or continue]"
+argument-hint: "[--background|--wait|--foreground] [--resume|--fresh] [--model <model>] [--effort <low|medium|high>] [--verify <cmd>] [--no-verify] [--env KEY=VALUE] [--blender-sandbox|--no-blender-sandbox] [--godot-export-smoke] [--no-isolate] [--max-duration <s>] [what Grok should investigate, solve, or continue]"
 allowed-tools: Bash(node:*), AskUserQuestion, Agent
 ---
 
@@ -23,7 +23,7 @@ Execution mode:
 - `--background`, `--wait`, and `--foreground` are execution flags for Claude Code. Do not forward them to `run`, and do not treat them as part of the natural-language task text.
 - `--model` and `--effort` are runtime-selection flags. Preserve them for the forwarded `run` call, but do not treat them as part of the natural-language task text.
 - **Passthrough flags.** The user may type any of the following directly into `/grok-build:delegate`. Forward each one **verbatim** to the `run` invocation the subagent builds, and strip it out of the natural-language task text exactly like `--model`/`--effort` are already stripped — never fold one of these into prose:
-  `--verify` (repeatable — forward every occurrence), `--verify-attempts`, `--verify-ignore` (repeatable), `--verify-timeout`, `--baseline-timeout`, `--verify-max-buffer`, `--no-verify`, `--no-verify-baseline`, `--env` (repeatable), `--blender-sandbox`, `--no-isolate`, `--max-duration`, `--max-turns`, `--max-cost`. `--prompt-file` is deliberately **not** in this list: it is the subagent's own mechanism for delivering the task text (see below), not a flag a user types.
+  `--verify` (repeatable — forward every occurrence), `--verify-attempts`, `--verify-ignore` (repeatable), `--verify-timeout`, `--baseline-timeout`, `--verify-max-buffer`, `--no-verify`, `--no-verify-baseline`, `--env` (repeatable), `--blender-sandbox`, `--no-blender-sandbox`, `--godot-export-smoke`, `--no-isolate`, `--max-duration`, `--max-turns`, `--max-cost`. `--prompt-file` is deliberately **not** in this list: it is the subagent's own mechanism for delivering the task text (see below), not a flag a user types.
 - If the request includes `--resume`, do not ask whether to continue. The user already chose.
 - If the request includes `--fresh`, do not ask whether to continue. The user already chose.
 - Otherwise, before starting Grok, check for a resumable delegate thread from this Claude session by running:

@@ -224,23 +224,29 @@ test("detection degrades to no ecosystem when the filesystem throws", () => {
 
 test("defaultVerifyCommands for Godot 4 with GUT imports and runs gut_cmdln", () => {
   const commands = defaultVerifyCommands(
-    { id: "godot", major: 4, testRunner: "gut" },
+    { id: "godot", major: 4, testRunner: "gut", supportsCheckOnly: true },
     { env: {}, platform: "linux" }
   );
+  assert.ok(commands.some((command) => command.includes("--check-only")), commands.join("\n"));
   assert.ok(commands.some((command) => command.includes("--import")), commands.join("\n"));
   assert.ok(
     commands.some((command) => command.includes("gut_cmdln.gd -gexit")),
     commands.join("\n")
   );
   assert.ok(commands.every((command) => command.startsWith("godot ")));
+  // --check-only must precede the slow import so a parse error fails in seconds.
+  const checkIdx = commands.findIndex((command) => command.includes("--check-only"));
+  const importIdx = commands.findIndex((command) => command.includes("--import"));
+  assert.ok(checkIdx >= 0 && importIdx > checkIdx, commands.join("\n"));
 });
 
-test("defaultVerifyCommands for Godot 3 uses --no-window and never --quit-after", () => {
+test("defaultVerifyCommands for Godot 3 uses --no-window and never --check-only or --quit-after", () => {
   const commands = defaultVerifyCommands(
-    { id: "godot", major: 3, testRunner: "gut" },
+    { id: "godot", major: 3, testRunner: "gut", supportsCheckOnly: false },
     { env: {}, platform: "linux" }
   );
   assert.ok(commands.every((command) => command.includes("--no-window")), commands.join("\n"));
+  assert.ok(commands.every((command) => !command.includes("--check-only")), commands.join("\n"));
   assert.ok(commands.every((command) => !command.includes("--quit-after")), commands.join("\n"));
   assert.ok(commands.some((command) => command.includes("gut_cmdln.gd -gexit")));
 });
@@ -460,12 +466,20 @@ test("win32 keeps the GUI exe when no console build sits next to it", () => {
 });
 
 test("python defaults use python3 off win32 and only when there is something to run", () => {
-  assert.deepEqual(defaultVerifyCommands({ id: "python", hasTests: true }, { platform: "linux", env: {} }), [
-    "python3 -m pytest -q"
-  ]);
-  assert.deepEqual(defaultVerifyCommands({ id: "python", hasTests: true }, { platform: "win32", env: {} }), [
-    "python -m pytest -q"
-  ]);
+  assert.deepEqual(
+    defaultVerifyCommands(
+      { id: "python", hasTests: true, interpreter: { kind: "system", python: "python3", prefix: [] } },
+      { platform: "linux", env: {} }
+    ),
+    ["python3 -m pytest -q"]
+  );
+  assert.deepEqual(
+    defaultVerifyCommands(
+      { id: "python", hasTests: true, interpreter: { kind: "system", python: "python", prefix: [] } },
+      { platform: "win32", env: {} }
+    ),
+    ["python -m pytest -q"]
+  );
   assert.deepEqual(defaultVerifyCommands({ id: "python", hasTests: false }, { platform: "linux", env: {} }), []);
 });
 

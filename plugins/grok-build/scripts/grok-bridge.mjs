@@ -55,8 +55,17 @@ import {
 import {
   defaultVerifyCommands,
   detectEcosystems,
-  detectPrimaryEcosystem
+  detectPrimaryEcosystem,
+  resolveEcosystemBinary
 } from "./lib/ecosystem.mjs";
+import {
+  acquireGodotCacheLock,
+  blenderVersionGuardNote,
+  checkUidIntegrity,
+  detectBlendLocks,
+  parseBlenderVersionOutput,
+  snapshotUidFiles
+} from "./lib/engine-runtime.mjs";
 import { binaryAvailable, runCommand, terminateProcessTree } from "./lib/process.mjs";
 import {
   describeVerifySource,
@@ -69,9 +78,12 @@ import {
 } from "./lib/project-config.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
+  GODOT_CACHE_DIRS,
+  injectRuntimePlugin,
   planBlenderScriptSandbox,
   planWorktreeLinks,
-  provisionWorktree
+  provisionWorktree,
+  shouldAutoBlenderSandbox
 } from "./lib/provision.mjs";
 import {
   claimJobTerminal,
@@ -190,7 +202,7 @@ function printUsage() {
       "      [--model <model>] [--effort <low|medium|high>] [--caller <id>]",
       "      [--verify <command>]... [--verify-attempts <n>] [--verify-timeout <seconds>] [--baseline-timeout <seconds>]",
       "      [--verify-max-buffer <megabytes>] [--verify-ignore <regex>]... [--no-verify] [--no-verify-baseline]",
-      "      [--env KEY=VALUE]... [--blender-sandbox]",
+      "      [--env KEY=VALUE]... [--blender-sandbox|--no-blender-sandbox] [--godot-export-smoke]",
       "      [--max-duration <seconds>] [--max-turns <n>] [--max-cost <usd>]",
       "      [--prompt-file <path>] [--cwd|-C <dir>] [--json] [prompt]",
       "    Verify commands run in THE BRIDGE, never the agent, so a run cannot claim success without",
@@ -313,7 +325,11 @@ function resolveProjectRunPlan(workspaceRoot, cli = {}) {
   // config file is trusted; loadWorkspaceProjectConfig has already withheld it
   // otherwise.
   const toolOverride = ecosystem ? projectConfig.config.tools?.[ecosystem.id] : undefined;
-  const ecosystemVerify = defaultVerifyCommands(ecosystem, { override: toolOverride });
+  const exportSmoke = Boolean(cli.exportSmoke ?? projectConfig.config.exportSmoke);
+  const ecosystemVerify = defaultVerifyCommands(ecosystem, {
+    override: toolOverride,
+    exportSmoke
+  });
 
   const settings = resolveRunSettings({
     cli,
@@ -321,7 +337,7 @@ function resolveProjectRunPlan(workspaceRoot, cli = {}) {
     ecosystemDefaults: { verify: ecosystemVerify }
   });
 
-  return { projectConfig, ecosystem, settings };
+  return { projectConfig, ecosystem, settings, exportSmoke };
 }
 
 /**
@@ -2674,6 +2690,34 @@ async function executeTaskRun(request) {
   let provisionSummary = null;
   /** @type {Record<string, string>|null} */
   let blenderSandboxEnv = null;
+  /** @type {{ private: boolean, reason: string, cacheLine: string }|null} */
+  let godotCacheMode = null;
+  /** Shared-cache path for the cross-process import lock; null when private. */
+  let sharedGodotCachePath = null;
+  /** @type {Map<string, string>|null} */
+  let uidSnapshotBefore = null;
+  /** @type {{ ok: boolean, notes: string[] }|null} */
+  let uidIntegrity = null;
+  /** @type {string|null} */
+  let blenderVersionNote = null;
+  /** @type {string[]|null} */
+  let runtimePluginPacks = null;
+
+  // Re-detect in the workspace root (not the worktree) so sandbox/auto-inject
+  // decisions match the plan handleTask already resolved. Cheap and pure.
+  const runEcosystem =
+    verifyPlan?.ecosystem != null
+      ? detectEcosystems(workspaceRoot).find((entry) => entry.id === verifyPlan.ecosystem) ??
+        detectPrimaryEcosystem(workspaceRoot)
+      : detectPrimaryEcosystem(workspaceRoot);
+
+  const wantBlenderSandbox = shouldAutoBlenderSandbox(runEcosystem, {
+    isolate,
+    write,
+    explicit: request.blenderSandbox ? true : request.noBlenderSandbox ? false : null,
+    noSandbox: Boolean(request.noBlenderSandbox)
+  });
+
   if (isolate && write) {
     created = createWorktree({ cwd: workspaceRoot, runId: request.jobId });
     // Persist worktree descriptor immediately so cancel/crash cannot orphan it
@@ -2689,16 +2733,39 @@ async function executeTaskRun(request) {
     }
     const plan = planWorktreeLinks(created.repoRoot, created.worktreePath, {
       // Only ever true/false when the project config said so; undefined lets
-      // GROK_BUILD_LINK_GODOT_CACHE decide, which is the documented default
-      // path and the one a background worker inherits through its environment.
+      // resolveGodotCacheMode fall through to env / the isolated private default.
       copyGodotCache: request.provisionCopy
     });
+    godotCacheMode = plan.godotCache ?? null;
     // The result used to be discarded outright, so a link that failed - the
     // commonest being a `.godot` that is tracked in git and therefore already
     // checked out into the worktree - was invisible, and the run just got
     // mysteriously slower.
     provisionSummary = summarizeProvisionResult(provisionWorktree(plan));
-    if (request.blenderSandbox) {
+
+    // Progress channel FIRST — the shared-cache warning must reach the user
+    // before a long agent turn, not only in the final report after a corrupted
+    // import has already burned the run.
+    for (const note of provisionSummary.notes ?? []) {
+      request.onProgress?.({
+        phase: "starting",
+        message: `Provisioning: ${note}`
+      });
+    }
+
+    if (godotCacheMode && !godotCacheMode.private) {
+      // Shared with the main checkout: lock around engine access. The linked
+      // path in the worktree is a junction/symlink to the real cache.
+      for (const name of GODOT_CACHE_DIRS) {
+        const candidate = path.join(created.repoRoot, name);
+        if (fs.existsSync(candidate)) {
+          sharedGodotCachePath = candidate;
+          break;
+        }
+      }
+    }
+
+    if (wantBlenderSandbox) {
       // Inside the worktree, so unlinkReparsePointsSync already tears the
       // junction down with the rest of the run, and `.grok-build/` is excluded
       // from the commit so the linked add-on cannot be committed twice.
@@ -2711,6 +2778,9 @@ async function executeTaskRun(request) {
         failed: [...provisionSummary.failed, ...sandboxResult.failed],
         notes: [...provisionSummary.notes, ...sandboxResult.notes]
       };
+      for (const note of sandboxResult.notes ?? []) {
+        request.onProgress?.({ phase: "starting", message: `Provisioning: ${note}` });
+      }
       // Only claim the sandbox when the link actually landed. Setting
       // BLENDER_USER_SCRIPTS at an add-on directory that does not exist is
       // strictly worse than not sandboxing at all: Blender would then find NO
@@ -2724,13 +2794,44 @@ async function executeTaskRun(request) {
         );
       }
     }
+
+    // Inject ecosystem skills into the worktree so the agent (not only the
+    // bridge) sees Godot/Blender facts. Copy, never link; `.grok/` is excluded
+    // from the commit.
+    const ecosystemIds = detectEcosystems(created.worktreePath).map((entry) => entry.id);
+    if (ecosystemIds.length === 0 && runEcosystem?.id) {
+      ecosystemIds.push(runEcosystem.id);
+    }
+    const injected = injectRuntimePlugin(created.worktreePath, ecosystemIds, {
+      pluginRoot: ROOT_DIR
+    });
+    runtimePluginPacks = injected.packs;
+    provisionSummary = {
+      ...provisionSummary,
+      notes: [...provisionSummary.notes, ...injected.notes],
+      runtimePlugin: {
+        injected: injected.injected,
+        packs: injected.packs,
+        target: injected.target
+      }
+    };
+    for (const note of injected.notes) {
+      request.onProgress?.({ phase: "starting", message: note });
+    }
+
+    // Snapshot *.uid before the agent so a regenerated companion is reported
+    // as the silent reference-break it is.
+    if (runEcosystem?.id === "godot" || ecosystemIds.includes("godot")) {
+      uidSnapshotBefore = snapshotUidFiles(created.worktreePath);
+    }
+
     // A SECOND patch: the one above fires before planning even starts, so the
     // summary has nowhere to attach there.
     if (request.jobId) {
       patchJobIfActive(workspaceRoot, request.jobId, { provision: provisionSummary });
     }
     runCwd = created.worktreePath;
-  } else if (request.blenderSandbox) {
+  } else if (wantBlenderSandbox || request.blenderSandbox) {
     // The sandbox lives inside a worktree and is torn down with it. Building one
     // in the user's real checkout would leave a junction behind in their
     // repository, which nothing cleans up.
@@ -2747,6 +2848,51 @@ async function executeTaskRun(request) {
   // wins: a user who typed BLENDER_USER_SCRIPTS themselves gets the value they
   // typed.
   const runEnv = buildRunEnvironment({ ...(blenderSandboxEnv ?? {}), ...envOverrides });
+
+  // Blender pre-flight: locked .blend files and version_min vs binary.
+  if (runEcosystem?.id === "blender" && verifyCommands.length > 0) {
+    const blendLock = detectBlendLocks(runCwd);
+    if (blendLock.locked && blendLock.note) {
+      provisionSummary = provisionSummary ?? { provisioned: [], failed: [], notes: [] };
+      provisionSummary.notes.push(blendLock.note);
+      request.onProgress?.({ phase: "verifying", message: blendLock.note });
+    }
+
+    const blenderExe = resolveEcosystemBinary(runEcosystem, {
+      env: runEnv,
+      override: undefined
+    });
+    // Version probe is best-effort and bounded. Failure here must not abort
+    // the run — doctor already covers a missing binary.
+    try {
+      const versionResult = runCommand(
+        process.platform === "win32" ? process.env.ComSpec || "cmd.exe" : "/bin/sh",
+        process.platform === "win32"
+          ? ["/d", "/s", "/c", `"${blenderExe} --background --version"`]
+          : ["-c", `${blenderExe} --background --version`],
+        {
+          cwd: runCwd,
+          env: runEnv,
+          timeout: 20_000,
+          windowsVerbatimArguments: process.platform === "win32" ? true : undefined
+        }
+      );
+      const versionText = `${versionResult.stdout ?? ""}\n${versionResult.stderr ?? ""}`;
+      const parsed = parseBlenderVersionOutput(versionText);
+      if (parsed) {
+        blenderVersionNote = `Blender version: ${parsed.raw}`;
+        request.onProgress?.({ phase: "verifying", message: blenderVersionNote });
+        const guard = blenderVersionGuardNote(parsed, runEcosystem.blenderVersionMin);
+        if (guard) {
+          provisionSummary = provisionSummary ?? { provisioned: [], failed: [], notes: [] };
+          provisionSummary.notes.push(guard);
+          request.onProgress?.({ phase: "verifying", message: guard });
+        }
+      }
+    } catch {
+      // Probe failure is non-fatal.
+    }
+  }
 
   /** @type {Awaited<ReturnType<typeof probeBaselines>>} */
   let baselines = [];
@@ -2822,23 +2968,35 @@ async function executeTaskRun(request) {
     // long got recorded as an empty baseline signature - and every one of
     // its real, pre-existing failures then looked "new" once the agent's
     // run finished, blaming it for something it never touched.
-    baselines = await probeBaselines(verifyCommands, runCwd, {
-      timeoutMs: baselineTimeoutMs,
-      // Same environment the post-agent pass gets, for the same reason as the
-      // output budget below: a baseline measured without the run's overrides
-      // can be running a different binary, and every difference it then finds
-      // is attributed to the agent.
-      env: runEnv,
-      // Must match what the post-agent pass gets: a baseline captured under a
-      // tighter output budget records a shorter signature, and every failure
-      // the fuller capture then finds looks new. Same reasoning for the
-      // pattern sets - a baseline measured WITHOUT the exit-0 output patterns
-      // would record a Godot project that was already printing SCRIPT ERROR as
-      // passing, and blame the agent for it the moment the real pass ran.
-      maxOutputBytes: verifyTiming.maxOutputBytes ?? undefined,
-      outputFailurePatterns,
-      ignorePatterns: verifyIgnorePatterns
-    });
+    // Shared-cache lock also covers the baseline probe: it runs the same
+    // import commands and is just as capable of clobbering a concurrent run.
+    let baselineLock = null;
+    if (sharedGodotCachePath && verifyCommands.some((command) => /\bgodot\b/i.test(command))) {
+      baselineLock = await acquireGodotCacheLock(sharedGodotCachePath, {
+        onWaiting: (message) => request.onProgress?.({ phase: "verifying", message })
+      });
+    }
+    try {
+      baselines = await probeBaselines(verifyCommands, runCwd, {
+        timeoutMs: baselineTimeoutMs,
+        // Same environment the post-agent pass gets, for the same reason as the
+        // output budget below: a baseline measured without the run's overrides
+        // can be running a different binary, and every difference it then finds
+        // is attributed to the agent.
+        env: runEnv,
+        // Must match what the post-agent pass gets: a baseline captured under a
+        // tighter output budget records a shorter signature, and every failure
+        // the fuller capture then finds looks new. Same reasoning for the
+        // pattern sets - a baseline measured WITHOUT the exit-0 output patterns
+        // would record a Godot project that was already printing SCRIPT ERROR as
+        // passing, and blame the agent for it the moment the real pass ran.
+        maxOutputBytes: verifyTiming.maxOutputBytes ?? undefined,
+        outputFailurePatterns,
+        ignorePatterns: verifyIgnorePatterns
+      });
+    } finally {
+      baselineLock?.release();
+    }
     baselineProbeMs = Date.now() - probeStarted;
     request.onProgress?.({
       phase: "verifying",
@@ -3060,18 +3218,32 @@ async function executeTaskRun(request) {
           message: `Verify attempt ${attempt + 1}/${verifyAttempts + 1}: ${command}`
         });
         const commandStarted = Date.now();
-        const outcome = await runVerifyCommand(command, runCwd, {
-          env: runEnv,
-          timeoutMs,
-          maxOutputBytes: verifyTiming.maxOutputBytes ?? undefined,
-          outputFailurePatterns,
-          // Must mirror the baseline probe above: passing this to
-          // summarizeFailures alone (as shipped) left detectOutputFailures
-          // ungated, so an "ignored" line still set outcome.ok:false and then
-          // produced an empty, incomparable signature - a diagnosis strictly
-          // worse than not ignoring the line at all.
-          ignorePatterns: verifyIgnorePatterns
-        });
+        // Shared Godot cache: hold the cross-process lock for the whole command
+        // so two concurrent grok-build imports cannot clobber
+        // global_script_class_cache.cfg. Private caches skip the lock entirely.
+        let godotLock = null;
+        if (sharedGodotCachePath && /\bgodot\b/i.test(command)) {
+          godotLock = await acquireGodotCacheLock(sharedGodotCachePath, {
+            onWaiting: (message) => request.onProgress?.({ phase: "verifying", message })
+          });
+        }
+        let outcome;
+        try {
+          outcome = await runVerifyCommand(command, runCwd, {
+            env: runEnv,
+            timeoutMs,
+            maxOutputBytes: verifyTiming.maxOutputBytes ?? undefined,
+            outputFailurePatterns,
+            // Must mirror the baseline probe above: passing this to
+            // summarizeFailures alone (as shipped) left detectOutputFailures
+            // ungated, so an "ignored" line still set outcome.ok:false and then
+            // produced an empty, incomparable signature - a diagnosis strictly
+            // worse than not ignoring the line at all.
+            ignorePatterns: verifyIgnorePatterns
+          });
+        } finally {
+          godotLock?.release();
+        }
         const commandMs = Date.now() - commandStarted;
         request.onProgress?.({
           phase: "verifying",
@@ -3275,9 +3447,23 @@ async function executeTaskRun(request) {
         isolationBreached = true;
         isolationLeak = capChangedFiles(leaked);
         request.onProgress?.({
-          message: `Isolation BREACHED: ${isolationLeak.total} path(s) dirty in the main checkout (work is in the wrong tree).`,
+          message: `Isolation BREACHED: ${isolationLeak.total} path(s) changed in the main checkout during this run (agent escape, or a concurrent edit of your own).`,
           phase: "finalizing"
         });
+      }
+    }
+  }
+
+  if (created && uidSnapshotBefore) {
+    // Post-run .uid integrity: deleted/rewritten companions or dangling
+    // uid:// refs. Prominence matters — this is the most damaging silent
+    // Godot failure and looks like a normal file change in the manifest.
+    uidIntegrity = checkUidIntegrity(uidSnapshotBefore, created.worktreePath);
+    if (!uidIntegrity.ok) {
+      for (const note of uidIntegrity.notes) {
+        request.onProgress?.({ phase: "finalizing", message: note });
+        provisionSummary = provisionSummary ?? { provisioned: [], failed: [], notes: [] };
+        provisionSummary.notes.push(note);
       }
     }
   }
@@ -3482,6 +3668,8 @@ async function executeTaskRun(request) {
           verifyTrustCommand: TRUST_CONFIG_COMMAND,
           baselineProbeMs,
           baselineProbeCommands: baselines.length,
+          blenderVersion: blenderVersionNote,
+          runtimePlugin: runtimePluginPacks ? { packs: runtimePluginPacks } : null,
           worktree,
           provision: provisionSummary,
           budgetStopped
@@ -3516,7 +3704,23 @@ async function executeTaskRun(request) {
       source: verifyTiming.timeoutMs != null ? "explicit" : "derived",
       sources: verifyTiming.sources
     },
-    results: verifyResults
+    results: verifyResults,
+    // Blender binary the verify actually ran against (when probed).
+    blenderVersion: blenderVersionNote,
+    // Isolated Godot: .uid integrity after the agent finished.
+    uidIntegrity: uidIntegrity
+      ? {
+          ok: uidIntegrity.ok,
+          deleted: uidIntegrity.deleted,
+          rewritten: uidIntegrity.rewritten,
+          danglingRefs: uidIntegrity.danglingRefs,
+          notes: uidIntegrity.notes
+        }
+      : null,
+    // Which capability pack was copied into the worktree for the agent.
+    runtimePlugin: runtimePluginPacks
+      ? { packs: runtimePluginPacks }
+      : null
   };
 
   const budget = {
@@ -3698,6 +3902,8 @@ function buildTaskRequest({
   noVerifyBaseline = false,
   provisionCopy = undefined,
   blenderSandbox = false,
+  noBlenderSandbox = false,
+  exportSmoke = false,
   env = {},
   maxDurationSeconds = null,
   maxTurns = null,
@@ -3734,10 +3940,14 @@ function buildTaskRequest({
     noVerifyBaseline,
     // The Godot import-cache tier, from `provision.copy` in .grok-build.json.
     // Left undefined when the project said nothing, so planWorktreeLinks can
-    // still fall back to GROK_BUILD_LINK_GODOT_CACHE.
+    // still fall back to GROK_BUILD_LINK_GODOT_CACHE (and the isolated default
+    // of a private cache).
     provisionCopy,
-    // Opt-in, and only meaningful for an isolated write run.
+    // Blender sandbox: explicit opt-in, explicit opt-out, or auto for isolated
+    // add-on runs (resolved again in executeTaskRun against the descriptor).
     blenderSandbox,
+    noBlenderSandbox,
+    exportSmoke,
     // Environment overrides, VERBATIM. This object is the detached worker's
     // input, not a report: redacting here would hand the background run a
     // literal "[redacted]" for its API token. The redacted copy is what reaches
@@ -4009,6 +4219,8 @@ export const RUN_PASSTHROUGH_FLAGS = Object.freeze([
   "--no-verify-baseline",
   "--env",
   "--blender-sandbox",
+  "--no-blender-sandbox",
+  "--godot-export-smoke",
   "--no-isolate",
   "--max-duration",
   "--max-turns",
@@ -4035,9 +4247,12 @@ async function handleTask(argv) {
       // verification strict, since with nothing measured every failure is
       // treated as this run's.
       "no-verify-baseline",
-      // Opt-in, never automatic: a private Blender scripts directory hides
-      // every other add-on the user's verify script may depend on.
+      // Explicit opt-in. Isolated add-on runs also auto-enable the sandbox
+      // unless --no-blender-sandbox is set (see shouldAutoBlenderSandbox).
       "blender-sandbox",
+      "no-blender-sandbox",
+      // Opt-in Godot headless export smoke when export_presets.cfg exists.
+      "godot-export-smoke",
       "no-isolate"
     ],
     aliasMap: {
@@ -4061,9 +4276,12 @@ async function handleTask(argv) {
   // job's record: the detached worker resolves nothing of its own, and a
   // worktree (which has no .grok-build.json of its own until the commit lands)
   // cannot change the plan half way through.
-  const { projectConfig, ecosystem, settings } = resolveProjectRunPlan(
+  const cliSettings = cliSettingsFromTaskOptions(options);
+  // exportSmoke is resolved inside resolveProjectRunPlan (CLI flag or config).
+  cliSettings.exportSmoke = Boolean(options["godot-export-smoke"]);
+  const { projectConfig, ecosystem, settings, exportSmoke } = resolveProjectRunPlan(
     workspaceRoot,
-    cliSettingsFromTaskOptions(options)
+    cliSettings
   );
 
   // normalizeReasoningEffort still runs on the CLI value first so an
@@ -4117,10 +4335,12 @@ async function handleTask(argv) {
   const verifyIgnorePatterns = settings.verifyIgnorePatterns ?? [];
   const noVerifyBaseline = Boolean(options["no-verify-baseline"]);
   // undefined, not false, when the project said nothing: planWorktreeLinks
-  // falls back to GROK_BUILD_LINK_GODOT_CACHE only when the option is absent,
-  // so a default of false would silently shadow the environment variable.
+  // falls back to GROK_BUILD_LINK_GODOT_CACHE / the isolated private default
+  // only when the option is absent, so a default of false would silently
+  // shadow the environment variable.
   const provisionCopy = settings.provision?.copy;
   const blenderSandbox = Boolean(options["blender-sandbox"]);
+  const noBlenderSandbox = Boolean(options["no-blender-sandbox"]);
   // Merged key by key rather than resolved through resolveRunSettings, whose
   // precedence is whole-value: one `--env FOO=bar` would otherwise shadow the
   // project's entire env block. `settings.env` is already trust-gated - an
@@ -4161,6 +4381,8 @@ async function handleTask(argv) {
         noVerifyBaseline,
         provisionCopy,
         blenderSandbox,
+        noBlenderSandbox,
+        exportSmoke,
         env: envOverrides,
         maxDurationSeconds,
         maxTurns,
@@ -4195,6 +4417,8 @@ async function handleTask(argv) {
         noVerifyBaseline,
         provisionCopy,
         blenderSandbox,
+        noBlenderSandbox,
+        exportSmoke,
         env: envOverrides,
         maxDurationSeconds,
         maxTurns,

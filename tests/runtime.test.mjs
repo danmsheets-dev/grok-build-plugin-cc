@@ -1600,10 +1600,11 @@ test("--blender-sandbox on a non-isolated run says it did nothing", () => {
 });
 
 test("a Godot cache that git already checked out is reported, not silently skipped", () => {
-  // The provisionWorktree result used to be discarded outright. A repository
-  // that TRACKS its `.godot` (plenty do, deliberately or not) has it checked
-  // out into every new worktree, so the junction cannot be created - and the
-  // only symptom was a run that was inexplicably slower than the last one.
+  // Isolated default is a private (copy) cache. A repository that TRACKS its
+  // `.godot` has seed files already checked out into every new worktree, so
+  // each copy lands as "destination already exists" — and that must be visible
+  // rather than silent. Explicit shared-link mode still has the same shape for
+  // the directory itself.
   const repo = makeTempDir("grok-provision-report-");
   const binDir = makeTempDir("grok-provision-report-bin-");
   const pluginDataDir = makeTempDir("grok-provision-report-data-");
@@ -1621,7 +1622,9 @@ test("a Godot cache that git already checked out is reported, not silently skipp
 
   const result = run("node", [SCRIPT, "run", "--write", "--json", "edit something"], {
     cwd: repo,
-    env: pluginDataEnv(pluginDataDir, binDir)
+    // Force the shared-link path so this test still covers the classic
+    // "tracked .godot blocks the junction" report.
+    env: pluginDataEnv(pluginDataDir, binDir, { GROK_BUILD_LINK_GODOT_CACHE: "1" })
   });
 
   assert.equal(result.status, 0, result.stderr || result.stdout);
@@ -1638,8 +1641,11 @@ test("a Godot cache that git already checked out is reported, not silently skipp
     assert.doesNotMatch(entry.name, /[\/]/, `${entry.name} must be a basename`);
   }
   // A cache that could not be linked is not shared, so the editor warning
-  // must not fire for it.
-  assert.deepEqual(payload.provision.notes, []);
+  // must not fire for it. Other provision notes (runtime plugin, etc.) may.
+  assert.ok(
+    !payload.provision.notes.some((note) => /close the Godot editor/i.test(String(note))),
+    `shared-cache editor warning must not fire when the link failed, got: ${JSON.stringify(payload.provision.notes)}`
+  );
   // Load-bearing for land's dirty gate: because provisioning SKIPS a tracked
   // `.godot` rather than replacing it, it can never leave the user's repo with
   // tracked dirt inside an artifact-excluded path - which is the one state
@@ -1662,7 +1668,7 @@ test("a Godot cache that git already checked out is reported, not silently skipp
     );
     // The second patchJobIfActive: the first fires before planning even starts,
     // so the summary has nowhere to attach there.
-    assert.equal(stored.result.provision.failed[0].name, ".godot");
+    assert.ok(stored.result.provision.failed.some((entry) => entry.name === ".godot"));
   } finally {
     if (previous == null) {
       delete process.env.CLAUDE_PLUGIN_DATA;
@@ -1759,12 +1765,14 @@ test("an isolated Godot write run reports what it changed, not just where it wen
   const payload = JSON.parse(result.stdout);
 
   assert.equal(payload.changedFiles.source, "commit");
+  // Scene/resource paths may carry a cheap annotation ("scene edit") after the
+  // path — match the status+path prefix, not a bare exact line.
   assert.ok(
-    payload.changedFiles.entries.includes("A\tscenes/Player.tscn"),
+    payload.changedFiles.entries.some((entry) => entry.startsWith("A\tscenes/Player.tscn")),
     payload.changedFiles.entries.join(" | ")
   );
   assert.ok(
-    payload.changedFiles.entries.includes("M\tassets/model.glb"),
+    payload.changedFiles.entries.some((entry) => entry.startsWith("M\tassets/model.glb")),
     payload.changedFiles.entries.join(" | ")
   );
   assert.ok(

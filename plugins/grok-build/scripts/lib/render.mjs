@@ -515,16 +515,26 @@ function pushVerifyPlanLines(lines, meta) {
       lines.push(`  Review it, then trust it with: ${meta.verifyTrustCommand}`);
     }
   }
+
+  // Blender version the verify actually ran against — answers "works on my
+  // machine" without requiring the user to open --json.
+  if (typeof meta.blenderVersion === "string" && meta.blenderVersion.trim()) {
+    lines.push(meta.blenderVersion.trim());
+  }
+
+  const runtimePacks = meta.runtimePlugin?.packs ?? meta.verifyRuntimePlugin?.packs;
+  if (Array.isArray(runtimePacks) && runtimePacks.length > 0) {
+    lines.push(`Runtime plugin: injected [${runtimePacks.join(", ")}]`);
+  }
 }
 
 /**
  * What the isolated worktree was seeded with, and what it was not.
  *
- * Two things have to reach the user here. The mandatory one is the shared-cache
- * warning carried in `notes`: `.godot` is junctioned straight from the working
- * copy, so a Godot editor left open on the same project is writing into the
- * cache a headless verify run is reading. The other is a failed link, which is
- * silent otherwise and shows up only as a run that is inexplicably slow.
+ * The shared-cache warning (when the user opted into a linked `.godot`) and the
+ * private-cache line (the isolated default) both live in `notes`, as do UID
+ * integrity failures and Blender sandbox decisions. A failed link is otherwise
+ * silent and shows up only as a run that is inexplicably slow.
  */
 function pushProvisionLines(lines, provision) {
   if (!provision || typeof provision !== "object") {
@@ -731,12 +741,21 @@ export function buildTaskStatusLines(meta = {}, rawOutput = "") {
   pushChangedFileLines(lines, meta.changedFiles);
 
   if (meta.isolationBreached || meta.status === "isolation-breached") {
+    // Deliberately "changed during this run" rather than "the agent wrote":
+    // the check is a before/after diff of the main checkout's dirty set, and it
+    // cannot tell the agent's write from a human editing the same checkout
+    // while the run was in flight. Observed exactly that during development -
+    // three files edited by hand mid-run were reported as leaked.
+    //
+    // The status stays terminal and stays loud anyway. A false positive costs
+    // one look at the list below; a missed breach costs the thing this whole
+    // mechanism exists to prevent. Do not soften it into a warning.
     lines.push(
-      "Isolation BREACHED: the agent wrote into the main checkout. That work is in the wrong tree and does not count."
+      "Isolation BREACHED: the main checkout changed while this run was in flight, so work may be in the wrong tree and is not verified."
     );
     const leaked = meta.isolationLeak?.entries ?? meta.isolationLeak?.paths ?? null;
     if (Array.isArray(leaked) && leaked.length > 0) {
-      lines.push("Leaked paths (main checkout):");
+      lines.push("Changed in the main checkout during this run:");
       for (const entry of leaked) {
         lines.push(`  ${entry}`);
       }
@@ -746,6 +765,9 @@ export function buildTaskStatusLines(meta = {}, rawOutput = "") {
         );
       }
     }
+    lines.push(
+      "  If you edited the main checkout yourself while this run was going, that is what this is - re-check with `git status` and land the worktree normally."
+    );
   }
 
   if (meta.worktree?.path) {
