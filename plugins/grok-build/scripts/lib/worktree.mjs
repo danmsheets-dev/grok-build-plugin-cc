@@ -274,11 +274,18 @@ function assertFreeSpaceForWorktree(parentDir, statfsImpl, env) {
  * `statfsImpl`/`gitImpl` exist so the free-space precheck can be tested without
  * a full disk. They are seams, not configuration: production passes neither.
  *
+ * Nested delegation (nest.mjs) MUST pass `worktreePath` derived via
+ * `deriveSiblingWorktreePath` whenever a parent worktree exists. A worktree
+ * inside a worktree breaks `git worktree remove`, doubles path length on
+ * Windows, and makes the artifact excludes and `land` graph incoherent —
+ * sibling directories only, never nested.
+ *
  * @param {object} options
  * @param {string} options.cwd - source repository cwd
  * @param {string} options.runId
  * @param {string} [options.baseRef] - defaults to HEAD
  * @param {string} [options.dataDir]
+ * @param {string} [options.worktreePath] - explicit path (sibling placement)
  * @param {NodeJS.ProcessEnv} [options.env]
  * @param {typeof fs.statfsSync} [options.statfsImpl]
  * @param {typeof git} [options.gitImpl]
@@ -288,6 +295,7 @@ export function createWorktree({
   runId,
   baseRef = "HEAD",
   dataDir,
+  worktreePath: worktreePathOverride,
   env,
   statfsImpl = fs.statfsSync,
   gitImpl = git
@@ -298,7 +306,9 @@ export function createWorktree({
   }
 
   const branchName = `grok-build/${runId}`;
-  const worktreePath = resolveWorktreePath(runId, { dataDir, env });
+  const worktreePath = worktreePathOverride
+    ? path.resolve(String(worktreePathOverride))
+    : resolveWorktreePath(runId, { dataDir, env });
   const baseSha = gitChecked(repoRoot, ["rev-parse", baseRef]).stdout.trim();
 
   fs.mkdirSync(path.dirname(worktreePath), { recursive: true });

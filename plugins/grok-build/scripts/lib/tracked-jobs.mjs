@@ -487,6 +487,11 @@ export async function runTrackedJob(job, runner, options = {}) {
         worktree: execution.worktree ?? job.worktree ?? null,
         budget: execution.budget ?? null,
         rendered: redactedRendered,
+        // Nested delegation linkage — additive; older runners leave them null.
+        parentRunId: execution.parentRunId ?? job.parentRunId ?? redactedPayload?.parentRunId ?? null,
+        nestDepth: execution.nestDepth ?? job.nestDepth ?? redactedPayload?.nestDepth ?? 0,
+        children: execution.children ?? job.children ?? redactedPayload?.children ?? [],
+        usageBreakdown: execution.usageBreakdown ?? redactedPayload?.usageBreakdown ?? null,
         bridgePid,
         agentPid: null,
         pid: null,

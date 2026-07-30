@@ -230,7 +230,12 @@ const INDEX_TERMINAL_MIRROR_FIELDS = [
   "toolCallCount",
   "worktree",
   "grokVersion",
-  "model"
+  "model",
+  // Nested delegation linkage: runs groups children under parents when these
+  // are on the index. Additive only — older records simply omit them.
+  "parentRunId",
+  "nestDepth",
+  "children"
 ];
 
 function pickIndexMirrorFields(source = {}) {
@@ -367,6 +372,9 @@ export function claimJobTerminal(cwd, jobId, nextStatus, patch = {}) {
       title: nextJob.title ?? existing.title,
       jobClass: nextJob.jobClass ?? existing.jobClass,
       write: nextJob.write ?? existing.write,
+      parentRunId: nextJob.parentRunId ?? existing.parentRunId ?? null,
+      nestDepth: nextJob.nestDepth ?? existing.nestDepth ?? null,
+      children: nextJob.children ?? existing.children,
       // jobs/<id>.json already holds the full record; the index used to drop
       // usage/stopReason/counts, so runs --json showed null for every finished
       // run even when the job file had them. Mirror the fields that runs/show

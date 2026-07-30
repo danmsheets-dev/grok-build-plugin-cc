@@ -92,6 +92,9 @@ function jobDisplayStatus(job) {
 
 function formatJobLine(job) {
   const parts = [job.id, jobDisplayStatus(job)];
+  if (job.parentRunId) {
+    parts.push(`parent ${job.parentRunId}`);
+  }
   if (job.kindLabel) {
     parts.push(job.kindLabel);
   }
@@ -235,47 +238,51 @@ export function summarizeSessionUsage(jobs) {
 }
 
 function pushJobDetails(lines, job, options = {}) {
-  lines.push(`- ${formatJobLine(job)}`);
+  const indent = options.indent ?? "";
+  lines.push(`${indent}- ${formatJobLine(job)}`);
+  if (job.parentRunId) {
+    lines.push(`${indent}  Parent: ${job.parentRunId}`);
+  }
   if (job.summary) {
-    lines.push(`  Summary: ${job.summary}`);
+    lines.push(`${indent}  Summary: ${job.summary}`);
   }
   if (job.phase) {
-    lines.push(`  Phase: ${job.phase}`);
+    lines.push(`${indent}  Phase: ${job.phase}`);
   }
   if (job.abandoned) {
-    lines.push("  Abandoned: tracked processes are gone. Reclaim with `/grok-build:prune --apply`.");
+    lines.push(`${indent}  Abandoned: tracked processes are gone. Reclaim with \`/grok-build:prune --apply\`.`);
   }
   if (job.lastEventAge && (job.status === "queued" || job.status === "running")) {
-    lines.push(`  Last activity: ${job.lastEventAge}`);
+    lines.push(`${indent}  Last activity: ${job.lastEventAge}`);
   }
   if (job.lastHeartbeatAge && (job.status === "queued" || job.status === "running")) {
-    lines.push(`  Last heartbeat: ${job.lastHeartbeatAge}`);
+    lines.push(`${indent}  Last heartbeat: ${job.lastHeartbeatAge}`);
   }
   const usageLine = formatUsageLine(job.usage);
   if (usageLine) {
-    lines.push(`  ${usageLine}`);
+    lines.push(`${indent}  ${usageLine}`);
   }
   if (options.showElapsed && job.elapsed) {
-    lines.push(`  Elapsed: ${job.elapsed}`);
+    lines.push(`${indent}  Elapsed: ${job.elapsed}`);
   }
   if (options.showDuration && job.duration) {
-    lines.push(`  Duration: ${job.duration}`);
+    lines.push(`${indent}  Duration: ${job.duration}`);
   }
   if (job.threadId) {
-    lines.push(`  Grok session ID: ${job.threadId}`);
+    lines.push(`${indent}  Grok session ID: ${job.threadId}`);
   }
   const resumeCommand = formatGrokResumeCommand(job);
   if (resumeCommand) {
-    lines.push(`  Resume in Grok: ${resumeCommand}`);
+    lines.push(`${indent}  Resume in Grok: ${resumeCommand}`);
   }
   if (job.logFile && options.showLog) {
-    lines.push(`  Log: ${job.logFile}`);
+    lines.push(`${indent}  Log: ${job.logFile}`);
   }
   if ((job.status === "queued" || job.status === "running") && options.showCancelHint) {
-    lines.push(`  Stop: /grok-build:stop ${job.id}`);
+    lines.push(`${indent}  Stop: /grok-build:stop ${job.id}`);
   }
   if (job.status !== "queued" && job.status !== "running" && options.showResultHint) {
-    lines.push(`  Show: /grok-build:show ${job.id}`);
+    lines.push(`${indent}  Show: /grok-build:show ${job.id}`);
   }
   if (job.status !== "queued" && job.status !== "running" && job.jobClass === "task" && job.write && options.showReviewHint) {
     if (job.worktree?.path) {
@@ -283,16 +290,24 @@ function pushJobDetails(lines, job, options = {}) {
       // /grok-build:review here would review the wrong thing entirely - it
       // would find nothing, since the actual changes sit unlanded in the
       // worktree. Point at land instead, which is what actually shows them.
-      lines.push(`  Review and land: /grok-build:land ${job.id}`);
+      lines.push(`${indent}  Review and land: /grok-build:land ${job.id}`);
     } else {
-      lines.push("  Review changes: /grok-build:review --wait");
-      lines.push("  Stricter pass: /grok-build:critique --wait");
+      lines.push(`${indent}  Review changes: /grok-build:review --wait`);
+      lines.push(`${indent}  Stricter pass: /grok-build:critique --wait`);
+    }
+  }
+  if (Array.isArray(job.children) && job.children.length > 0 && options.showChildren !== false) {
+    lines.push(`${indent}  Nested children:`);
+    for (const child of job.children) {
+      const childId = child.runId ?? child.id ?? "?";
+      const childStatus = child.status ?? "unknown";
+      lines.push(`${indent}    - ${childId} ${childStatus}`);
     }
   }
   if (job.progressPreview?.length) {
-    lines.push("  Progress:");
+    lines.push(`${indent}  Progress:`);
     for (const line of job.progressPreview) {
-      lines.push(`    ${line}`);
+      lines.push(`${indent}    ${line}`);
     }
   }
 }
@@ -692,13 +707,40 @@ export function buildTaskStatusLines(meta = {}, rawOutput = "") {
     );
   }
 
-  const usageLine = formatUsageLine(meta.usage, {
-    model: meta.model,
-    resolvedModel: meta.resolvedModel ?? meta.usage?.resolvedModel,
-    compact: true
-  });
-  if (usageLine) {
-    lines.push(usageLine);
+  // Prefer the explicit own/nested split when the run had children — a single
+  // summed line would look like the parent spent the children's budget alone.
+  if (meta.usageBreakdown?.own || meta.usageBreakdown?.includingNested) {
+    const ownLine = formatUsageLine(meta.usageBreakdown.own ?? meta.usage, {
+      model: meta.model,
+      resolvedModel: meta.resolvedModel ?? meta.usage?.resolvedModel,
+      compact: true
+    });
+    if (ownLine) {
+      lines.push(`Usage (own): ${ownLine.replace(/^Tokens:\s*/, "")}`);
+    }
+    if (meta.usageBreakdown.nested) {
+      const nestedLine = formatUsageLine(meta.usageBreakdown.nested, { compact: true });
+      if (nestedLine) {
+        lines.push(`Usage (nested children): ${nestedLine.replace(/^Tokens:\s*/, "")}`);
+      }
+    }
+    const totalLine = formatUsageLine(meta.usageBreakdown.includingNested ?? meta.usage, {
+      model: meta.model,
+      resolvedModel: meta.resolvedModel,
+      compact: true
+    });
+    if (totalLine) {
+      lines.push(`Usage (including nested): ${totalLine.replace(/^Tokens:\s*/, "")}`);
+    }
+  } else {
+    const usageLine = formatUsageLine(meta.usage, {
+      model: meta.model,
+      resolvedModel: meta.resolvedModel ?? meta.usage?.resolvedModel,
+      compact: true
+    });
+    if (usageLine) {
+      lines.push(usageLine);
+    }
   }
 
   const naLine = VERIFIED_NA_STATUSES.has(meta.status)
@@ -789,9 +831,45 @@ export function buildTaskStatusLines(meta = {}, rawOutput = "") {
     lines.push(`Budget: run stopped early (${meta.budgetStopped}).`);
   }
 
+  pushNestedRunsSection(lines, meta);
+
   pushRunDiagnosticLines(lines, meta, rawOutput);
 
   return lines;
+}
+
+/**
+ * Parent report section listing each nested child. A child failure is never
+ * summarised as success here — status is the stored terminal value, verbatim.
+ */
+function pushNestedRunsSection(lines, meta = {}) {
+  const children = Array.isArray(meta.children) ? meta.children : [];
+  if (children.length === 0) {
+    return;
+  }
+
+  lines.push("", "## Nested runs");
+  for (const child of children) {
+    const id = child.runId ?? child.id ?? "unknown";
+    const status = child.status ?? "unknown";
+    const files =
+      child.changedFileCount == null ? "unknown files" : `${child.changedFileCount} file(s)`;
+    const usageLine = formatUsageLine(child.usage, { compact: true });
+    const branch = child.branch ? ` branch ${child.branch}` : "";
+    const parts = [`- ${id}: ${status}, ${files}`];
+    if (usageLine) {
+      parts.push(usageLine);
+    }
+    if (branch) {
+      parts.push(branch.trim());
+    }
+    lines.push(parts.join(" · "));
+    lines.push(`  Land into this worktree: node scripts/grok-bridge.mjs land ${id} --into-run ${meta.jobId ?? "<parent>"}`);
+    // Make non-success impossible to skim past as "fine".
+    if (status !== "completed" && status !== "completed-noop") {
+      lines.push(`  Note: child did not fully succeed (status=${status}); do not treat as landed work.`);
+    }
+  }
 }
 
 /**

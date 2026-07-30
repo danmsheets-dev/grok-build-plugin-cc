@@ -407,6 +407,56 @@ hooks, LSP servers, MCP servers — lives in `~/.grok` and is configured there,
 independent of this plugin. Ecosystem support in this repo (Godot, Blender)
 concerns how the bridge *verifies* a run, not how the agent writes code.
 
+## Nested delegation (Hyper → Hyper)
+
+A Hyper agent inside an isolated write run can hand a **sub-task** to another
+Hyper instance — its own sibling worktree, bridge-side verify, tracked run,
+structured result, and an explicit land into the parent worktree.
+
+This is **not** Hyper's in-process subagents. Those share the parent's
+filesystem and default to max nesting depth 1; they fan out work, they do not
+isolate it. Nested delegation uses MCP (`delegate_run` / `delegate_status` /
+`delegate_wait` / `delegate_result` / `delegate_land` / `delegate_stop`) and the
+bridge subcommand `nest-run`.
+
+### Enable / disable
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `GROK_BUILD_NESTED_DELEGATION` | on | Set to `0` / `false` / `no` to stop offering the MCP server to agents |
+| `GROK_BUILD_MAX_NEST_DEPTH` | `2` | Maximum nest depth (incoming depth ≥ max is refused) |
+| `GROK_BUILD_MAX_NEST_CONCURRENCY` | `2` | Max live children per parent; further requests are refused, not queued |
+| `GROK_BUILD_NEST_DEPTH` | `0` | Set by the bridge for child processes; do not set by hand |
+
+The run header reports whether nested delegation was offered and how much depth
+budget remains.
+
+### Sibling worktrees, never nested
+
+A child's worktree is created **next to** the parent's under the same parent
+directory (e.g. `%TEMP%\gb\w\<short-id>` on Windows), off the **parent's base
+commit**, never as a directory inside the parent worktree. A worktree inside a
+worktree breaks `git worktree remove`, doubles path length on Windows, and makes
+artifact excludes and the land graph incoherent.
+
+### Budget inheritance
+
+The parent's `--max-cost`, `--max-duration`, and `--max-turns` are ceilings for
+the child. The child may ask for less, never more. Cost uses the parent's
+**remaining** budget (cap minus spend so far, including earlier children).
+
+### Landing nested work
+
+1. Wait for the child (`delegate_wait` or `runs` / `wait`).
+2. Read the structured result — a failed child is listed on the parent report
+   and is **never** summarised as success; it does not fail the parent by itself.
+3. Call `delegate_land` (or `land <child> --into-run <parent>`) to squash-merge
+   the child branch into the **parent worktree**. Nothing auto-lands.
+4. Land the parent into the main checkout as usual with `/grok-build:land`.
+
+`.grok/` (including the injected runtime plugin and its `.mcp.json`) is excluded
+from the run commit the same way `.grok-build/` is.
+
 ## Environment
 
 | Variable | Purpose |
@@ -421,5 +471,8 @@ concerns how the bridge *verifies* a run, not how the agent writes code.
 | `GROK_BUILD_LINK_GODOT_CACHE=0` | Copy Godot's small cache state files into the worktree instead of linking `.godot`/`.import` — see "What isolation does and does not guarantee" |
 | `GROK_BUILD_MIN_FREE_BYTES` | Moves the 512 MB free-space floor a checkout refuses to start under; `0` disables the check |
 | `GROK_VERIFY_MAX_OUTPUT_BYTES` | Overrides the default 32 MB verify-output ring (see `--verify-max-buffer`, which is the per-run form of this) |
+| `GROK_BUILD_NESTED_DELEGATION` | Nested Hyper→Hyper MCP offer; default on, `0` disables — see [Nested delegation](#nested-delegation-hyper--hyper) |
+| `GROK_BUILD_MAX_NEST_DEPTH` | Max nest depth (default 2) |
+| `GROK_BUILD_MAX_NEST_CONCURRENCY` | Max live children per parent (default 2) |
 
 State falls back to `$TMPDIR/grok-cc-runs` when `CLAUDE_PLUGIN_DATA` is unset.

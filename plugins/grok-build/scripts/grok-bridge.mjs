@@ -91,11 +91,34 @@ import {
   isTerminalJobStatus,
   listJobs,
   patchJobIfActive,
+  readJobFile,
+  resolveJobFile,
   resolveJobLogFile,
   resolveStateDir,
   upsertJob,
   writeJobFile
 } from "./lib/state.mjs";
+import {
+  aggregateUsageOwnVsNested,
+  assertNestConcurrencyAllowed,
+  assertNestDepthAllowed,
+  buildChildSummary,
+  childIsLandable,
+  deriveSiblingWorktreePath,
+  formatNestedDelegationHeaderLine,
+  inheritBudget,
+  nestedDelegationEnabled,
+  parentSpentCostUsd,
+  readMaxNestConcurrency,
+  readMaxNestDepth,
+  readNestDepth,
+  resolveBridgeScriptPath,
+  resolveMcpScriptPath,
+  upsertChildEntry,
+  writeRuntimeMcpJson,
+  NEST_DEPTH_ENV,
+  PARENT_RUN_ID_ENV
+} from "./lib/nest.mjs";
 import { redactSecrets, redactSecretsDeep } from "./lib/redact.mjs";
 import { MESSAGE_SEPARATOR } from "./lib/stream-events.mjs";
 import {
@@ -209,6 +232,11 @@ function printUsage() {
       "    having passed. A run whose verification never passes is reported completed-unverified, never",
       "    as success. See `verify-plan` to preview the resolved plan without running it.",
       "    Pay-per-token models (openai/*) require GROK_BUILD_ALLOW_PAY_PER_TOKEN=1.",
+      "  node scripts/grok-bridge.mjs nest-run [--background] [--write] [--prompt-file <path>]",
+      "      [--model <model>] [--effort <low|medium|high>] [--verify <command>]... [--no-verify]",
+      "      [--max-duration <seconds>] [--max-turns <n>] [--max-cost <usd>] [--json] [prompt]",
+      "    Nested Hyper-to-Hyper delegation: always isolated, sibling worktree, depth/fan-out bounded.",
+      "    Refuses --no-isolate. Intended for the runtime MCP server (delegate_run), not humans.",
       "  node scripts/grok-bridge.mjs import [--source <claude-jsonl>] [--json]",
       "  node scripts/grok-bridge.mjs runs [run-id] [--all] [--wait] [--timeout-ms <ms>] [--json]",
       "  node scripts/grok-bridge.mjs show [run-id] [--json]",
@@ -254,6 +282,11 @@ const SUBCOMMAND_HELP = {
     "Delegate a task. Default is read-only; pass --write to allow edits.",
     "See `node scripts/grok-bridge.mjs help` for the full flag list."
   ],
+  "nest-run": [
+    "Usage: node scripts/grok-bridge.mjs nest-run [options] [prompt]",
+    "Nested Hyper run for agent-to-agent delegation. Always isolated; --no-isolate is refused.",
+    "Depth/fan-out bounded by GROK_BUILD_MAX_NEST_DEPTH / GROK_BUILD_MAX_NEST_CONCURRENCY."
+  ],
   import: ["Usage: node scripts/grok-bridge.mjs import [--source <claude-jsonl>] [--json]"],
   runs: [
     "Usage: node scripts/grok-bridge.mjs runs [run-id] [--all] [--wait] [--timeout-ms <ms>] [--json]",
@@ -265,7 +298,10 @@ const SUBCOMMAND_HELP = {
     "Usage: node scripts/grok-bridge.mjs wait <run-id> [--timeout <seconds>] [--timeout-ms <ms>] [--json]",
     "Block until the run is terminal (or the timeout), then print the same result as show."
   ],
-  land: ["Usage: node scripts/grok-bridge.mjs land [run-id] [--preview|--discard] [--json]"]
+  land: [
+    "Usage: node scripts/grok-bridge.mjs land [run-id] [--preview|--discard] [--into-run <parent-id>] [--json]",
+    "Squash-merge a run's branch. --into-run lands a nested child into the parent's worktree."
+  ]
 };
 
 function printSubcommandHelp(subcommand) {
@@ -2219,7 +2255,11 @@ function projectRunJsonRow(job, storedJob = null) {
     threadId: record.threadId ?? null,
     logFile: record.logFile ?? null,
     createdAt: record.createdAt ?? null,
-    completedAt: record.completedAt ?? null
+    completedAt: record.completedAt ?? null,
+    // Nested delegation — additive keys only; older records omit them.
+    parentRunId: record.parentRunId ?? storedJob?.parentRunId ?? null,
+    nestDepth: record.nestDepth ?? storedJob?.nestDepth ?? null,
+    children: record.children ?? storedJob?.children ?? []
   };
 }
 
@@ -2243,7 +2283,10 @@ function hydrateJobFromStored(workspaceRoot, job) {
     "toolCallCount",
     "worktree",
     "grokVersion",
-    "model"
+    "model",
+    "parentRunId",
+    "nestDepth",
+    "children"
   ];
   const next = { ...job };
   for (const key of fill) {
@@ -2719,11 +2762,28 @@ async function executeTaskRun(request) {
   });
 
   if (isolate && write) {
-    created = createWorktree({ cwd: workspaceRoot, runId: request.jobId });
+    // Nested children: sibling of the parent worktree, never inside it. A
+    // worktree inside a worktree breaks `git worktree remove`, doubles path
+    // length on Windows, and makes the artifact excludes and `land` graph
+    // incoherent. See nest.mjs deriveSiblingWorktreePath.
+    let nestedWorktreePath = null;
+    if (request.parentWorktree && request.jobId) {
+      nestedWorktreePath = deriveSiblingWorktreePath(request.parentWorktree, request.jobId);
+    }
+    created = createWorktree({
+      cwd: workspaceRoot,
+      runId: request.jobId,
+      // Child starts from the parent's base commit (not the parent's HEAD with
+      // partial agent edits) so each nested run is a clean sibling branch.
+      baseRef: request.baseRef || "HEAD",
+      worktreePath: nestedWorktreePath ?? undefined
+    });
     // Persist worktree descriptor immediately so cancel/crash cannot orphan it
     // from land/prune/doctor (descriptor must not wait until the run returns).
     if (request.jobId) {
       patchJobIfActive(workspaceRoot, request.jobId, {
+        parentRunId: request.parentRunId ?? null,
+        nestDepth: request.nestDepth ?? 0,
         worktree: {
           path: created.worktreePath,
           branch: created.branchName,
@@ -2817,6 +2877,51 @@ async function executeTaskRun(request) {
     };
     for (const note of injected.notes) {
       request.onProgress?.({ phase: "starting", message: note });
+    }
+
+    // Nested-delegation MCP surface. Owns only `.mcp.json` in the runtime
+    // plugin directory; WP-P3 owns agents/skills beside it. Creates the
+    // directory if injectRuntimePlugin was disabled or failed.
+    const nestOffered = nestedDelegationEnabled(process.env);
+    const nestDepthForHeader = Number.isFinite(Number(request.nestDepth))
+      ? Number(request.nestDepth)
+      : readNestDepth(process.env);
+    if (nestOffered && request.jobId) {
+      const mcpWrite = writeRuntimeMcpJson(created.worktreePath, {
+        mcpScriptPath: resolveMcpScriptPath(ROOT_DIR),
+        bridgePath: resolveBridgeScriptPath(ROOT_DIR),
+        pluginRoot: ROOT_DIR,
+        workspaceRoot,
+        parentRunId: request.jobId,
+        nestDepth: nestDepthForHeader,
+        parentBaseSha: created.baseSha,
+        parentWorktree: created.worktreePath,
+        parentMaxCostUsd: maxCostUsd,
+        parentMaxDurationSeconds: maxDurationSeconds,
+        parentMaxTurns: maxTurns,
+        parentSpentCostUsd: 0
+      });
+      provisionSummary = {
+        ...provisionSummary,
+        notes: [...provisionSummary.notes, ...mcpWrite.notes],
+        nestedDelegation: {
+          offered: mcpWrite.written,
+          mcpJson: mcpWrite.path,
+          nestDepth: nestDepthForHeader,
+          maxNestDepth: readMaxNestDepth(process.env)
+        }
+      };
+      for (const note of mcpWrite.notes) {
+        request.onProgress?.({ phase: "starting", message: note });
+      }
+    } else if (!nestOffered) {
+      const offNote = formatNestedDelegationHeaderLine({ offered: false });
+      provisionSummary = {
+        ...provisionSummary,
+        notes: [...provisionSummary.notes, offNote],
+        nestedDelegation: { offered: false }
+      };
+      request.onProgress?.({ phase: "starting", message: offNote });
     }
 
     // Snapshot *.uid before the agent so a regenerated companion is reported
@@ -3072,6 +3177,24 @@ async function executeTaskRun(request) {
   }
   if (budgetBits.length > 0) {
     request.onProgress?.({ message: `Budgets: ${budgetBits.join(", ")}`, phase: "starting" });
+  }
+
+  // Nested delegation offer (also recorded in provision for isolated runs).
+  // Non-isolated write runs never get a runtime plugin, so say so plainly.
+  {
+    const nestDepthForHeader = Number.isFinite(Number(request.nestDepth))
+      ? Number(request.nestDepth)
+      : readNestDepth(process.env);
+    const nestOffered = nestedDelegationEnabled(process.env) && Boolean(created);
+    request.onProgress?.({
+      message: formatNestedDelegationHeaderLine({
+        offered: nestOffered,
+        nestDepth: nestDepthForHeader,
+        maxNestDepth: readMaxNestDepth(process.env),
+        maxConcurrency: readMaxNestConcurrency(process.env)
+      }),
+      phase: "starting"
+    });
   }
 
   // Permission shape: write runs approve every tool; read-only runs get plan +
@@ -3621,6 +3744,25 @@ async function executeTaskRun(request) {
     hadWork: Boolean(prompt),
     isolationBreached
   });
+
+  // Pull any children the agent started mid-run (MCP nest-run patches the
+  // parent job). Re-read rather than trusting an empty in-memory list.
+  let children = [];
+  if (request.jobId) {
+    try {
+      const jobFile = resolveJobFile(workspaceRoot, request.jobId);
+      if (fs.existsSync(jobFile)) {
+        const live = readJobFile(jobFile);
+        if (Array.isArray(live?.children)) {
+          children = live.children;
+        }
+      }
+    } catch {
+      children = Array.isArray(request.children) ? request.children : [];
+    }
+  }
+  const usageBreakdown = aggregateUsageOwnVsNested(cumulativeUsage, children);
+
   const rendered = timedOut
     ? `${failureMessage}\n${rawOutput ? `\n${rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`}` : ""}`
     : renderTaskResult(
@@ -3672,7 +3814,9 @@ async function executeTaskRun(request) {
           runtimePlugin: runtimePluginPacks ? { packs: runtimePluginPacks } : null,
           worktree,
           provision: provisionSummary,
-          budgetStopped
+          budgetStopped,
+          children,
+          usageBreakdown
         }
       );
 
@@ -3737,6 +3881,10 @@ async function executeTaskRun(request) {
     status: exitStatus,
     threadId: result.threadId,
     usage: cumulativeUsage ?? null,
+    usageBreakdown,
+    children,
+    parentRunId: request.parentRunId ?? null,
+    nestDepth: request.nestDepth ?? 0,
     stopReason,
     toolCallCount,
     changedFileCount: effectiveChangedFileCount,
@@ -3785,6 +3933,23 @@ async function executeTaskRun(request) {
     timedOut
   };
 
+  // Nested child: mirror final summary onto the parent's children[] so the
+  // parent's report can list status/usage without re-scanning every job file.
+  // A child failure never fails the parent — only updates the linkage.
+  if (request.parentRunId && request.jobId) {
+    try {
+      linkChildOutcomeToParent(workspaceRoot, request.parentRunId, {
+        id: request.jobId,
+        status: terminalStatus,
+        changedFileCount: effectiveChangedFileCount,
+        usage: cumulativeUsage ?? null,
+        worktree
+      });
+    } catch {
+      // Parent may already be terminal/pruned; never fail the child over it.
+    }
+  }
+
   return {
     exitStatus,
     timedOut,
@@ -3816,6 +3981,10 @@ async function executeTaskRun(request) {
     grokVersion,
     verify,
     usage: cumulativeUsage ?? null,
+    usageBreakdown,
+    children,
+    parentRunId: request.parentRunId ?? null,
+    nestDepth: request.nestDepth ?? 0,
     stopReason,
     toolCallCount,
     changedFileCount: effectiveChangedFileCount,
@@ -3823,6 +3992,40 @@ async function executeTaskRun(request) {
     resolvedModel,
     hadWork: Boolean(prompt)
   };
+}
+
+/**
+ * Record or refresh a child entry on the parent job (file + index).
+ * Best-effort: a missing parent is ignored. Prefer patchJobIfActive while the
+ * parent is still running; fall back to a terminal-safe write when it is not.
+ */
+function linkChildOutcomeToParent(workspaceRoot, parentRunId, childJob) {
+  if (!workspaceRoot || !parentRunId || !childJob?.id) {
+    return;
+  }
+  const parentFile = resolveJobFile(workspaceRoot, parentRunId);
+  if (!fs.existsSync(parentFile)) {
+    return;
+  }
+  let parent;
+  try {
+    parent = readJobFile(parentFile);
+  } catch {
+    return;
+  }
+  const children = upsertChildEntry(parent.children, buildChildSummary(childJob));
+  const active = patchJobIfActive(workspaceRoot, parentRunId, { children });
+  if (active.patched) {
+    return;
+  }
+  // Parent already terminal (or missing from the active path): still persist
+  // the linkage so `show <parent>` lists the child after both finished.
+  writeJobFile(workspaceRoot, parentRunId, {
+    ...parent,
+    children,
+    updatedAt: nowIso()
+  });
+  upsertJob(workspaceRoot, { id: parentRunId, children });
 }
 
 function buildReviewJobMetadata(reviewName, target) {
@@ -3907,7 +4110,11 @@ function buildTaskRequest({
   env = {},
   maxDurationSeconds = null,
   maxTurns = null,
-  maxCostUsd = null
+  maxCostUsd = null,
+  parentRunId = null,
+  nestDepth = 0,
+  baseRef = null,
+  parentWorktree = null
 }) {
   return {
     cwd,
@@ -3956,7 +4163,12 @@ function buildTaskRequest({
     env,
     maxDurationSeconds,
     maxTurns,
-    maxCostUsd
+    maxCostUsd,
+    // Nested-delegation linkage. Null/0 for top-level runs.
+    parentRunId,
+    nestDepth,
+    baseRef,
+    parentWorktree
   };
 }
 
@@ -4430,6 +4642,271 @@ async function handleTask(argv) {
 }
 
 /**
+ * Nested Hyper-to-Hyper run. Reuses executeTaskRun; the differences are the
+ * gate checks (depth, fan-out, always-isolate, budget inheritance) and the
+ * parent/child record linkage. Intended for the runtime MCP server.
+ */
+async function handleNestRun(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: [...TASK_VALUE_OPTIONS, "parent-run-id"],
+    repeatableOptions: ["verify", "verify-ignore", "env"],
+    booleanOptions: [
+      "json",
+      "write",
+      "background",
+      "no-verify",
+      "no-verify-baseline",
+      "no-isolate",
+      "isolate",
+      "blender-sandbox",
+      "no-blender-sandbox",
+      "godot-export-smoke"
+    ],
+    aliasMap: { m: "model" }
+  });
+
+  // Nested write runs are isolated unconditionally — --no-isolate is refused
+  // even when GROK_BUILD_ALLOW_NO_ISOLATE=1, because a nested child that edits
+  // the parent worktree (or the main checkout) destroys the isolation story.
+  if (options["no-isolate"]) {
+    throw new Error(
+      "nest-run refuses --no-isolate: a nested write run is always isolated in a sibling worktree."
+    );
+  }
+
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveCommandWorkspace(options);
+
+  // Depth: the incoming env value is the PARENT's depth; the child is +1.
+  // Refuse when the parent is already at the max (leaf run).
+  const incomingDepth = readNestDepth(process.env);
+  const maxDepth = readMaxNestDepth(process.env);
+  const { childDepth } = assertNestDepthAllowed(incomingDepth, maxDepth);
+
+  const parentRunId =
+    (options["parent-run-id"] && String(options["parent-run-id"]).trim()) ||
+    (process.env[PARENT_RUN_ID_ENV] && String(process.env[PARENT_RUN_ID_ENV]).trim()) ||
+    null;
+  if (!parentRunId) {
+    throw new Error(
+      `nest-run requires a parent run id (${PARENT_RUN_ID_ENV} or --parent-run-id). ` +
+        "Top-level work should use `run`, not `nest-run`."
+    );
+  }
+
+  // Fan-out: at most N live children of this parent.
+  const parentStored = readStoredJob(workspaceRoot, parentRunId);
+  if (!parentStored) {
+    throw new Error(`nest-run: parent run ${parentRunId} was not found in this workspace.`);
+  }
+  assertNestConcurrencyAllowed(parentStored.children, readMaxNestConcurrency(process.env));
+
+  const prompt = readTaskPrompt(cwd, options, positionals);
+  requireTaskRequest(prompt, false);
+
+  // Same default as `run`: read-only unless --write. The MCP delegate_run tool
+  // always passes --write for the common nested-edit case.
+  const write = Boolean(options.write);
+
+  const cliSettings = cliSettingsFromTaskOptions(options);
+  cliSettings.exportSmoke = Boolean(options["godot-export-smoke"]);
+  const { projectConfig, ecosystem, settings, exportSmoke } = resolveProjectRunPlan(
+    workspaceRoot,
+    cliSettings
+  );
+
+  const model = options.model ? String(options.model).trim() : (settings.model ?? null);
+  const effort = normalizeReasoningEffort(options.effort) ?? settings.effort ?? null;
+  const billingGate = assertModelBillingAllowed(model, process.env);
+  if (!billingGate.allowed) {
+    throw new Error(billingGate.message);
+  }
+
+  // Budget inheritance: parent ceilings + remaining cost. Child may ask for less.
+  const parentBudget = parentStored.budget ?? parentStored.request?.budget ?? {};
+  const parentMaxCost =
+    parentBudget.maxCostUsd ??
+    parentStored.request?.maxCostUsd ??
+    (process.env.GROK_BUILD_PARENT_MAX_COST != null
+      ? Number(process.env.GROK_BUILD_PARENT_MAX_COST)
+      : null);
+  const parentMaxDuration =
+    parentBudget.maxDurationSeconds ??
+    parentStored.request?.maxDurationSeconds ??
+    (process.env.GROK_BUILD_PARENT_MAX_DURATION != null
+      ? Number(process.env.GROK_BUILD_PARENT_MAX_DURATION)
+      : null);
+  const parentMaxTurns =
+    parentBudget.maxTurns ??
+    parentStored.request?.maxTurns ??
+    (process.env.GROK_BUILD_PARENT_MAX_TURNS != null
+      ? Number(process.env.GROK_BUILD_PARENT_MAX_TURNS)
+      : null);
+  const spent = parentSpentCostUsd(parentStored);
+
+  const childRequested = {
+    maxCostUsd: resolveMaxCostUsd(options["max-cost"] ?? settings.maxCostUsd),
+    maxDurationSeconds: resolveMaxDurationSeconds(
+      options["max-duration"] ?? settings.maxDurationSeconds
+    ),
+    maxTurns: resolveMaxTurns(options["max-turns"] ?? settings.maxTurns)
+  };
+  const inherited = inheritBudget({
+    parentMaxCostUsd: parentMaxCost,
+    parentSpentCostUsd: spent,
+    parentMaxDurationSeconds: parentMaxDuration,
+    parentMaxTurns,
+    childMaxCostUsd: childRequested.maxCostUsd,
+    childMaxDurationSeconds: childRequested.maxDurationSeconds,
+    childMaxTurns: childRequested.maxTurns
+  });
+
+  const verifyCommands = settings.verify;
+  const verifyPlan = {
+    source: settings.sources.verify,
+    disabled: Boolean(settings.verifyDisabled),
+    ecosystem: ecosystem?.id ?? null,
+    configPresent: projectConfig.present,
+    configTrusted: projectConfig.trusted,
+    configWithheld: Object.keys(projectConfig.untrusted)
+  };
+  const verifyTiming = {
+    timeoutMs: settings.verifyTimeoutMs ?? null,
+    multiplier: settings.verifyTimeoutMultiplier ?? null,
+    baselineTimeoutMs: settings.baselineTimeoutMs ?? null,
+    maxOutputBytes: settings.verifyMaxOutputBytes ?? null,
+    sources: {
+      timeoutMs: settings.sources.verifyTimeoutMs ?? null,
+      multiplier: settings.sources.verifyTimeoutMultiplier ?? null,
+      baselineTimeoutMs: settings.sources.baselineTimeoutMs ?? null,
+      maxOutputBytes: settings.sources.verifyMaxOutputBytes ?? null
+    }
+  };
+
+  const parentWorktree =
+    parentStored.worktree?.path ??
+    (process.env.GROK_BUILD_PARENT_WORKTREE
+      ? String(process.env.GROK_BUILD_PARENT_WORKTREE)
+      : null);
+  const baseRef =
+    parentStored.worktree?.baseSha ??
+    (process.env.GROK_BUILD_PARENT_BASE_SHA
+      ? String(process.env.GROK_BUILD_PARENT_BASE_SHA)
+      : null);
+
+  const taskMetadata = buildTaskRunMetadata({ prompt, resumeLast: false });
+  const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+  // Stamp parent linkage on the job record before enqueue so runs can group.
+  job.parentRunId = parentRunId;
+  job.nestDepth = childDepth;
+  job.children = [];
+
+  const request = {
+    kind: "task",
+    ...buildTaskRequest({
+      cwd: workspaceRoot,
+      model,
+      effort,
+      prompt,
+      write,
+      resumeLast: false,
+      jobId: job.id,
+      isolate: true,
+      isolateSource: "nest-run",
+      verifyCommands,
+      verifyPlan,
+      verifyTiming,
+      verifyAttempts: resolveVerifyAttempts(settings.verifyAttempts),
+      verifyFailurePatterns: settings.verifyFailurePatterns ?? [],
+      verifyIgnorePatterns: settings.verifyIgnorePatterns ?? [],
+      noVerifyBaseline: Boolean(options["no-verify-baseline"]),
+      provisionCopy: settings.provision?.copy,
+      blenderSandbox: Boolean(options["blender-sandbox"]),
+      noBlenderSandbox: Boolean(options["no-blender-sandbox"]),
+      exportSmoke,
+      env: { ...(settings.env ?? {}), ...parseEnvAssignments(options.env) },
+      maxDurationSeconds: inherited.maxDurationSeconds,
+      maxTurns: inherited.maxTurns,
+      maxCostUsd: inherited.maxCostUsd,
+      parentRunId,
+      nestDepth: childDepth,
+      baseRef,
+      parentWorktree
+    })
+  };
+
+  // Register the child on the parent before the worker starts so fan-out
+  // accounting sees it immediately.
+  linkChildOutcomeToParent(workspaceRoot, parentRunId, {
+    id: job.id,
+    status: "queued",
+    changedFileCount: null,
+    usage: null,
+    worktree: null
+  });
+
+  // Child process must see its own depth so a grandchild refuses correctly.
+  const childEnv = {
+    ...process.env,
+    [NEST_DEPTH_ENV]: String(childDepth),
+    [PARENT_RUN_ID_ENV]: parentRunId
+  };
+
+  if (options.background) {
+    ensureGrokAvailable(cwd);
+    const { payload, logFile } = enqueueBackgroundJob(cwd, job, request, {
+      spawnWorker: (workerCwd, jobId) => {
+        const scriptPath = path.join(ROOT_DIR, "scripts", "grok-bridge.mjs");
+        const child = spawn(process.execPath, [scriptPath, "run-worker", "--cwd", workerCwd, "--job-id", jobId], {
+          cwd: workerCwd,
+          env: childEnv,
+          detached: true,
+          stdio: "ignore",
+          windowsHide: true
+        });
+        child.unref();
+        return child;
+      }
+    });
+    // Background nest-run returns immediately with the ids the MCP tool needs.
+    // worktree is null until the worker creates it; status polling fills it in.
+    const out = {
+      jobId: payload.jobId,
+      runId: payload.jobId,
+      status: payload.status,
+      logFile: logFile ?? payload.logFile,
+      worktree: null,
+      branch: null,
+      parentRunId,
+      nestDepth: childDepth
+    };
+    outputCommandResult(out, renderQueuedTaskLaunch(payload), options.json);
+    return;
+  }
+
+  // Foreground nest-run: rare (MCP always backgrounds) but supported for tests.
+  const previousDepth = process.env[NEST_DEPTH_ENV];
+  process.env[NEST_DEPTH_ENV] = String(childDepth);
+  try {
+    await runForegroundCommand(
+      job,
+      (progress) =>
+        executeTaskRun({
+          ...request,
+          onProgress: progress
+        }),
+      { json: options.json }
+    );
+  } finally {
+    if (previousDepth === undefined) {
+      delete process.env[NEST_DEPTH_ENV];
+    } else {
+      process.env[NEST_DEPTH_ENV] = previousDepth;
+    }
+  }
+}
+
+/**
  * Porcelain lines split into their two-character status code and their path.
  *
  * The status code is what distinguishes tracked dirt from untracked dirt - `??`
@@ -4654,7 +5131,7 @@ function markJobLanded(workspaceRoot, jobId, storedJob, action) {
 
 async function handleLand(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
+    valueOptions: ["cwd", "into-run"],
     booleanOptions: ["json", "discard", "preview"]
   });
 
@@ -4671,6 +5148,75 @@ async function handleLand(argv) {
   const branchName = worktree.branch;
   const worktreePath = worktree.path;
   const baseSha = worktree.baseSha;
+  const intoRunId = options["into-run"] ? String(options["into-run"]).trim() : "";
+
+  // Nested land: merge the child branch into the PARENT worktree branch, not
+  // the main checkout. Refuses non-landable terminal statuses.
+  if (intoRunId) {
+    if (options.discard) {
+      throw new Error("land --into-run cannot be combined with --discard; discard the child alone.");
+    }
+    if (!childIsLandable(storedJob.status)) {
+      throw new Error(
+        `Refusing to land nested run ${job.id} into ${intoRunId}: status is "${storedJob.status}" ` +
+          "(need a completed-family terminal status)."
+      );
+    }
+    const parentJob = readStoredJob(workspaceRoot, intoRunId);
+    if (!parentJob?.worktree?.path) {
+      throw new Error(
+        `land --into-run ${intoRunId}: parent has no worktree path (is it still running, or already landed?).`
+      );
+    }
+    if (!branchName) {
+      throw new Error(`Run ${job.id} worktree is missing a branch name.`);
+    }
+
+    const parentWorktreePath = parentJob.worktree.path;
+    // Squash-merge inside the parent worktree so changes land on the parent's
+    // branch. Conflicts are reported; we never leave the parent half-merged
+    // without a recovery message.
+    const merge = git(parentWorktreePath, ["merge", "--squash", branchName]);
+    if (merge.status !== 0) {
+      // Best-effort abort of any partial squash state in the parent worktree.
+      git(parentWorktreePath, ["reset", "--hard", "HEAD"]);
+      git(parentWorktreePath, ["clean", "-fd"]);
+      throw new Error(
+        `Nested land of ${job.id} into parent ${intoRunId} conflicted or failed:\n` +
+          `${(merge.stderr || merge.stdout || "").trim()}\n` +
+          `Parent worktree left clean at HEAD; child worktree retained for inspection.`
+      );
+    }
+
+    removeWorktree({
+      repoRoot,
+      worktreePath,
+      branchName,
+      deleteBranch: true
+    });
+    markJobLanded(workspaceRoot, job.id, storedJob, "apply-into-parent");
+    linkChildOutcomeToParent(workspaceRoot, intoRunId, {
+      id: job.id,
+      status: storedJob.status,
+      changedFileCount: storedJob.changedFileCount ?? null,
+      usage: storedJob.usage ?? null,
+      worktree: { path: null, branch: branchName, landedInto: intoRunId }
+    });
+
+    const payload = {
+      jobId: job.id,
+      action: "apply-into-parent",
+      parentRunId: intoRunId,
+      parentWorktree: parentWorktreePath,
+      worktree,
+      branch: branchName
+    };
+    const text =
+      `Landed nested run ${job.id} into parent ${intoRunId} worktree (${parentWorktreePath}).\n` +
+      `Changes are staged in the parent worktree; the parent agent should review before its own land.\n`;
+    outputCommandResult(payload, text, options.json);
+    return;
+  }
 
   if (options.discard) {
     removeWorktree({
@@ -5298,6 +5844,9 @@ async function main() {
       break;
     case "run":
       await handleTask(argv);
+      break;
+    case "nest-run":
+      await handleNestRun(argv);
       break;
     case "import":
       await handleTransfer(argv);
