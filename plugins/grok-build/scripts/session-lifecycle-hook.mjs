@@ -6,7 +6,7 @@ import process from "node:process";
 import { terminateProcessTree } from "./lib/process.mjs";
 import { claimJobTerminal, loadState, resolveStateFile, updateState } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
-import { resolveJobKillTargets, SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
+import { resolveJobTreeKillTargets, SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
@@ -50,7 +50,31 @@ function cleanupSessionJobs(cwd, sessionId) {
   for (const job of sessionJobs) {
     const stillRunning = job.status === "queued" || job.status === "running";
     if (stillRunning) {
-      const killTargets = resolveJobKillTargets(job);
+      // Cascade through nested children so a session-end stop is
+      // platform-symmetric (not only the parent's own PIDs).
+      const { pids: killTargets, jobs: treeJobs } = resolveJobTreeKillTargets(
+        workspaceRoot,
+        job
+      );
+      for (const node of treeJobs) {
+        if (!node?.id || node.id === job.id) {
+          continue;
+        }
+        if (node.status !== "queued" && node.status !== "running") {
+          continue;
+        }
+        try {
+          claimJobTerminal(workspaceRoot, node.id, "cancelled", {
+            errorMessage: "Stopped by session end (parent cascade).",
+            phase: "cancelled",
+            pid: null,
+            agentPid: null,
+            bridgePid: null
+          });
+        } catch {
+          // Claim races are fine.
+        }
+      }
       const killResults = [];
       const survivors = [];
       for (const pid of killTargets) {

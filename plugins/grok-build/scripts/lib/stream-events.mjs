@@ -423,6 +423,11 @@ export function createStreamTranscript() {
           sessionId = typeof event.sessionId === "string" ? event.sessionId : sessionId;
           stopReason = typeof event.stopReason === "string" ? event.stopReason : stopReason;
           usage = normalizeUsage(event) ?? usage;
+          // Surface cumulative usage on the accept result so the progress path
+          // can patch the live job record mid-run (nested budget inheritance).
+          if (usage) {
+            result.usage = usage;
+          }
           const explicit = readExplicitToolCallCount(event);
           if (explicit != null) {
             // An explicit end-event count is the only way a run with no tool

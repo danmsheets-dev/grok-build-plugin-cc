@@ -409,6 +409,86 @@ export function resolveJobKillTargets(job = {}) {
   return targets;
 }
 
+/**
+ * Collect this job and every nested descendant (via children[] / parentRunId
+ * linkage on stored job files), leaf-first. Used by stop so cancelling a
+ * parent also claims and kills its nested Hyper children on every platform.
+ *
+ * @param {string} workspaceRoot
+ * @param {object} job
+ * @param {{ readStoredJob?: (root: string, id: string) => object|null }} [options]
+ * @returns {object[]} leaf-first job records (descendants before ancestors)
+ */
+export function collectJobTreeLeafFirst(workspaceRoot, job, options = {}) {
+  const readStored =
+    options.readStoredJob ??
+    ((root, id) => {
+      try {
+        return readStoredJobOrNull(root, id);
+      } catch {
+        return null;
+      }
+    });
+  const root = job && typeof job === "object" ? job : null;
+  if (!root?.id) {
+    return [];
+  }
+
+  const ordered = [];
+  const visited = new Set();
+
+  function walk(node) {
+    if (!node?.id || visited.has(node.id)) {
+      return;
+    }
+    visited.add(node.id);
+    const stored = readStored(workspaceRoot, node.id) ?? node;
+    const children = Array.isArray(stored.children) ? stored.children : [];
+    for (const entry of children) {
+      const childId = entry?.runId ?? entry?.id;
+      if (!childId || visited.has(childId)) {
+        continue;
+      }
+      const childStored = readStored(workspaceRoot, childId);
+      if (childStored) {
+        walk(childStored);
+      } else {
+        // Still visit a stub so kill targets from the entry are attempted.
+        walk({ id: childId, ...entry, status: entry.status ?? "running" });
+      }
+    }
+    ordered.push(stored);
+  }
+
+  walk(root);
+  return ordered;
+}
+
+/**
+ * Kill targets for a job and every nested descendant (leaf-first PIDs).
+ * Dedupes PIDs across the tree.
+ *
+ * @param {string} workspaceRoot
+ * @param {object} job
+ * @param {{ readStoredJob?: Function }} [options]
+ * @returns {{ pids: number[], jobs: object[] }}
+ */
+export function resolveJobTreeKillTargets(workspaceRoot, job, options = {}) {
+  const jobs = collectJobTreeLeafFirst(workspaceRoot, job, options);
+  const pids = [];
+  const seen = new Set();
+  for (const node of jobs) {
+    for (const pid of resolveJobKillTargets(node)) {
+      if (seen.has(pid)) {
+        continue;
+      }
+      seen.add(pid);
+      pids.push(pid);
+    }
+  }
+  return { pids, jobs };
+}
+
 export const HEARTBEAT_INTERVAL_MS = 15000;
 
 /**

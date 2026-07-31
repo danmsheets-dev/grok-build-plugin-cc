@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   aggregateUsageOwnVsNested,
+  applyChildrenToCompletionStatus,
   assertNestConcurrencyAllowed,
   assertNestDepthAllowed,
   buildChildSummary,
@@ -17,6 +18,7 @@ import {
   nestedDelegationEnabled,
   parentSpentCostUsd,
   remainingCostBudget,
+  remainingDurationSeconds,
   remainingNestDepth,
   upsertChildEntry,
   writeRuntimeMcpJson,
@@ -25,17 +27,36 @@ import {
   NEST_MCP_SERVER_NAME,
   NESTED_DELEGATION_ENV
 } from "../plugins/grok-build/scripts/lib/nest.mjs";
-import { artifactExcludePathspecs, shortWorktreeId } from "../plugins/grok-build/scripts/lib/worktree.mjs";
+import {
+  collectJobTreeLeafFirst,
+  resolveJobKillTargets,
+  resolveJobTreeKillTargets
+} from "../plugins/grok-build/scripts/lib/tracked-jobs.mjs";
+import {
+  generateJobId,
+  isTerminalJobStatus,
+  upsertJob,
+  writeJobFile
+} from "../plugins/grok-build/scripts/lib/state.mjs";
+import {
+  artifactExcludePathspecs,
+  createWorktree,
+  shortWorktreeId
+} from "../plugins/grok-build/scripts/lib/worktree.mjs";
 import { buildTaskStatusLines } from "../plugins/grok-build/scripts/lib/render.mjs";
 import {
+  buildDelegateRunBridgeArgs,
   handleJsonRpcMessage,
   parseJsonRpcLine,
   shapeDelegateResult
 } from "../plugins/grok-build/mcp/grok-build-mcp.mjs";
-import { makeTempDir } from "./helpers.mjs";
+import { normalizeReasoningEffort } from "../plugins/grok-build/scripts/grok-bridge.mjs";
+import { buildEnv, installFakeGrok } from "./fake-grok-fixture.mjs";
+import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "grok-build");
+const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "grok-bridge.mjs");
 
 /* -------------------------------------------------------------------------
  * Depth / fan-out bounds
@@ -396,6 +417,397 @@ test("shapeDelegateResult normalises show/wait payloads", () => {
   assert.equal(shaped.branch, "grok-build/run-x");
   assert.equal(shaped.cost, 0.05);
   assert.match(shaped.finalReport, /Done/);
+});
+
+test("shapeDelegateResult reads finalReport from production {job, storedJob} shape", () => {
+  // Literal payload shape handleResult / wait emit: job is an index row
+  // without result; storedJob carries result.finalReport and changedFiles.
+  const productionPayload = {
+    job: {
+      id: "run-child-prod",
+      status: "completed",
+      stopReason: "EndTurn",
+      verified: true,
+      changedFileCount: 4,
+      usage: { costUsd: 0.12, inputTokens: 10, outputTokens: 4 },
+      worktree: {
+        path: "/tmp/wt-child",
+        branch: "grok-build/run-child-prod",
+        changedFileCount: 4
+      },
+      logFile: "/tmp/logs/run-child-prod.log"
+      // deliberately no result
+    },
+    storedJob: {
+      id: "run-child-prod",
+      status: "completed",
+      stopReason: "EndTurn",
+      verified: true,
+      changedFileCount: 4,
+      usage: { costUsd: 0.12, inputTokens: 10, outputTokens: 4 },
+      worktree: {
+        path: "/tmp/wt-child",
+        branch: "grok-build/run-child-prod",
+        changedFileCount: 4
+      },
+      logFile: "/tmp/logs/run-child-prod.log",
+      rendered: "## Result\nRendered fallback only.",
+      result: {
+        finalReport: "## Result\nChild decided to port the inventory API.",
+        changedFiles: {
+          total: 4,
+          entries: ["M\tsrc/a.js", "M\tsrc/b.js", "A\tsrc/c.js", "M\tsrc/d.js"]
+        },
+        usage: { costUsd: 0.12, inputTokens: 10, outputTokens: 4 },
+        verified: true,
+        stopReason: "EndTurn"
+      }
+    }
+  };
+  const shaped = shapeDelegateResult(productionPayload, "run-child-prod");
+  assert.equal(shaped.runId, "run-child-prod");
+  assert.equal(shaped.status, "completed");
+  assert.equal(shaped.verified, true);
+  assert.equal(shaped.changedFileCount, 4);
+  assert.ok(shaped.changedFiles);
+  assert.equal(shaped.changedFiles.total, 4);
+  assert.match(shaped.finalReport, /port the inventory API/);
+  assert.equal(shaped.cost, 0.12);
+  assert.equal(shaped.branch, "grok-build/run-child-prod");
+});
+
+test("shapeDelegateResult falls back to storedJob.rendered when result has no report", () => {
+  const shaped = shapeDelegateResult(
+    {
+      job: { id: "run-y", status: "completed" },
+      storedJob: {
+        id: "run-y",
+        status: "completed",
+        rendered: "## Result\nOnly rendered text.",
+        result: { changedFiles: { total: 1, entries: ["M\tz.js"] } }
+      }
+    },
+    "run-y"
+  );
+  assert.match(shaped.finalReport, /Only rendered text/);
+  assert.equal(shaped.changedFiles.total, 1);
+});
+
+test("delegate_run bridge args never include --verify even if args sneak verify keys", () => {
+  const args = buildDelegateRunBridgeArgs(
+    {
+      prompt: "noop",
+      write: true,
+      verify: ["powershell -c whoami"],
+      no_verify: true,
+      max_cost: 0.5
+    },
+    "prompt.txt"
+  );
+  assert.equal(args.includes("--verify"), false);
+  assert.equal(args.includes("--no-verify"), false);
+  assert.ok(args.includes("--max-cost"));
+  assert.ok(args.includes("nest-run"));
+});
+
+test("MCP tools/list does not advertise verify on delegate_run", () => {
+  const { response } = handleJsonRpcMessage({
+    jsonrpc: "2.0",
+    id: 99,
+    method: "tools/list"
+  });
+  const runTool = response.result.tools.find((t) => t.name === "delegate_run");
+  assert.ok(runTool);
+  assert.equal(runTool.inputSchema.properties.verify, undefined);
+  assert.equal(runTool.inputSchema.properties.no_verify, undefined);
+});
+
+/* -------------------------------------------------------------------------
+ * Budget reservation / remaining wall-clock
+ * ---------------------------------------------------------------------- */
+
+test("parentSpentCostUsd counts reserved grants on live children", () => {
+  const parent = {
+    usage: { costUsd: 0.5 },
+    children: [
+      { runId: "c1", status: "running", reservedCostUsd: 1.0, usage: null },
+      { runId: "c2", status: "queued", reservedCostUsd: 0.75, usage: null }
+    ]
+  };
+  // 0.5 own + 1.0 + 0.75 reserved = 2.25
+  assert.ok(Math.abs(parentSpentCostUsd(parent) - 2.25) < 1e-9);
+});
+
+test("two concurrent children share one cost ceiling via reservation", () => {
+  const parentCap = 5;
+  // First child registers with full remaining.
+  let parent = {
+    usage: { costUsd: 0 },
+    children: []
+  };
+  const firstGrant = inheritBudget({
+    parentMaxCostUsd: parentCap,
+    parentSpentCostUsd: parentSpentCostUsd(parent),
+    childMaxCostUsd: 5
+  }).maxCostUsd;
+  assert.equal(firstGrant, 5);
+  parent = {
+    ...parent,
+    children: upsertChildEntry(parent.children, {
+      runId: "c1",
+      status: "running",
+      reservedCostUsd: firstGrant
+    })
+  };
+  const secondGrant = inheritBudget({
+    parentMaxCostUsd: parentCap,
+    parentSpentCostUsd: parentSpentCostUsd(parent),
+    childMaxCostUsd: 5
+  }).maxCostUsd;
+  // Second child must see spent=5 and get 0 remaining — not another full 5.
+  assert.equal(secondGrant, 0);
+});
+
+test("inheritBudget uses remaining wall-clock when provided", () => {
+  const result = inheritBudget({
+    parentMaxDurationSeconds: 600,
+    parentRemainingDurationSeconds: 45,
+    childMaxDurationSeconds: 300
+  });
+  assert.equal(result.maxDurationSeconds, 45);
+});
+
+test("remainingDurationSeconds subtracts elapsed from parent start", () => {
+  const start = new Date(Date.now() - 90_000).toISOString();
+  const remaining = remainingDurationSeconds(120, start, Date.now());
+  assert.ok(remaining <= 35 && remaining >= 25, `expected ~30s left, got ${remaining}`);
+});
+
+test("applyChildrenToCompletionStatus demotes completed when a child failed", () => {
+  assert.equal(
+    applyChildrenToCompletionStatus("completed", [{ runId: "c", status: "failed" }]),
+    "completed-with-failed-children"
+  );
+  assert.equal(
+    applyChildrenToCompletionStatus("completed", [{ runId: "c", status: "completed" }]),
+    "completed"
+  );
+  assert.equal(
+    applyChildrenToCompletionStatus("failed", [{ runId: "c", status: "failed" }]),
+    "failed"
+  );
+  assert.equal(isTerminalJobStatus("completed-with-failed-children"), true);
+});
+
+test("buildChildSummary carries structured fan-in fields including finalReport", () => {
+  const summary = buildChildSummary({
+    id: "run-c",
+    status: "completed",
+    verified: true,
+    usage: { costUsd: 0.2 },
+    result: {
+      finalReport: "## Result\nNested work done.",
+      changedFiles: { total: 2, entries: ["M\ta.js"] }
+    },
+    worktree: { path: "/wt", branch: "grok-build/run-c" },
+    reservedCostUsd: 0.5
+  });
+  assert.equal(summary.runId, "run-c");
+  assert.equal(summary.verified, true);
+  assert.equal(summary.cost, 0.2);
+  assert.equal(summary.reservedCostUsd, 0.5);
+  assert.match(summary.finalReport, /Nested work done/);
+  assert.equal(summary.changedFiles.total, 2);
+});
+
+test("normalizeReasoningEffort value is a string or null, never a wrapper object", () => {
+  const a = normalizeReasoningEffort(null);
+  assert.equal(a.value, null);
+  assert.equal(typeof a, "object");
+  const b = normalizeReasoningEffort("high");
+  assert.equal(b.value, "high");
+  // The bug was `const effort = normalizeReasoningEffort(...) ?? settings` — always object.
+  assert.notEqual(typeof b, "string");
+  assert.equal(typeof b.value, "string");
+});
+
+test("resolveJobTreeKillTargets walks children leaf-first", () => {
+  const dir = makeTempDir("nest-kill-tree-");
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = dir;
+  try {
+    const parentId = generateJobId("run");
+    const childId = generateJobId("run");
+    const grandId = generateJobId("run");
+    writeJobFile(dir, grandId, {
+      id: grandId,
+      status: "running",
+      agentPid: 3001,
+      bridgePid: 3002,
+      children: []
+    });
+    writeJobFile(dir, childId, {
+      id: childId,
+      status: "running",
+      agentPid: 2001,
+      bridgePid: 2002,
+      children: [{ runId: grandId, status: "running" }]
+    });
+    writeJobFile(dir, parentId, {
+      id: parentId,
+      status: "running",
+      agentPid: 1001,
+      bridgePid: 1002,
+      children: [{ runId: childId, status: "running" }]
+    });
+    upsertJob(dir, { id: parentId, status: "running" });
+    upsertJob(dir, { id: childId, status: "running" });
+    upsertJob(dir, { id: grandId, status: "running" });
+
+    const parent = {
+      id: parentId,
+      status: "running",
+      agentPid: 1001,
+      bridgePid: 1002,
+      children: [{ runId: childId, status: "running" }]
+    };
+    const tree = collectJobTreeLeafFirst(dir, parent);
+    assert.equal(tree[0].id, grandId);
+    assert.equal(tree[tree.length - 1].id, parentId);
+    const { pids } = resolveJobTreeKillTargets(dir, parent);
+    assert.ok(pids.includes(3001));
+    assert.ok(pids.includes(2001));
+    assert.ok(pids.includes(1001));
+    // Own-only targets omit the descendants.
+    const own = resolveJobKillTargets(parent);
+    assert.equal(own.includes(3001), false);
+  } finally {
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
+});
+
+test("land --into-run on merge conflict does not wipe parent worktree dirt", () => {
+  const repo = makeTempDir("nest-land-into-");
+  const binDir = makeTempDir("nest-land-bin-");
+  const pluginDataDir = makeTempDir("nest-land-data-");
+  installFakeGrok(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "shared.txt"), "base\n");
+  fs.writeFileSync(path.join(repo, "parent-only.txt"), "parent seed\n");
+  run("git", ["add", "shared.txt", "parent-only.txt"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  try {
+    const parentId = generateJobId("run");
+    const childId = generateJobId("run");
+    const parentWt = createWorktree({
+      cwd: repo,
+      runId: parentId,
+      dataDir: pluginDataDir
+    });
+    const childWt = createWorktree({
+      cwd: repo,
+      runId: childId,
+      dataDir: pluginDataDir
+    });
+
+    // Parent agent mid-run dirt (uncommitted).
+    fs.writeFileSync(path.join(parentWt.worktreePath, "parent-wip.txt"), "parent uncommitted work\n");
+    fs.writeFileSync(path.join(parentWt.worktreePath, "shared.txt"), "parent edit of shared\n");
+
+    // Child committed conflicting change to shared.txt on its branch.
+    fs.writeFileSync(path.join(childWt.worktreePath, "shared.txt"), "child edit of shared\n");
+    run("git", ["add", "shared.txt"], { cwd: childWt.worktreePath });
+    run("git", ["commit", "-m", "child change"], { cwd: childWt.worktreePath });
+
+    writeJobFile(repo, parentId, {
+      id: parentId,
+      status: "running",
+      kind: "task",
+      worktree: {
+        path: parentWt.worktreePath,
+        branch: parentWt.branchName,
+        baseSha: parentWt.baseSha
+      },
+      children: [{ runId: childId, status: "completed", branch: childWt.branchName }]
+    });
+    upsertJob(repo, {
+      id: parentId,
+      status: "running",
+      worktree: {
+        path: parentWt.worktreePath,
+        branch: parentWt.branchName,
+        baseSha: parentWt.baseSha
+      }
+    });
+    writeJobFile(repo, childId, {
+      id: childId,
+      status: "completed",
+      kind: "task",
+      parentRunId: parentId,
+      worktree: {
+        path: childWt.worktreePath,
+        branch: childWt.branchName,
+        baseSha: childWt.baseSha
+      }
+    });
+    upsertJob(repo, {
+      id: childId,
+      status: "completed",
+      worktree: {
+        path: childWt.worktreePath,
+        branch: childWt.branchName,
+        baseSha: childWt.baseSha
+      }
+    });
+
+    const env = buildEnv(binDir, { CLAUDE_PLUGIN_DATA: pluginDataDir });
+    const result = run("node", [SCRIPT, "land", childId, "--into-run", parentId, "--json"], {
+      cwd: repo,
+      env
+    });
+
+    assert.notEqual(result.status, 0, result.stdout);
+    const combined = `${result.stderr}\n${result.stdout}`;
+    // Must refuse overlap or report merge failure — never claim hard-reset clean.
+    assert.doesNotMatch(combined, /left clean at HEAD/i);
+    assert.doesNotMatch(combined, /reset --hard/i);
+
+    // Parent uncommitted work must survive.
+    assert.equal(
+      fs.readFileSync(path.join(parentWt.worktreePath, "parent-wip.txt"), "utf8"),
+      "parent uncommitted work\n"
+    );
+    assert.equal(
+      fs.readFileSync(path.join(parentWt.worktreePath, "shared.txt"), "utf8"),
+      "parent edit of shared\n"
+    );
+    // Child worktree retained for inspection.
+    assert.equal(fs.existsSync(childWt.worktreePath), true);
+
+    // Structured failure when --json.
+    if (result.stdout.trim()) {
+      try {
+        const payload = JSON.parse(result.stdout);
+        assert.equal(payload.landed, false);
+        assert.ok(payload.reason);
+      } catch {
+        // stderr-only error path is also acceptable
+      }
+    }
+  } finally {
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
 });
 
 /* -------------------------------------------------------------------------

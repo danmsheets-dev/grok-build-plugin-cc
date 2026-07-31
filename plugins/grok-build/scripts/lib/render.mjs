@@ -1035,7 +1035,19 @@ function pushNestedRunsSection(lines, meta = {}) {
       child.changedFileCount == null ? "unknown files" : `${child.changedFileCount} file(s)`;
     const usageLine = formatUsageLine(child.usage, { compact: true });
     const branch = child.branch ? ` branch ${child.branch}` : "";
+    const verified =
+      child.verified === true ? "verified" : child.verified === false ? "unverified" : null;
+    const cost =
+      child.cost != null && Number.isFinite(Number(child.cost))
+        ? `cost=$${Number(child.cost).toFixed(4)}`
+        : null;
     const parts = [`- ${id}: ${status}, ${files}`];
+    if (verified) {
+      parts.push(verified);
+    }
+    if (cost) {
+      parts.push(cost);
+    }
     if (usageLine) {
       parts.push(usageLine);
     }
@@ -1044,6 +1056,10 @@ function pushNestedRunsSection(lines, meta = {}) {
     }
     lines.push(parts.join(" · "));
     lines.push(`  Land into this worktree: node scripts/grok-bridge.mjs land ${id} --into-run ${meta.jobId ?? "<parent>"}`);
+    if (typeof child.finalReport === "string" && child.finalReport.trim()) {
+      const snippet = child.finalReport.trim().split(/\r?\n/).slice(0, 3).join(" ").slice(0, 200);
+      lines.push(`  Child report: ${snippet}${child.finalReport.trim().length > 200 ? "…" : ""}`);
+    }
     // Make non-success impossible to skim past as "fine".
     if (status !== "completed" && status !== "completed-noop") {
       lines.push(`  Note: child did not fully succeed (status=${status}); do not treat as landed work.`);

@@ -208,6 +208,9 @@ const TERMINAL_STATUSES = new Set([
   "completed-truncated",
   "completed-noop",
   "completed-blind",
+  // Parent agent finished but one or more nested children failed, cancelled,
+  // timed out, or were still live when the parent drain cancelled them.
+  "completed-with-failed-children",
   "timed-out",
   // Agent wrote into the main checkout during an isolated run. Terminal and
   // never success — decideCompletionStatus and the report contract both treat

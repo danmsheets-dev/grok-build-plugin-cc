@@ -831,7 +831,14 @@ export function buildHeadlessArgs(prompt, options = {}) {
   if (options.model) {
     trailing.push("--model", options.model);
   }
-  if (options.effort) {
+  if (options.effort != null && options.effort !== "") {
+    // Guard: nest-run once passed the normalizeReasoningEffort wrapper object
+    // and Hyper saw --effort "[object Object]". Only strings reach argv.
+    if (typeof options.effort !== "string") {
+      throw new Error(
+        `buildHeadlessArgs: options.effort must be a string (got ${typeof options.effort})`
+      );
+    }
     trailing.push("--effort", options.effort);
   }
   // Extra rules appended to the SYSTEM prompt. The output contract belongs here
@@ -1002,7 +1009,8 @@ export function runHeadlessAgent(cwd, options = {}) {
             threadId: sessionId,
             agentPid,
             logTitle: "Assistant message",
-            logBody: outcome.messageCompleted
+            logBody: outcome.messageCompleted,
+            ...(outcome.usage ? { usage: outcome.usage } : {})
           }
         );
       }
@@ -1010,7 +1018,16 @@ export function runHeadlessAgent(cwd, options = {}) {
         lastPhase = outcome.phase;
         emitProgress(options.onProgress, `Grok is ${outcome.phase}.`, outcome.phase, {
           threadId: sessionId,
-          agentPid
+          agentPid,
+          ...(outcome.usage ? { usage: outcome.usage } : {})
+        });
+      } else if (outcome.usage) {
+        // Turn-end usage without a phase change still patches the live job so
+        // nest-run budget inheritance can see parent spend mid-run.
+        emitProgress(options.onProgress, "Usage updated.", lastPhase ?? "running", {
+          threadId: sessionId,
+          agentPid,
+          usage: outcome.usage
         });
       }
     }

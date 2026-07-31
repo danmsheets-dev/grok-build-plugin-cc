@@ -103,6 +103,7 @@ import {
 } from "./lib/state.mjs";
 import {
   aggregateUsageOwnVsNested,
+  applyChildrenToCompletionStatus,
   assertNestConcurrencyAllowed,
   assertNestDepthAllowed,
   buildChildSummary,
@@ -110,11 +111,14 @@ import {
   deriveSiblingWorktreePath,
   formatNestedDelegationHeaderLine,
   inheritBudget,
+  listNonTerminalChildIds,
   nestedDelegationEnabled,
   parentSpentCostUsd,
   readMaxNestConcurrency,
   readMaxNestDepth,
   readNestDepth,
+  readNestDrainSeconds,
+  remainingDurationSeconds,
   resolveBridgeScriptPath,
   resolveMcpScriptPath,
   upsertChildEntry,
@@ -134,6 +138,8 @@ import {
   formatRunLogHeader,
   nowIso,
   resolveJobKillTargets,
+  resolveJobTreeKillTargets,
+  collectJobTreeLeafFirst,
   runTrackedJob,
   SESSION_ID_ENV,
   writeRunLogHeader
@@ -3109,6 +3115,8 @@ async function executeTaskRun(request) {
         parentMaxCostUsd: maxCostUsd,
         parentMaxDurationSeconds: maxDurationSeconds,
         parentMaxTurns: maxTurns,
+        // Bridge-side nest-run re-reads the live parent record for spend; this
+        // env snapshot is a best-effort hint at MCP launch (always 0 here).
         parentSpentCostUsd: 0
       });
       provisionSummary = {
@@ -4154,7 +4162,7 @@ async function executeTaskRun(request) {
     isolation: isolationHeader,
     workspaceRoot
   });
-  const terminalStatus = decideCompletionStatus({
+  let terminalStatus = decideCompletionStatus({
     timedOut,
     exitStatus: timedOut ? 1 : result.status,
     stopReason,
@@ -4184,6 +4192,18 @@ async function executeTaskRun(request) {
       children = Array.isArray(request.children) ? request.children : [];
     }
   }
+
+  // End-of-run children policy: drain live nested runs up to a bound, then
+  // cancel survivors so the parent's terminal record is not frozen with
+  // "running" children that nobody will ever reap (platform-symmetric).
+  if (request.jobId && children.length > 0) {
+    children = await drainNestedChildrenAtParentEnd(workspaceRoot, request.jobId, children, {
+      onProgress: request.onProgress
+    });
+  }
+  // A parent with failed/abandoned children cannot claim plain completed.
+  terminalStatus = applyChildrenToCompletionStatus(terminalStatus, children);
+
   const usageBreakdown = aggregateUsageOwnVsNested(cumulativeUsage, children);
 
   const rendered = timedOut
@@ -4369,16 +4389,20 @@ async function executeTaskRun(request) {
   };
 
   // Nested child: mirror final summary onto the parent's children[] so the
-  // parent's report can list status/usage without re-scanning every job file.
-  // A child failure never fails the parent — only updates the linkage.
+  // parent's report can list status/usage/report without re-scanning every
+  // job file. A child failure never fails the parent process — only updates
+  // the linkage (parent terminal status is adjusted separately at parent end).
   if (request.parentRunId && request.jobId) {
     try {
       linkChildOutcomeToParent(workspaceRoot, request.parentRunId, {
         id: request.jobId,
         status: terminalStatus,
+        verified: isolationBreached ? false : verified,
         changedFileCount: effectiveChangedFileCount,
+        changedFiles,
         usage: cumulativeUsage ?? null,
-        worktree
+        worktree,
+        finalReport: typeof finalReport === "string" ? finalReport : null
       });
     } catch {
       // Parent may already be terminal/pruned; never fail the child over it.
@@ -4431,6 +4455,102 @@ async function executeTaskRun(request) {
     debris: debris ?? { entries: [], total: 0, truncated: false },
     hadWork: Boolean(prompt)
   };
+}
+
+/**
+ * At parent end-of-run: wait for live nested children up to
+ * GROK_BUILD_NEST_DRAIN_SECONDS, then cancel any survivors and re-read the
+ * children[] snapshot for the terminal report.
+ */
+async function drainNestedChildrenAtParentEnd(workspaceRoot, parentRunId, children, options = {}) {
+  let live = Array.isArray(children) ? [...children] : [];
+  const drainSeconds = readNestDrainSeconds(process.env);
+  const pollMs = 500;
+  const deadline = Date.now() + drainSeconds * 1000;
+
+  const refresh = () => {
+    try {
+      const stored = readStoredJob(workspaceRoot, parentRunId);
+      if (Array.isArray(stored?.children)) {
+        live = stored.children;
+      }
+    } catch {
+      // keep last snapshot
+    }
+    // Also refresh each non-terminal child from its job file so status/usage
+    // are current even if linkChildOutcomeToParent has not run yet.
+    live = live.map((entry) => {
+      const id = entry?.runId ?? entry?.id;
+      if (!id || (entry?.status && isTerminalJobStatus(entry.status))) {
+        return entry;
+      }
+      const childStored = readStoredJob(workspaceRoot, id);
+      if (!childStored) {
+        return entry;
+      }
+      return buildChildSummary(childStored);
+    });
+    return listNonTerminalChildIds(live);
+  };
+
+  let pending = refresh();
+  if (pending.length === 0) {
+    return live;
+  }
+
+  options.onProgress?.({
+    phase: "finalizing",
+    message: `Waiting for ${pending.length} nested child run(s) (drain ${drainSeconds}s)…`
+  });
+
+  while (pending.length > 0 && Date.now() < deadline) {
+    await sleep(Math.min(pollMs, Math.max(0, deadline - Date.now())));
+    pending = refresh();
+  }
+
+  if (pending.length > 0) {
+    options.onProgress?.({
+      phase: "finalizing",
+      message: `Cancelling ${pending.length} nested child run(s) still live after drain…`
+    });
+    for (const childId of pending) {
+      try {
+        const childStored = readStoredJob(workspaceRoot, childId);
+        const record = childStored ?? { id: childId, status: "running" };
+        if (isTerminalJobStatus(record.status)) {
+          continue;
+        }
+        // Claim before kill so no child observes a cancelled parent and keeps going.
+        claimJobTerminal(workspaceRoot, childId, "cancelled", {
+          errorMessage: "Cancelled by parent end-of-run drain.",
+          phase: "cancelled",
+          pid: null,
+          agentPid: null,
+          bridgePid: null
+        });
+        terminateJobProcessTrees(record);
+        linkChildOutcomeToParent(workspaceRoot, parentRunId, {
+          id: childId,
+          status: "cancelled",
+          changedFileCount: record.changedFileCount ?? null,
+          usage: record.usage ?? null,
+          worktree: record.worktree ?? null,
+          finalReport: null
+        });
+      } catch {
+        // Best-effort; continue other children.
+      }
+    }
+    refresh();
+  }
+
+  // Persist the refreshed children list on the parent while it is still active.
+  try {
+    patchJobIfActive(workspaceRoot, parentRunId, { children: live });
+  } catch {
+    // ignore
+  }
+  return live;
 }
 
 /**
@@ -5179,13 +5299,42 @@ async function handleNestRun(argv) {
   );
 
   const model = options.model ? String(options.model).trim() : (settings.model ?? null);
-  const effort = normalizeReasoningEffort(options.effort) ?? settings.effort ?? null;
+  // Same destructure as handleTask: normalizeReasoningEffort always returns
+  // `{ value, warning }`, never a bare string/null — using `??` left the
+  // wrapper object on the request and Hyper saw --effort "[object Object]".
+  const effortNorm = normalizeReasoningEffort(options.effort ?? settings.effort ?? null);
+  if (effortNorm.warning) {
+    process.stderr.write(`[grok-build] ${effortNorm.warning}\n`);
+  }
+  const effort = effortNorm.value;
   const billingGate = assertModelBillingAllowed(model, process.env);
   if (!billingGate.allowed) {
     throw new Error(billingGate.message);
   }
 
-  // Budget inheritance: parent ceilings + remaining cost. Child may ask for less.
+  // Nested agents must not smuggle free-form --verify through nest-run: the
+  // bridge executes those strings outside Hyper confinement. Humans invoking
+  // nest-run from a shell (no PARENT_RUN_ID) may still pass CLI verify.
+  const nestedAgentCaller = Boolean(
+    process.env[PARENT_RUN_ID_ENV] && String(process.env[PARENT_RUN_ID_ENV]).trim()
+  );
+  if (nestedAgentCaller) {
+    if (Array.isArray(options.verify) && options.verify.length > 0) {
+      throw new Error(
+        "nest-run refuses --verify when called from a nested agent: verify commands " +
+          "run outside Hyper confinement. The child uses project/ecosystem verify only."
+      );
+    }
+    if (options["no-verify"]) {
+      throw new Error(
+        "nest-run refuses --no-verify when called from a nested agent; " +
+          "the child resolves verify from project config and ecosystem defaults."
+      );
+    }
+  }
+
+  // Budget inheritance: parent ceilings + remaining cost (including reserved
+  // grants for live siblings) + remaining wall-clock. Child may ask for less.
   const parentBudget = parentStored.budget ?? parentStored.request?.budget ?? {};
   const parentMaxCost =
     parentBudget.maxCostUsd ??
@@ -5205,7 +5354,14 @@ async function handleNestRun(argv) {
     (process.env.GROK_BUILD_PARENT_MAX_TURNS != null
       ? Number(process.env.GROK_BUILD_PARENT_MAX_TURNS)
       : null);
-  const spent = parentSpentCostUsd(parentStored);
+  // Re-read parent so concurrent nest-run registrations see each other's
+  // reservedCostUsd entries before launch.
+  const parentFresh = readStoredJob(workspaceRoot, parentRunId) ?? parentStored;
+  const spent = parentSpentCostUsd(parentFresh);
+  const parentRemainingDuration = remainingDurationSeconds(
+    parentMaxDuration,
+    parentFresh.startedAt ?? parentFresh.createdAt ?? null
+  );
 
   const childRequested = {
     maxCostUsd: resolveMaxCostUsd(options["max-cost"] ?? settings.maxCostUsd),
@@ -5218,13 +5374,15 @@ async function handleNestRun(argv) {
     parentMaxCostUsd: parentMaxCost,
     parentSpentCostUsd: spent,
     parentMaxDurationSeconds: parentMaxDuration,
+    parentRemainingDurationSeconds: parentRemainingDuration,
     parentMaxTurns,
     childMaxCostUsd: childRequested.maxCostUsd,
     childMaxDurationSeconds: childRequested.maxDurationSeconds,
     childMaxTurns: childRequested.maxTurns
   });
 
-  const verifyCommands = settings.verify;
+  // Agent-originated nest-run: never honour CLI verify overrides.
+  const verifyCommands = nestedAgentCaller ? (settings.verifyDisabled ? [] : settings.verify) : settings.verify;
   const verifyPlan = {
     source: settings.sources.verify,
     disabled: Boolean(settings.verifyDisabled),
@@ -5302,13 +5460,16 @@ async function handleNestRun(argv) {
   };
 
   // Register the child on the parent before the worker starts so fan-out
-  // accounting sees it immediately.
+  // accounting sees it immediately. reservedCostUsd debits the parent's
+  // remaining budget for concurrent siblings (refunded implicitly when the
+  // child terminals with actual usage).
   linkChildOutcomeToParent(workspaceRoot, parentRunId, {
     id: job.id,
     status: "queued",
     changedFileCount: null,
     usage: null,
-    worktree: null
+    worktree: null,
+    reservedCostUsd: inherited.maxCostUsd
   });
 
   // Child process must see its own depth so a grandchild refuses correctly.
@@ -5577,6 +5738,43 @@ function recoverFromFailedLandMerge(repoRoot, jobId, branchName, merge) {
 }
 
 /**
+ * Nested land failure recovery. Mirrors top-level recoverFromFailedLandMerge
+ * messaging but MUST NOT run `git reset --hard` or `git clean -fd` on the
+ * parent worktree — that tree belongs to a still-running parent agent.
+ */
+function recoverFromFailedNestedLand(parentWorktreePath, childJobId, parentRunId, branchName, merge) {
+  const combined = `${merge.stderr || ""}\n${merge.stdout || ""}`;
+  const conflicted = new Set(
+    [...combined.matchAll(/CONFLICT \([^)]*\): Merge conflict in (.+)/g)].map((match) =>
+      match[1].trim()
+    )
+  );
+  const listed = [...conflicted];
+  const payload = {
+    landed: false,
+    reason: listed.length > 0 ? "merge-conflict" : "merge-failed",
+    jobId: childJobId,
+    parentRunId,
+    parentWorktree: parentWorktreePath,
+    branch: branchName,
+    conflictingFiles: listed,
+    gitStatus: merge.status,
+    gitStderr: (merge.stderr || "").trim() || null,
+    gitStdout: (merge.stdout || "").trim() || null
+  };
+  const detail = combined.trim().split(/\r?\n/).filter(Boolean).slice(0, 8).join("; ");
+  const message =
+    listed.length > 0
+      ? `Nested land of ${childJobId} into parent ${parentRunId} hit merge conflicts in: ${listed.join(", ")}. ` +
+        `Parent worktree was restored without hard-reset/clean (parent agent work preserved). ` +
+        `Child worktree retained for inspection. Options: resolve conflicts by hand in the parent worktree, ` +
+        `or discard the child with land ${childJobId} --discard.`
+      : `Nested land of ${childJobId} into parent ${parentRunId} failed: ${detail || `git exited ${merge.status}`}. ` +
+        `Parent worktree was not hard-reset or cleaned; child worktree retained for inspection.`;
+  return { payload, message };
+}
+
+/**
  * Clear a job's worktree field after it has been successfully landed or
  * discarded. Reuses the existing "no worktree to land" guard at the top of
  * handleLand: without this, a second `land` call against the same job id
@@ -5639,19 +5837,88 @@ async function handleLand(argv) {
     }
 
     const parentWorktreePath = parentJob.worktree.path;
+
+    // Dirty gate (mirrors top-level land, rooted at the parent worktree):
+    // never squash-merge over parent dirt that the child also touches. Other
+    // parent dirt is allowed (mid-run land is the design), but overlapping
+    // paths are refused so we never need a destructive recovery.
+    let parentDirty = git(parentWorktreePath, [
+      "status",
+      "--porcelain",
+      "--",
+      ".",
+      ...artifactExcludePathspecs()
+    ]);
+    if (parentDirty.status !== 0) {
+      parentDirty = git(parentWorktreePath, ["status", "--porcelain"]);
+    }
+    if (parentDirty.status !== 0) {
+      throw new Error(
+        `Unable to inspect parent worktree before nested land: ${(parentDirty.stderr || parentDirty.stdout || "").trim()}`
+      );
+    }
+    const parentDirtyFiles = porcelainDirtyPaths(parentDirty.stdout);
+    const childFilesRaw = git(parentWorktreePath, [
+      "diff",
+      "--name-only",
+      `${baseSha || "HEAD"}...${branchName}`
+    ]);
+    const childFiles = new Set(
+      String(childFilesRaw.stdout || "")
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean)
+    );
+    const overlapping = parentDirtyFiles.filter((file) => childFiles.has(file));
+    if (overlapping.length > 0) {
+      const payload = {
+        landed: false,
+        reason: "parent-dirty-overlap",
+        jobId: job.id,
+        parentRunId: intoRunId,
+        conflictingFiles: overlapping,
+        parentDirtyFiles,
+        childFiles: [...childFiles]
+      };
+      const message =
+        `Refusing nested land of ${job.id} into parent ${intoRunId}: parent worktree has ` +
+        `uncommitted changes that overlap the child's files (${overlapping.slice(0, 8).join(", ")}). ` +
+        `Parent worktree was not modified. Resolve the overlap, then retry.`;
+      if (options.json) {
+        outputCommandResult(payload, `${message}\n`, true);
+        process.exitCode = 1;
+        return;
+      }
+      throw new Error(message);
+    }
+
     // Squash-merge inside the parent worktree so changes land on the parent's
-    // branch. Conflicts are reported; we never leave the parent half-merged
-    // without a recovery message.
+    // branch. On failure: restore like top-level land — never hard-reset +
+    // clean -fd (that destroys the parent agent's uncommitted work).
     const merge = git(parentWorktreePath, ["merge", "--squash", branchName]);
     if (merge.status !== 0) {
-      // Best-effort abort of any partial squash state in the parent worktree.
-      git(parentWorktreePath, ["reset", "--hard", "HEAD"]);
-      git(parentWorktreePath, ["clean", "-fd"]);
-      throw new Error(
-        `Nested land of ${job.id} into parent ${intoRunId} conflicted or failed:\n` +
-          `${(merge.stderr || merge.stdout || "").trim()}\n` +
-          `Parent worktree left clean at HEAD; child worktree retained for inspection.`
+      // Prefer reset --merge: restores conflicted paths to HEAD while keeping
+      // unrelated local modifications. Never clean -fd. Never claim the parent
+      // tree was "left clean at HEAD".
+      const soft = git(parentWorktreePath, ["reset", "--merge"]);
+      if (soft.status !== 0) {
+        // Last resort for squash (no MERGE_HEAD): mixed reset unstages without
+        // wiping the working tree of parent edits.
+        git(parentWorktreePath, ["reset", "HEAD"]);
+      }
+      const recovery = recoverFromFailedNestedLand(
+        parentWorktreePath,
+        job.id,
+        intoRunId,
+        branchName,
+        merge
       );
+      if (options.json) {
+        outputCommandResult(recovery.payload, `${recovery.message}\n`, true);
+        process.exitCode = 1;
+        return;
+      }
+      throw new Error(recovery.message);
     }
 
     removeWorktree({
@@ -5666,10 +5933,12 @@ async function handleLand(argv) {
       status: storedJob.status,
       changedFileCount: storedJob.changedFileCount ?? null,
       usage: storedJob.usage ?? null,
-      worktree: { path: null, branch: branchName, landedInto: intoRunId }
+      worktree: { path: null, branch: branchName, landedInto: intoRunId },
+      landedInto: intoRunId
     });
 
     const payload = {
+      landed: true,
       jobId: job.id,
       action: "apply-into-parent",
       parentRunId: intoRunId,
@@ -5708,6 +5977,32 @@ async function handleLand(argv) {
   }
   if (!baseSha) {
     throw new Error(`Run ${job.id} worktree is missing baseSha.`);
+  }
+
+  // Parent landing its own branch: surface unlanded nested children so the
+  // caller knows land will not merge their work.
+  const parentChildren = Array.isArray(storedJob.children) ? storedJob.children : [];
+  const unlandedChildren = parentChildren.filter((child) => {
+    if (!childIsLandable(child?.status)) {
+      return false;
+    }
+    if (child?.landedInto) {
+      return false;
+    }
+    // worktree null + landedInto set is the post-land marker; a still-landable
+    // child with a branch/worktree path is unlanded.
+    return Boolean(child?.branch || child?.worktree);
+  });
+  if (unlandedChildren.length > 0 && !options.discard && !options.preview) {
+    const lines = unlandedChildren.map((child) => {
+      const id = child.runId ?? child.id;
+      return `  land ${id} --into-run ${job.id}`;
+    });
+    process.stderr.write(
+      `[grok-build] Warning: ${unlandedChildren.length} nested child run(s) completed but were never ` +
+        `landed into this worktree. Landing the parent will not include their branches.\n` +
+        `${lines.join("\n")}\n`
+    );
   }
 
   const diffRange = `${baseSha}..${branchName}`;
@@ -6011,8 +6306,13 @@ function handleTaskResumeCandidate(argv) {
   outputCommandResult(payload, rendered, options.json);
 }
 
-function terminateJobProcessTrees(job) {
-  const targets = resolveJobKillTargets(job);
+function terminateJobProcessTrees(job, options = {}) {
+  const targets =
+    options.pids != null
+      ? options.pids
+      : options.workspaceRoot
+        ? resolveJobTreeKillTargets(options.workspaceRoot, job).pids
+        : resolveJobKillTargets(job);
   const results = [];
   const survivors = [];
   for (const pid of targets) {
@@ -6032,7 +6332,8 @@ function terminateJobProcessTrees(job) {
       method: null,
       errorText: null,
       survivors: [],
-      results: []
+      results: [],
+      killTargets: targets
     };
   }
   const uniqueSurvivors = [...new Set(survivors)];
@@ -6044,8 +6345,63 @@ function terminateJobProcessTrees(job) {
     method: results.map((entry) => entry.method).filter(Boolean).join("+") || null,
     errorText: results.map((entry) => entry.errorText).filter(Boolean).join("; ") || null,
     survivors: uniqueSurvivors,
-    results
+    results,
+    killTargets: targets
   };
+}
+
+/**
+ * Claim every nested descendant cancelled (leaf-first) before killing PIDs,
+ * then kill the whole tree. Platform-symmetric: Windows job-object teardown
+ * and Unix orphans both become an explicit cascade.
+ */
+function cancelJobTree(workspaceRoot, rootJob, options = {}) {
+  const tree = collectJobTreeLeafFirst(workspaceRoot, rootJob);
+  const childClaims = [];
+  // Leaf-first: claim descendants before the root so no child observes a
+  // cancelled parent and keeps going.
+  for (const node of tree) {
+    if (!node?.id || node.id === rootJob.id) {
+      continue;
+    }
+    if (isTerminalJobStatus(node.status)) {
+      childClaims.push({ jobId: node.id, status: node.status, alreadyTerminal: true });
+      continue;
+    }
+    try {
+      const claim = claimJobTerminal(workspaceRoot, node.id, "cancelled", {
+        errorMessage: options.childErrorMessage ?? "Stopped because parent run was cancelled.",
+        phase: "cancelled",
+        pid: null,
+        agentPid: null,
+        bridgePid: null,
+        logFile: node.logFile ?? null
+      });
+      childClaims.push({
+        jobId: node.id,
+        status: claim.status ?? "cancelled",
+        alreadyTerminal: !claim.claimed,
+        claimed: Boolean(claim.claimed)
+      });
+      if (rootJob.id && node.parentRunId === rootJob.id) {
+        linkChildOutcomeToParent(workspaceRoot, rootJob.id, {
+          id: node.id,
+          status: "cancelled",
+          changedFileCount: node.changedFileCount ?? null,
+          usage: node.usage ?? null,
+          worktree: node.worktree ?? null
+        });
+      }
+    } catch (error) {
+      childClaims.push({
+        jobId: node.id,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+  const { pids } = resolveJobTreeKillTargets(workspaceRoot, rootJob);
+  const killResult = terminateJobProcessTrees(rootJob, { pids });
+  return { childClaims, killResult, treeJobIds: tree.map((n) => n.id) };
 }
 
 async function handleCancel(argv) {
@@ -6061,7 +6417,11 @@ async function handleCancel(argv) {
   const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
   const existing = readStoredJob(workspaceRoot, job.id) ?? job;
   const preClaimRecord = { ...job, ...existing };
-  const killTargets = resolveJobKillTargets(preClaimRecord);
+  // Cascade: claim descendants leaf-first, then kill the whole tree.
+  const treeCancel = cancelJobTree(workspaceRoot, preClaimRecord, {
+    childErrorMessage: "Stopped because parent run was cancelled by user."
+  });
+  const killTargets = treeCancel.killResult.killTargets ?? resolveJobTreeKillTargets(workspaceRoot, preClaimRecord).pids;
 
   const claim = claimJobTerminal(workspaceRoot, job.id, "cancelled", {
     errorMessage: "Stopped by user.",
@@ -6072,7 +6432,7 @@ async function handleCancel(argv) {
     logFile: existing.logFile ?? job.logFile ?? null
   });
 
-  const killResult = terminateJobProcessTrees(preClaimRecord);
+  const killResult = treeCancel.killResult;
 
   if (!claim.claimed && claim.status && claim.status !== "cancelled") {
     const payload = {
@@ -6137,6 +6497,8 @@ async function handleCancel(argv) {
     killSurvivors: killResult.survivors,
     killErrorText: killResult.errorText,
     killTargets,
+    childClaims: treeCancel.childClaims,
+    cascadedChildren: treeCancel.treeJobIds.filter((id) => id !== job.id),
     claimOrder: "claim-before-kill",
     claimed: claim.claimed
   };

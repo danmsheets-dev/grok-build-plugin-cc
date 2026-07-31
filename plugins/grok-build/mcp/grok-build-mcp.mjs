@@ -164,13 +164,7 @@ defineTool(
       effort: { type: "string", enum: ["low", "medium", "high"] },
       max_turns: { type: "number" },
       max_cost: { type: "number", description: "USD ceiling; cannot exceed parent's remaining budget." },
-      max_duration: { type: "number", description: "Seconds ceiling; cannot exceed parent's ceiling." },
-      verify: {
-        type: "array",
-        items: { type: "string" },
-        description: "Verify commands for the child (bridge-side)."
-      },
-      no_verify: { type: "boolean" }
+      max_duration: { type: "number", description: "Seconds ceiling; cannot exceed parent's remaining wall clock." }
     },
     required: ["prompt"]
   },
@@ -180,42 +174,20 @@ defineTool(
       return toolError("delegate_run requires a non-empty prompt");
     }
 
+    // verify / no_verify are intentionally not accepted: free-form verify
+    // strings would run under the bridge (node → cmd.exe), outside Hyper
+    // confinement. The child resolves its own plan from project config /
+    // ecosystem like any other run.
+    if (args.verify != null || args.no_verify != null) {
+      return toolError(
+        "delegate_run does not accept verify/no_verify; the child resolves " +
+          "verify from project config and ecosystem defaults only."
+      );
+    }
+
     const workspaceRoot = resolveWorkspaceRoot();
     const promptFile = writePromptFile(prompt, workspaceRoot);
-    const bridgeArgs = [
-      "nest-run",
-      "--background",
-      "--prompt-file",
-      promptFile
-    ];
-
-    const write = args.write === false ? false : true;
-    if (write) {
-      bridgeArgs.push("--write");
-    }
-    if (args.model) {
-      bridgeArgs.push("--model", String(args.model));
-    }
-    if (args.effort) {
-      bridgeArgs.push("--effort", String(args.effort));
-    }
-    if (args.max_turns != null) {
-      bridgeArgs.push("--max-turns", String(args.max_turns));
-    }
-    if (args.max_cost != null) {
-      bridgeArgs.push("--max-cost", String(args.max_cost));
-    }
-    if (args.max_duration != null) {
-      bridgeArgs.push("--max-duration", String(args.max_duration));
-    }
-    if (args.no_verify) {
-      bridgeArgs.push("--no-verify");
-    }
-    if (Array.isArray(args.verify)) {
-      for (const command of args.verify) {
-        bridgeArgs.push("--verify", String(command));
-      }
-    }
+    const bridgeArgs = buildDelegateRunBridgeArgs(args, promptFile);
 
     const result = runBridge(bridgeArgs);
     if (!result.ok || !result.parsed) {
@@ -404,32 +376,73 @@ defineTool(
 
 /**
  * Normalise show/wait JSON into the contract surface for wait/result.
+ *
+ * Production `show --json` / `wait --json` emit `{ job, storedJob }` where
+ * `job` is an index row (no `result`) and the full terminal payload lives on
+ * `storedJob.result` / `storedJob.rendered`. Older flat fixtures still work.
  */
 export function shapeDelegateResult(parsed, runId) {
   const job = parsed?.job ?? parsed ?? {};
-  const result = job.result ?? parsed?.result ?? {};
-  const worktree = job.worktree ?? result.worktree ?? null;
-  const usage = job.usage ?? result.usage ?? null;
+  const stored = parsed?.storedJob ?? null;
+  const result = stored?.result ?? job.result ?? parsed?.result ?? {};
+  const worktree = job.worktree ?? stored?.worktree ?? result.worktree ?? null;
+  const usage = job.usage ?? stored?.usage ?? result.usage ?? null;
   const finalReport =
     result.finalReport ??
     result.rawOutput ??
+    result.transcript ??
+    (typeof stored?.rendered === "string" ? stored.rendered : null) ??
     (typeof parsed?.rendered === "string" ? parsed.rendered : null);
 
   return {
-    runId: job.id ?? runId,
-    status: job.status ?? parsed?.status ?? "unknown",
-    stopReason: job.stopReason ?? result.stopReason ?? null,
-    verified: job.verified ?? result.verified ?? null,
+    runId: job.id ?? stored?.id ?? runId,
+    status: job.status ?? stored?.status ?? parsed?.status ?? "unknown",
+    stopReason: job.stopReason ?? stored?.stopReason ?? result.stopReason ?? null,
+    verified: job.verified ?? stored?.verified ?? result.verified ?? null,
     changedFiles: result.changedFiles ?? null,
     changedFileCount:
-      job.changedFileCount ?? result.changedFileCount ?? worktree?.changedFileCount ?? null,
+      job.changedFileCount ??
+      stored?.changedFileCount ??
+      result.changedFileCount ??
+      result.changedFiles?.total ??
+      worktree?.changedFileCount ??
+      null,
     usage,
     cost: usage?.costUsd ?? null,
     worktree: worktree?.path ?? null,
     branch: worktree?.branch ?? null,
     finalReport,
-    logFile: job.logFile ?? null
+    logFile: job.logFile ?? stored?.logFile ?? null
   };
+}
+
+/**
+ * Build the argv that `delegate_run` would pass to the bridge for a given
+ * tool-args object. Exported for confinement regression tests.
+ */
+export function buildDelegateRunBridgeArgs(args = {}, promptFile = "prompt.txt") {
+  const bridgeArgs = ["nest-run", "--background", "--prompt-file", promptFile];
+  const write = args.write === false ? false : true;
+  if (write) {
+    bridgeArgs.push("--write");
+  }
+  if (args.model) {
+    bridgeArgs.push("--model", String(args.model));
+  }
+  if (args.effort) {
+    bridgeArgs.push("--effort", String(args.effort));
+  }
+  if (args.max_turns != null) {
+    bridgeArgs.push("--max-turns", String(args.max_turns));
+  }
+  if (args.max_cost != null) {
+    bridgeArgs.push("--max-cost", String(args.max_cost));
+  }
+  if (args.max_duration != null) {
+    bridgeArgs.push("--max-duration", String(args.max_duration));
+  }
+  // Never forward verify / no_verify — see tool handler above.
+  return bridgeArgs;
 }
 
 // ---------------------------------------------------------------------------

@@ -143,12 +143,15 @@ export function assertNestConcurrencyAllowed(children, maxConcurrency = DEFAULT_
 /**
  * Parent budgets are ceilings. A child may ask for less, never more.
  * Cost uses the *remaining* parent budget (cap minus spend so far, including
- * earlier children) so N children cannot each spend the full parent cap.
+ * earlier children and reserved grants for live siblings) so N children cannot
+ * each spend the full parent cap. Duration uses remaining wall-clock when
+ * `parentRemainingDurationSeconds` is supplied (preferred over the raw cap).
  *
  * @param {{
  *   parentMaxCostUsd?: number|null,
  *   parentSpentCostUsd?: number|null,
  *   parentMaxDurationSeconds?: number|null,
+ *   parentRemainingDurationSeconds?: number|null,
  *   parentMaxTurns?: number|null,
  *   childMaxCostUsd?: number|null,
  *   childMaxDurationSeconds?: number|null,
@@ -157,13 +160,42 @@ export function assertNestConcurrencyAllowed(children, maxConcurrency = DEFAULT_
  */
 export function inheritBudget(input = {}) {
   const parentRemainingCost = remainingCostBudget(input.parentMaxCostUsd, input.parentSpentCostUsd);
+  const durationCeiling =
+    input.parentRemainingDurationSeconds != null &&
+    Number.isFinite(Number(input.parentRemainingDurationSeconds))
+      ? Number(input.parentRemainingDurationSeconds)
+      : input.parentMaxDurationSeconds;
 
   return {
     maxCostUsd: clampCeiling(input.childMaxCostUsd, parentRemainingCost),
-    maxDurationSeconds: clampCeiling(input.childMaxDurationSeconds, input.parentMaxDurationSeconds),
+    maxDurationSeconds: clampCeiling(input.childMaxDurationSeconds, durationCeiling),
     maxTurns: clampCeiling(input.childMaxTurns, input.parentMaxTurns),
-    parentRemainingCostUsd: parentRemainingCost
+    parentRemainingCostUsd: parentRemainingCost,
+    parentRemainingDurationSeconds:
+      durationCeiling != null && Number.isFinite(Number(durationCeiling))
+        ? Math.max(0, Number(durationCeiling))
+        : null
   };
+}
+
+/**
+ * Remaining wall-clock seconds under a parent's max-duration ceiling.
+ * Null parent cap → null (no ceiling). Missing/invalid start → full cap.
+ */
+export function remainingDurationSeconds(parentMaxDurationSeconds, parentStartedAt, nowMs = Date.now()) {
+  if (parentMaxDurationSeconds == null || !Number.isFinite(Number(parentMaxDurationSeconds))) {
+    return null;
+  }
+  const cap = Math.max(0, Number(parentMaxDurationSeconds));
+  if (!parentStartedAt) {
+    return cap;
+  }
+  const startedMs = Date.parse(String(parentStartedAt));
+  if (!Number.isFinite(startedMs)) {
+    return cap;
+  }
+  const elapsedSec = Math.max(0, (Number(nowMs) - startedMs) / 1000);
+  return Math.max(0, cap - elapsedSec);
 }
 
 /**
@@ -275,34 +307,81 @@ export function aggregateUsageOwnVsNested(ownUsage, children = []) {
 }
 
 /**
- * Sum costUsd across a parent job's own usage and every recorded child.
+ * Sum costUsd the parent has already committed:
+ * - own usage so far
+ * - each terminal (or usage-bearing) child's actual cost
+ * - each live child's *reserved* grant (so concurrent fan-out cannot each take
+ *   the full remaining cap)
+ *
  * Used as the "spend so far" input to inheritBudget for the next child.
  */
 export function parentSpentCostUsd(parentJob = {}) {
-  const { includingNested } = aggregateUsageOwnVsNested(parentJob.usage, parentJob.children);
-  if (includingNested?.costUsd != null && Number.isFinite(Number(includingNested.costUsd))) {
-    return Number(includingNested.costUsd);
+  let spent = 0;
+  const own = parentJob?.usage;
+  if (own?.costUsd != null && Number.isFinite(Number(own.costUsd))) {
+    spent += Number(own.costUsd);
   }
-  return 0;
+  for (const child of Array.isArray(parentJob?.children) ? parentJob.children : []) {
+    const usageCost =
+      child?.usage?.costUsd != null && Number.isFinite(Number(child.usage.costUsd))
+        ? Number(child.usage.costUsd)
+        : null;
+    const reserved =
+      child?.reservedCostUsd != null && Number.isFinite(Number(child.reservedCostUsd))
+        ? Number(child.reservedCostUsd)
+        : null;
+    const status = child?.status;
+    const terminal = status ? isTerminalJobStatus(status) : false;
+    if (usageCost != null && (terminal || usageCost > 0)) {
+      // Actual spend replaces the reservation once known.
+      spent += usageCost;
+    } else if (!terminal && reserved != null) {
+      spent += reserved;
+    } else if (usageCost != null) {
+      spent += usageCost;
+    }
+  }
+  return spent;
 }
 
 /**
  * Compact child summary stored on the parent record.
+ * Structured fan-in: id, status, verified, changed files, cost, and the
+ * child's own report when available — not a flattened string.
  */
 export function buildChildSummary(job = {}) {
   const runId = job.id ?? job.runId ?? null;
   const worktree = job.worktree ?? null;
+  const usage = job.usage ?? job.result?.usage ?? null;
+  const finalReport =
+    job.finalReport ??
+    job.result?.finalReport ??
+    job.result?.rawOutput ??
+    null;
+  const changedFiles = job.changedFiles ?? job.result?.changedFiles ?? null;
   return {
     runId,
     status: job.status ?? "unknown",
+    verified: job.verified ?? job.result?.verified ?? null,
     changedFileCount:
       job.changedFileCount ??
-      job.result?.changedFiles?.total ??
+      changedFiles?.total ??
       worktree?.changedFileCount ??
       null,
-    usage: job.usage ?? job.result?.usage ?? null,
-    worktree: worktree?.path ?? null,
-    branch: worktree?.branch ?? null
+    changedFiles,
+    usage,
+    cost: usage?.costUsd ?? job.cost ?? null,
+    reservedCostUsd:
+      job.reservedCostUsd != null && Number.isFinite(Number(job.reservedCostUsd))
+        ? Number(job.reservedCostUsd)
+        : null,
+    worktree: typeof worktree === "string" ? worktree : (worktree?.path ?? null),
+    branch:
+      job.branch ??
+      (typeof worktree === "object" && worktree ? worktree.branch : null) ??
+      null,
+    finalReport: typeof finalReport === "string" ? finalReport : null,
+    landedInto: job.landedInto ?? worktree?.landedInto ?? null
   };
 }
 
@@ -316,20 +395,103 @@ export function upsertChildEntry(children, entry) {
     return list;
   }
   const index = list.findIndex((c) => (c.runId ?? c.id) === runId);
+  const summary = buildChildSummary({ ...entry, id: runId, runId });
   const normalized = {
     runId,
-    status: entry.status ?? "unknown",
-    changedFileCount: entry.changedFileCount ?? null,
-    usage: entry.usage ?? null,
-    worktree: entry.worktree ?? null,
-    branch: entry.branch ?? null
+    status: summary.status,
+    verified: summary.verified,
+    changedFileCount: summary.changedFileCount,
+    changedFiles: summary.changedFiles,
+    usage: summary.usage,
+    cost: summary.cost,
+    reservedCostUsd: summary.reservedCostUsd,
+    worktree: summary.worktree,
+    branch: summary.branch,
+    finalReport: summary.finalReport,
+    landedInto: summary.landedInto
   };
   if (index === -1) {
     list.push(normalized);
   } else {
-    list[index] = { ...list[index], ...normalized };
+    // Preserve reservedCostUsd when a later update omits it (terminal patch
+    // with usage should still keep the grant for audit; spend math uses usage).
+    list[index] = {
+      ...list[index],
+      ...normalized,
+      reservedCostUsd:
+        normalized.reservedCostUsd != null
+          ? normalized.reservedCostUsd
+          : list[index].reservedCostUsd ?? null
+    };
   }
   return list;
+}
+
+/**
+ * Classify parent terminal status when children did not all succeed.
+ * A parent whose own agent work succeeded still must not claim plain
+ * `completed` if a child failed, cancelled, or was abandoned.
+ *
+ * @param {string} ownStatus
+ * @param {Array<{ status?: string }>} children
+ * @returns {string}
+ */
+export function applyChildrenToCompletionStatus(ownStatus, children = []) {
+  const list = Array.isArray(children) ? children : [];
+  if (list.length === 0) {
+    return ownStatus;
+  }
+  const nonTerminal = list.filter((c) => c?.status && !isTerminalJobStatus(c.status));
+  const failed = list.filter((c) => {
+    const s = c?.status;
+    return (
+      s === "failed" ||
+      s === "timed-out" ||
+      s === "isolation-breached" ||
+      s === "cancelled" ||
+      s === "completed-truncated"
+    );
+  });
+  const successFamily = new Set([
+    "completed",
+    "completed-unverified",
+    "completed-noop",
+    "completed-blind"
+  ]);
+  if (!successFamily.has(ownStatus) && ownStatus !== "completed-truncated") {
+    return ownStatus;
+  }
+  if (nonTerminal.length > 0 || failed.length > 0) {
+    return "completed-with-failed-children";
+  }
+  return ownStatus;
+}
+
+/**
+ * Default bound (seconds) the parent waits for live children at end of run.
+ */
+export const DEFAULT_NEST_DRAIN_SECONDS = 120;
+export const NEST_DRAIN_SECONDS_ENV = "GROK_BUILD_NEST_DRAIN_SECONDS";
+
+export function readNestDrainSeconds(env = process.env) {
+  const raw = env?.[NEST_DRAIN_SECONDS_ENV];
+  if (raw === undefined || raw === null || String(raw).trim() === "") {
+    return DEFAULT_NEST_DRAIN_SECONDS;
+  }
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n < 0) {
+    return DEFAULT_NEST_DRAIN_SECONDS;
+  }
+  return Math.floor(n);
+}
+
+/**
+ * Live (non-terminal) child run ids from a parent children[] snapshot.
+ */
+export function listNonTerminalChildIds(children = []) {
+  return listLiveChildren(children)
+    .map((c) => c.runId ?? c.id)
+    .filter(Boolean);
 }
 
 /**
