@@ -949,8 +949,12 @@ function pushStreamChannelLines(lines, meta = {}) {
 
   const violations = Array.isArray(meta.confineViolations) ? meta.confineViolations : [];
   if (violations.length > 0) {
+    // Blocked attempt ≠ breach. The CLI refused the write; isolation held unless
+    // the main-checkout dirty-set (or shared-dir fingerprint) independently says
+    // otherwise. Do not fold this signal into isolationBreached.
+    const n = violations.length;
     lines.push(
-      `Confine violation${violations.length === 1 ? "" : "s"}: the agent attempted ${violations.length} path(s) outside the confine root (CLI blocked; treat isolation as breached).`
+      `${n} confine attempt${n === 1 ? "" : "s"} blocked by the CLI (isolation held).`
     );
     for (const v of violations.slice(0, 20)) {
       const tool = v.tool ? `tool=${v.tool}` : "tool=?";
@@ -1118,29 +1122,53 @@ export function buildTaskStatusLines(meta = {}, rawOutput = "") {
     // one look at the list below; a missed breach costs the thing this whole
     // mechanism exists to prevent. Do not soften it into a warning.
     //
-    // Confine violations (CLI-blocked escapes) also force isolationBreached —
-    // those are agent attempts, not a dirty-set guess.
-    const fromConfine =
-      Array.isArray(meta.confineViolations) && meta.confineViolations.length > 0;
+    // WP-B7-FIX: CLI-blocked confine attempts do NOT set isolationBreached.
+    // Only a real main-checkout dirty-set (or shared-dir) change does. Blocked
+    // attempts are surfaced separately above as "isolation held".
+    //
+    // R7-1: name BOTH file lists (worktree vs main). A split state is harder
+    // to recover from than no isolation; land refuses a breached run.
     lines.push(
-      fromConfine
-        ? "Isolation BREACHED: the CLI reported confine violation(s) and/or the main checkout changed while this run was in flight; work may be in the wrong tree and is not verified."
-        : "Isolation BREACHED: the main checkout changed while this run was in flight, so work may be in the wrong tree and is not verified."
+      "Isolation BREACHED: the main checkout changed while this run was in flight, so work may be in the wrong tree and is not verified."
     );
-    const leaked = meta.isolationLeak?.entries ?? meta.isolationLeak?.paths ?? null;
-    if (Array.isArray(leaked) && leaked.length > 0) {
-      lines.push("Changed in the main checkout during this run:");
-      for (const entry of leaked) {
+    const wtFiles =
+      meta.worktree?.worktreeFiles ??
+      meta.changedFiles?.worktree?.entries ??
+      meta.worktree?.changedFiles ??
+      null;
+    if (Array.isArray(wtFiles) && wtFiles.length > 0) {
+      lines.push("In the worktree:");
+      for (const entry of wtFiles.slice(0, 40)) {
         lines.push(`  ${entry}`);
       }
-      if (meta.isolationLeak?.truncated) {
+      if (wtFiles.length > 40) {
+        lines.push(`  … ${wtFiles.length - 40} more`);
+      }
+    } else {
+      lines.push("In the worktree: (none recorded — work may have landed only in main)");
+    }
+    const leaked =
+      meta.worktree?.mainTreeFiles ??
+      meta.changedFiles?.mainTree?.entries ??
+      meta.isolationLeak?.entries ??
+      meta.isolationLeak?.paths ??
+      null;
+    if (Array.isArray(leaked) && leaked.length > 0) {
+      lines.push("Leaked to main checkout:");
+      for (const entry of leaked.slice(0, 40)) {
+        lines.push(`  ${entry}`);
+      }
+      if (meta.isolationLeak?.truncated || leaked.length > 40) {
         lines.push(
-          `  … truncated (${meta.isolationLeak.total} total)`
+          `  … truncated (${meta.isolationLeak?.total ?? leaked.length} total)`
         );
       }
+    } else {
+      lines.push("Leaked to main checkout: (none listed)");
     }
     lines.push(
-      "  If you edited the main checkout yourself while this run was going, that is what this is - re-check with `git status` and land the worktree normally."
+      "Land refuses this run. Recovery: inspect both trees; copy wanted main-tree files into the worktree or re-apply the full change by hand; then land --discard. " +
+        "If you edited the main checkout yourself while this run was going, re-check with `git status` and keep those edits."
     );
   }
 
@@ -1369,11 +1397,14 @@ export function buildBridgeResultBlock(job = {}, storedJob = null) {
   }
 
   const worktree = record.worktree ?? null;
+  const isoRecord =
+    record.isolation && typeof record.isolation === "object" ? record.isolation : null;
   let isolation = "INACTIVE (workspaceRoot)";
-  if (worktree?.path) {
-    isolation = `ACTIVE (worktree ${worktree.path}, branch ${worktree.branch ?? "unknown"})`;
+  const isoPath = worktree?.path ?? isoRecord?.worktree ?? null;
+  if (isoPath || isoRecord?.active) {
+    isolation = `ACTIVE (worktree ${isoPath ?? "removed"}, branch ${worktree?.branch ?? isoRecord?.branch ?? "unknown"})`;
   }
-  if (worktree?.breached || record.isolationBreached) {
+  if (worktree?.breached || record.isolationBreached || isoRecord?.breached) {
     isolation = "breached";
   }
 
@@ -1775,8 +1806,11 @@ export function buildRunManifest(job = {}, storedJob = null) {
   const toolVisibility =
     result?.toolVisibility ?? record.toolVisibility ?? (record.toolCallCount == null ? "unavailable" : "observed");
 
+  // WP-B7-FIX: breached is only main-checkout dirtiness (or an explicit stored
+  // flag). CLI confine_violation events are blocked attempts — keep them under
+  // isolation.confineViolations; do not fold them into breached.
   const isolationBreached = Boolean(
-    record.isolationBreached || worktree?.breached || (Array.isArray(confineViolations) && confineViolations.length > 0)
+    record.isolationBreached || worktree?.breached || record.isolation?.breached
   );
 
   const children = Array.isArray(record.children)
@@ -1823,12 +1857,21 @@ export function buildRunManifest(job = {}, storedJob = null) {
       served: record.resolvedModel ?? usage?.resolvedModel ?? start?.servedModel ?? null
     },
     isolation: {
-      active: Boolean(worktree?.path),
-      worktree: worktree?.path ?? null,
-      branch: worktree?.branch ?? null,
-      baseSha: worktree?.baseSha ?? worktree?.base_sha ?? null,
-      headSha: worktree?.headSha ?? worktree?.head_sha ?? null,
+      // R6-2: prefer the persisted isolation object so completed/landed runs
+      // still report active/worktree/branch/source after worktree cleanup.
+      active: Boolean(
+        worktree?.path ||
+          record.isolation?.active ||
+          record.isolation?.worktree
+      ),
+      worktree: record.isolation?.worktree ?? worktree?.path ?? null,
+      branch: record.isolation?.branch ?? worktree?.branch ?? null,
+      baseSha:
+        record.isolation?.baseSha ?? worktree?.baseSha ?? worktree?.base_sha ?? null,
+      headSha:
+        record.isolation?.headSha ?? worktree?.headSha ?? worktree?.head_sha ?? worktree?.sha ?? null,
       breached: isolationBreached,
+      source: record.isolation?.source ?? record.isolateSource ?? null,
       leakedPaths: record.isolationLeak?.entries ?? record.isolationLeak?.paths ?? result?.isolationLeak?.entries ?? [],
       confineViolations: Array.isArray(confineViolations) ? confineViolations : []
     },

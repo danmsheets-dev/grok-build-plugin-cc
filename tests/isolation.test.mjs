@@ -26,6 +26,8 @@ import {
   detectCaller
 } from "../plugins/grok-build/scripts/lib/workspace.mjs";
 import {
+  createWorktree,
+  reconcileOrphanWorktrees,
   removeDirectoryTree,
   removeWorktree,
   resolveWorktreePath,
@@ -44,6 +46,7 @@ import {
   listJobs,
   readJobFile,
   resolveJobFile,
+  resolveStateDir,
   upsertJob,
   writeJobFile
 } from "../plugins/grok-build/scripts/lib/state.mjs";
@@ -289,6 +292,123 @@ test("isolated clean write run is not a breach", () => {
   assert.notEqual(jobs[0].status, "isolation-breached");
 });
 
+/* -------------------------------------------------------------------------
+ * WP-B7-FIX: blocked confine attempt ≠ isolation breach
+ * ---------------------------------------------------------------------- */
+
+test("blocked confine attempts alone are not a breach and remain landable (WP-B7-FIX)", () => {
+  const binDir = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const repo = makeTempDir();
+  installFakeGrok(binDir, "writes-files");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "seed.txt"), "seed\n");
+  run("git", ["add", "seed.txt"], { cwd: repo });
+  run("git", ["commit", "-m", "seed"], { cwd: repo });
+
+  // Shape seen on a real run: path holds a compound shell line whose cd target
+  // is the confine root itself — CLI blocked it, main tree stayed clean.
+  const confineViolations = [
+    {
+      tool: "run_terminal_command",
+      path: 'cd "H:\\\\gb-work\\\\gb\\\\w\\\\d52412a3" ; git show HEAD --stat',
+      resolvedPath: 'cd "H:\\\\gb-work\\\\gb\\\\w\\\\d52412a3" ; git show HEAD --stat',
+      root: "H:\\\\gb-work\\\\gb\\\\w\\\\d52412a3"
+    }
+  ];
+
+  const result = withPluginData(pluginDataDir, () =>
+    run("node", [SCRIPT, "run", "--write", "--no-verify", "--json", "edit inside worktree only"], {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir, {
+        CLAUDECODE: "1",
+        FAKE_GROK_WRITE_FILES: JSON.stringify({ "only-in-worktree.txt": "ok\n" }),
+        FAKE_GROK_CONFINE_VIOLATIONS: JSON.stringify(confineViolations)
+      }),
+      timeout: 60_000
+    })
+  );
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const combined = `${result.stdout}\n${result.stderr}`;
+  assert.match(combined, /confine attempt(?:s)? blocked by the CLI \(isolation held\)/i);
+  assert.doesNotMatch(combined, /Isolation BREACHED/i);
+
+  const jobs = withPluginData(pluginDataDir, () => listJobs(repo));
+  assert.ok(jobs.length >= 1, "expected a job record");
+  const job = jobs[0];
+  assert.notEqual(job.status, "isolation-breached", JSON.stringify(job, null, 2));
+  assert.ok(!job.isolationBreached, "index must not mark blocked attempts as breached");
+  assert.ok(!job.isolation?.breached);
+
+  // Full job file (index omits result.*) must record the blocked attempts.
+  const stored = withPluginData(pluginDataDir, () =>
+    readJobFile(resolveJobFile(repo, job.id))
+  );
+  assert.ok(!stored.isolationBreached);
+  assert.ok(!stored.isolation?.breached);
+  const violations = stored.result?.confineViolations ?? stored.confineViolations ?? [];
+  assert.ok(Array.isArray(violations) && violations.length >= 1, "blocked attempts must be recorded");
+  assert.equal(violations[0].tool, "run_terminal_command");
+
+  // Land must accept a clean main tree even when the CLI blocked attempts.
+  const land = withPluginData(pluginDataDir, () =>
+    run("node", [SCRIPT, "land", job.id, "--json"], {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir),
+      timeout: 60_000
+    })
+  );
+  assert.equal(land.status, 0, land.stderr || land.stdout);
+  assert.doesNotMatch(`${land.stderr}\n${land.stdout}`, /Refusing to land|isolation was breached/i);
+});
+
+test("blocked confine attempts plus dirty main checkout is still a breach (WP-B7-FIX)", () => {
+  const binDir = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const repo = makeTempDir();
+  installFakeGrok(binDir, "writes-files");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "seed.txt"), "seed\n");
+  run("git", ["add", "seed.txt"], { cwd: repo });
+  run("git", ["commit", "-m", "seed"], { cwd: repo });
+
+  const leakPath = path.join(repo, "leaked-with-block.txt");
+  const result = withPluginData(pluginDataDir, () =>
+    run("node", [SCRIPT, "run", "--write", "--no-verify", "--json", "touch a file"], {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir, {
+        CLAUDECODE: "1",
+        FAKE_GROK_WRITE_FILES: JSON.stringify({ "inside-worktree.txt": "ok\n" }),
+        FAKE_GROK_WRITE_ABSOLUTE: JSON.stringify({ [leakPath]: "leaked\n" }),
+        FAKE_GROK_CONFINE_VIOLATIONS: JSON.stringify([
+          { tool: "Write", path: "escape.txt", resolvedPath: leakPath, root: "/wt" }
+        ])
+      }),
+      timeout: 60_000
+    })
+  );
+
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const jobs = withPluginData(pluginDataDir, () => listJobs(repo));
+  assert.ok(jobs.length >= 1);
+  const job = jobs[0];
+  assert.equal(job.status, "isolation-breached", JSON.stringify(job, null, 2));
+  assert.equal(job.isolationBreached, true);
+  assert.match(`${result.stdout}\n${result.stderr}`, /Isolation BREACHED|main checkout/i);
+
+  // Land still refuses on the strength of the dirty main tree.
+  const land = withPluginData(pluginDataDir, () =>
+    run("node", [SCRIPT, "land", job.id, "--json"], {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir),
+      timeout: 60_000
+    })
+  );
+  assert.notEqual(land.status, 0, land.stdout);
+  assert.match(`${land.stderr}\n${land.stdout}`, /Refusing to land|isolation was breached/i);
+});
+
 test("programmatic --no-isolate is refused without escape hatch", () => {
   const binDir = makeTempDir();
   const pluginDataDir = makeTempDir();
@@ -313,16 +433,27 @@ test("programmatic --no-isolate is refused without escape hatch", () => {
  * Short worktree paths + long-path removal
  * ---------------------------------------------------------------------- */
 
-test("resolveWorktreePath uses short TEMP path on win32", () => {
+test("resolveWorktreePath uses same volume as repo on win32 (not TEMP)", () => {
   const short = resolveWorktreePath("run-ms7longid-abc", {
     platform: "win32",
-    env: { TEMP: "C:\\Users\\me\\AppData\\Local\\Temp" }
+    env: { TEMP: "C:\\Users\\me\\AppData\\Local\\Temp" },
+    repoRoot: "H:\\Apps\\MyRepo"
   });
   assert.equal(
     short,
-    path.join("C:\\Users\\me\\AppData\\Local\\Temp", "gb", "w", shortWorktreeId("run-ms7longid-abc"))
+    path.join("H:\\", "gb", "w", shortWorktreeId("run-ms7longid-abc"))
   );
   assert.equal(shortWorktreeId("run-ms7longid-abc").length, 8);
+});
+
+test("resolveWorktreePath honours GROK_BUILD_WORKTREE_ROOT", () => {
+  const root = "D:\\custom\\wt-root";
+  const resolved = resolveWorktreePath("run-y", {
+    platform: "win32",
+    env: { GROK_BUILD_WORKTREE_ROOT: root, TEMP: "C:\\Temp" },
+    repoRoot: "H:\\repo"
+  });
+  assert.equal(resolved, path.join(root, shortWorktreeId("run-y")));
 });
 
 test("resolveWorktreePath still honours explicit dataDir", () => {
@@ -389,6 +520,262 @@ test("removeWorktree returns orphanedPath when directory survives", () => {
   assert.equal(outcome.removed, false);
   assert.equal(outcome.orphanedPath, orphan);
   assert.match(outcome.reason, /still exists/i);
+});
+
+/* -------------------------------------------------------------------------
+ * R7-1: land refuses a breached run
+ * R6-1: read-only runs are isolated
+ * R6-2: isolation survives terminal cleanup
+ * R6-3: state dir resolves to root repo from a worktree
+ * R6-7: orphan reconciler
+ * ---------------------------------------------------------------------- */
+
+test("land refuses a breached isolation-breached run (R7-1)", () => {
+  const binDir = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const repo = makeTempDir();
+  installFakeGrok(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "seed.txt"), "seed\n");
+  run("git", ["add", "seed.txt"], { cwd: repo });
+  run("git", ["commit", "-m", "seed"], { cwd: repo });
+
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  try {
+    const jobId = generateJobId("run");
+    const dataDir = path.join(pluginDataDir, "wt-data");
+    const created = createWorktree({ cwd: repo, runId: jobId, dataDir });
+    fs.writeFileSync(path.join(created.worktreePath, "only-wt.txt"), "half\n");
+    run("git", ["add", "only-wt.txt"], { cwd: created.worktreePath });
+    run("git", ["commit", "-m", "partial"], { cwd: created.worktreePath });
+
+    const job = {
+      id: jobId,
+      kind: "task",
+      status: "isolation-breached",
+      phase: "isolation-breached",
+      write: true,
+      isolationBreached: true,
+      isolation: {
+        active: true,
+        worktree: created.worktreePath,
+        branch: created.branchName,
+        baseSha: created.baseSha,
+        breached: true,
+        source: "forced-programmatic"
+      },
+      worktree: {
+        path: created.worktreePath,
+        branch: created.branchName,
+        baseSha: created.baseSha,
+        breached: true,
+        worktreeFiles: ["A\tonly-wt.txt"],
+        mainTreeFiles: ["A\tleaked.txt"]
+      },
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+    writeJobFile(repo, jobId, job);
+    upsertJob(repo, job);
+
+    const result = run("node", [SCRIPT, "land", jobId, "--json"], {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir)
+    });
+    assert.notEqual(result.status, 0, result.stdout);
+    const combined = `${result.stderr}\n${result.stdout}`;
+    assert.match(combined, /Refusing to land|isolation was breached|split/i);
+    assert.match(combined, /only-wt|In the worktree/i);
+    assert.match(combined, /leaked|main checkout/i);
+    assert.match(combined, /--discard/i);
+    // Worktree must still exist — refuse means do not land or destroy.
+    assert.equal(fs.existsSync(created.worktreePath), true);
+  } finally {
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
+});
+
+test("read-only run is isolated in a worktree (R6-1)", () => {
+  const binDir = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const repo = makeTempDir();
+  installFakeGrok(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "seed.txt"), "seed\n");
+  run("git", ["add", "seed.txt"], { cwd: repo });
+  run("git", ["commit", "-m", "seed"], { cwd: repo });
+
+  const result = withPluginData(pluginDataDir, () =>
+    run("node", [SCRIPT, "run", "--no-verify", "--json", "review the code"], {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir),
+      timeout: 60_000
+    })
+  );
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+
+  const jobs = withPluginData(pluginDataDir, () => listJobs(repo));
+  assert.ok(jobs.length >= 1, "expected a job record");
+  const job = jobs[0];
+  const stored = withPluginData(pluginDataDir, () => readJobFile(resolveJobFile(repo, job.id)));
+  // Isolation active: worktree path was recorded (may still exist or be cleaned).
+  const iso = stored.isolation ?? job.isolation;
+  assert.ok(iso?.active || stored.worktree?.path || job.worktree?.path, JSON.stringify(stored, null, 2));
+  assert.ok(
+    iso?.source === "read-only-default" || iso?.source === "cli" || iso?.source === "config",
+    `unexpected isolate source: ${iso?.source}`
+  );
+});
+
+test("isolation fact survives in a terminal record after land discard (R6-2)", () => {
+  const binDir = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const repo = makeTempDir();
+  installFakeGrok(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "seed.txt"), "seed\n");
+  run("git", ["add", "seed.txt"], { cwd: repo });
+  run("git", ["commit", "-m", "seed"], { cwd: repo });
+
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  try {
+    const jobId = generateJobId("run");
+    const dataDir = path.join(pluginDataDir, "wt-data");
+    const created = createWorktree({ cwd: repo, runId: jobId, dataDir });
+    const job = {
+      id: jobId,
+      kind: "task",
+      status: "completed",
+      phase: "done",
+      write: true,
+      isolateSource: "forced-programmatic",
+      isolation: {
+        active: true,
+        worktree: created.worktreePath,
+        branch: created.branchName,
+        baseSha: created.baseSha,
+        breached: false,
+        source: "forced-programmatic"
+      },
+      worktree: {
+        path: created.worktreePath,
+        branch: created.branchName,
+        baseSha: created.baseSha
+      },
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+    writeJobFile(repo, jobId, job);
+    upsertJob(repo, job);
+
+    const result = run("node", [SCRIPT, "land", jobId, "--discard", "--json"], {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir)
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+
+    const stored = readJobFile(resolveJobFile(repo, jobId));
+    assert.equal(stored.worktree, null, "worktree path cleared after discard");
+    assert.ok(stored.isolation, "isolation object must survive");
+    assert.equal(stored.isolation.active, true);
+    assert.equal(stored.isolation.worktree, created.worktreePath);
+    assert.equal(stored.isolation.branch, created.branchName);
+    assert.equal(stored.isolation.source, "forced-programmatic");
+    assert.equal(stored.isolation.breached, false);
+
+    // show --json / runs surface must keep the isolation fact after cleanup.
+    const show = run("node", [SCRIPT, "show", jobId, "--json"], {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir)
+    });
+    assert.equal(show.status, 0, show.stderr || show.stdout);
+    const payload = JSON.parse(show.stdout);
+    const isolation = payload.isolation ?? payload.job?.isolation ?? payload.manifest?.isolation;
+    assert.ok(isolation, `expected isolation on show payload: ${JSON.stringify(payload).slice(0, 500)}`);
+    assert.equal(isolation.active, true);
+    assert.equal(isolation.worktree, created.worktreePath);
+    assert.equal(isolation.source, "forced-programmatic");
+  } finally {
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
+});
+
+test("state dir resolves to root repo from inside a worktree (R6-3)", () => {
+  const pluginDataDir = makeTempDir();
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "seed.txt"), "seed\n");
+  run("git", ["add", "seed.txt"], { cwd: repo });
+  run("git", ["commit", "-m", "seed"], { cwd: repo });
+
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  try {
+    const dataDir = path.join(pluginDataDir, "wt-data");
+    const created = createWorktree({ cwd: repo, runId: "state-dir-1", dataDir });
+
+    const fromMain = resolveStateDir(repo);
+    const fromWorktree = resolveStateDir(created.worktreePath);
+    assert.equal(
+      fromMain,
+      fromWorktree,
+      `state dir must be identical from main (${fromMain}) and worktree (${fromWorktree})`
+    );
+
+    // Write a job from the worktree cwd and list it from main.
+    const jobId = generateJobId("run");
+    writeJobFile(created.worktreePath, jobId, {
+      id: jobId,
+      status: "completed",
+      summary: "from-worktree"
+    });
+    upsertJob(created.worktreePath, { id: jobId, status: "completed", summary: "from-worktree" });
+
+    const jobs = listJobs(repo);
+    assert.ok(
+      jobs.some((j) => j.id === jobId),
+      `main listJobs must see job written from worktree: ${jobs.map((j) => j.id).join(",")}`
+    );
+  } finally {
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
+});
+
+test("orphan reconciler finds a directory with no job record (R6-7)", () => {
+  const root = makeTempDir("grok-orphan-root-");
+  const known = path.join(root, "known-wt");
+  const orphan = path.join(root, "orphan-wt");
+  fs.mkdirSync(known, { recursive: true });
+  fs.mkdirSync(orphan, { recursive: true });
+  fs.writeFileSync(path.join(orphan, "leftover.txt"), "x\n");
+
+  const result = reconcileOrphanWorktrees({
+    worktreeRoot: root,
+    knownPaths: [known],
+    repoRoot: null,
+    // Avoid git status on non-repos: treat as no uncommitted work for this unit test.
+    gitImpl: () => ({ status: 0, stdout: "", stderr: "", error: null })
+  });
+
+  assert.equal(result.scanned, 2);
+  assert.equal(result.orphans.length, 1);
+  assert.equal(path.resolve(result.orphans[0].path), path.resolve(orphan));
+  assert.equal(result.orphans[0].hasUncommittedWork, false);
+  assert.match(result.orphans[0].detail, /no job record/i);
 });
 
 /* -------------------------------------------------------------------------

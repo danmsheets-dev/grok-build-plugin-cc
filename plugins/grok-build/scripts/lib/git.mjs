@@ -101,6 +101,59 @@ export function getRepoRoot(cwd) {
   return gitChecked(cwd, ["rev-parse", "--show-toplevel"]).stdout.trim();
 }
 
+/**
+ * Absolute path of the repository's common git directory.
+ *
+ * Stable across linked worktrees (`git rev-parse --git-common-dir`): a run
+ * launched from inside a worktree and one launched from the main checkout
+ * resolve to the same path, so state/history keyed on this identity does not
+ * fragment per worktree.
+ *
+ * @param {string} cwd
+ * @returns {string|null}
+ */
+export function resolveGitCommonDir(cwd) {
+  const result = git(cwd, ["rev-parse", "--git-common-dir"]);
+  if (result.status !== 0 || result.error) {
+    return null;
+  }
+  let dir = String(result.stdout ?? "").trim();
+  if (!dir) {
+    return null;
+  }
+  if (!path.isAbsolute(dir)) {
+    dir = path.resolve(cwd, dir);
+  }
+  try {
+    return fs.realpathSync.native(dir);
+  } catch {
+    return path.resolve(dir);
+  }
+}
+
+/**
+ * Main worktree root for a repository, even when `cwd` is inside a linked
+ * worktree. Prefers the parent of `git-common-dir` when that is a `.git`
+ * directory; falls back to `show-toplevel`.
+ *
+ * @param {string} cwd
+ * @returns {string}
+ */
+export function resolveMainWorktreeRoot(cwd) {
+  const common = resolveGitCommonDir(cwd);
+  if (common) {
+    const base = path.basename(common);
+    if (base === ".git") {
+      return path.dirname(common);
+    }
+  }
+  try {
+    return ensureGitRepository(cwd);
+  } catch {
+    return path.resolve(cwd);
+  }
+}
+
 export function detectDefaultBranch(cwd) {
   const symbolic = git(cwd, ["symbolic-ref", "refs/remotes/origin/HEAD"]);
   if (symbolic.status === 0) {

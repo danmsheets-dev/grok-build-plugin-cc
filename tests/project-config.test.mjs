@@ -357,8 +357,9 @@ test("a config can turn isolation on for a run that would not have isolated", ()
   // Unset config: write still implies isolate, exactly as in 0.3.x.
   assert.equal(resolveIsolateSetting({ write: true }).isolate, true);
   assert.equal(resolveIsolateSetting({ write: true }).source, "write-default");
-  assert.equal(resolveIsolateSetting({ write: false }).isolate, false);
-  assert.equal(resolveIsolateSetting({ write: false }).source, "read-only");
+  // R6-1: read-only runs isolate by default too (worktree, no live-state provision).
+  assert.equal(resolveIsolateSetting({ write: false }).isolate, true);
+  assert.equal(resolveIsolateSetting({ write: false }).source, "read-only-default");
 });
 
 test("programmatic write forces isolation and refuses --no-isolate", () => {

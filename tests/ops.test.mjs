@@ -1076,6 +1076,10 @@ test("--no-verify opts out of a trusted config's plan", () => {
   const repo = makeTempDir();
   installFakeGrok(binDir);
   initGitRepo(repo);
+  // Read-only runs isolate by default (R6-1) and need a commit for worktree add.
+  fs.writeFileSync(path.join(repo, "seed.txt"), "seed\n");
+  run("git", ["add", "seed.txt"], { cwd: repo });
+  run("git", ["commit", "-m", "seed"], { cwd: repo });
 
   fs.writeFileSync(
     path.join(repo, ".grok-build.json"),

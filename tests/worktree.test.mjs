@@ -12,7 +12,9 @@ import {
   createWorktree,
   listCommittedChanges,
   removeWorktree,
-  resolveWorktreePath
+  resolveMinFreeBytes,
+  resolveWorktreePath,
+  resolveWorktreeRoot
 } from "../plugins/grok-build/scripts/lib/worktree.mjs";
 import { planWorktreeLinks, provisionWorktree } from "../plugins/grok-build/scripts/lib/provision.mjs";
 import { initGitRepo, makeTempDir, run, writeExecutable } from "./helpers.mjs";
@@ -122,24 +124,25 @@ function listMentionsPath(listLines, targetPath) {
   return listLines.some((line) => normalizePath(line.split(/\s+/)[0]).includes(normalized) || line.replace(/\\/g, "/").toLowerCase().includes(normalized));
 }
 
-test("resolveWorktreePath uses dataDir, short win32 default, or CLAUDE_PLUGIN_DATA/tmpdir", () => {
+test("resolveWorktreePath uses dataDir, same-volume win32 default, or CLAUDE_PLUGIN_DATA/tmpdir", () => {
   const dataDir = makeTempDir("grok-wt-data-");
   assert.equal(
     resolveWorktreePath("run-a", { dataDir }),
     path.join(dataDir, "worktrees", "run-a")
   );
 
-  // win32 defaults to a short TEMP path (deep engine caches break MAX_PATH under
-  // the long CLAUDE_PLUGIN_DATA prefix; LOCALAPPDATA outside Temp breaks junctions).
-  // Explicit dataDir still wins above.
+  // win32 defaults to the repository volume (`H:\gb\w\<8-char>`), not TEMP —
+  // hardlink seeding and private cargo targets must not land on another drive.
+  // Explicit dataDir still wins above; TEMP is only the no-repoRoot fallback.
   const winPath = resolveWorktreePath("run-b", {
     platform: "win32",
     env: {
       TEMP: "C:\\Users\\me\\AppData\\Local\\Temp",
       CLAUDE_PLUGIN_DATA: "C:\\very\\long\\plugin\\data"
-    }
+    },
+    repoRoot: "H:\\Apps\\Grok Build Plugin"
   });
-  assert.match(winPath.replace(/\\/g, "/"), /\/gb\/w\/[0-9a-f]{8}$/);
+  assert.match(winPath.replace(/\\/g, "/"), /^H:\/gb\/w\/[0-9a-f]{8}$/);
 
   const pluginData = makeTempDir("grok-wt-plugin-");
   assert.equal(
@@ -311,6 +314,36 @@ test("GROK_BUILD_MIN_FREE_BYTES moves the floor, and 0 disables the check", () =
     worktreePath: disabled.worktreePath,
     branchName: disabled.branchName
   });
+});
+
+test("resolveMinFreeBytes is ecosystem-aware (rust raises the floor)", () => {
+  assert.equal(resolveMinFreeBytes({}), 512 * 1024 * 1024);
+  assert.equal(resolveMinFreeBytes({}, { ecosystems: ["rust"] }), 2 * 1024 * 1024 * 1024);
+  assert.equal(resolveMinFreeBytes({}, { ecosystems: ["godot"] }), 1024 * 1024 * 1024);
+  // Explicit env override still wins over ecosystem.
+  assert.equal(
+    resolveMinFreeBytes({ GROK_BUILD_MIN_FREE_BYTES: "1024" }, { ecosystems: ["rust"] }),
+    1024
+  );
+});
+
+test("resolveWorktreeRoot prefers GROK_BUILD_WORKTREE_ROOT then same volume", () => {
+  assert.equal(
+    resolveWorktreeRoot({
+      env: { GROK_BUILD_WORKTREE_ROOT: "D:\\wt" },
+      platform: "win32",
+      repoRoot: "H:\\repo"
+    }),
+    path.resolve("D:\\wt")
+  );
+  assert.equal(
+    resolveWorktreeRoot({
+      env: { TEMP: "C:\\Temp" },
+      platform: "win32",
+      repoRoot: "H:\\Apps\\Repo"
+    }),
+    path.join("H:\\", "gb", "w")
+  );
 });
 
 test("removeWorktree deletes the directory and the branch", () => {

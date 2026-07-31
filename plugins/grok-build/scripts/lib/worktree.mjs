@@ -254,41 +254,105 @@ export function shortWorktreeId(runId) {
   return crypto.createHash("sha256").update(String(runId ?? "")).digest("hex").slice(0, 8);
 }
 
+/** Env override for the directory that holds short-id worktree children. */
+export const WORKTREE_ROOT_ENV = "GROK_BUILD_WORKTREE_ROOT";
+
+/**
+ * Directory under which NEW worktrees are created (parent of the run id entry).
+ *
+ * Precedence:
+ *   1. explicit `dataDir` → `${dataDir}/worktrees` (tests own the layout)
+ *   2. `GROK_BUILD_WORKTREE_ROOT` env override
+ *   3. same volume as `repoRoot` when known (`{volume}/gb/w` on win32, or
+ *      `{tmpdir}/gb/w` on POSIX) so hardlink seeding works and private cargo
+ *      target dirs do not fill a different drive
+ *   4. historical fallbacks (TEMP / CLAUDE_PLUGIN_DATA / tmpdir)
+ *
+ * Windows constraints (do not regress these):
+ *   - Junctions under bare `%LOCALAPPDATA%\…` (outside Temp) resolve as ENOENT
+ *     on this host class even though `mklink` succeeds — never default there.
+ *   - Paths must stay short enough that deep `.godot/imported/…` trees clear
+ *     MAX_PATH; an 8-char digest under `{volume}\gb\w\` does.
+ *
+ * Existing worktrees recorded under an older root must still be found, removed
+ * and landed — resolve those from the stored job descriptor, never by calling
+ * this function again.
+ *
+ * @param {{ dataDir?: string, env?: NodeJS.ProcessEnv, platform?: string, repoRoot?: string }} [options]
+ * @returns {string}
+ */
+export function resolveWorktreeRoot(options = {}) {
+  const env = options.env ?? process.env;
+  if (options.dataDir) {
+    return path.join(options.dataDir, "worktrees");
+  }
+  const override = env?.[WORKTREE_ROOT_ENV];
+  if (override != null && String(override).trim()) {
+    return path.resolve(String(override).trim());
+  }
+
+  const platform = options.platform ?? process.platform;
+  const repoRoot =
+    options.repoRoot != null && String(options.repoRoot).trim()
+      ? path.resolve(String(options.repoRoot).trim())
+      : null;
+
+  if (platform === "win32") {
+    // Prefer the repository's own volume so hardlinks seed node_modules/.godot
+    // and a private CARGO_TARGET_DIR cannot fill C: while the repo lives on H:.
+    // Layout `{volume}\gb\w\<8-char>` is short enough for MAX_PATH and is not
+    // bare LOCALAPPDATA (junctions fail to resolve there on this host class).
+    if (repoRoot) {
+      const volumeRoot = path.parse(repoRoot).root || path.parse(repoRoot).dir;
+      return path.join(volumeRoot, "gb", "w");
+    }
+    // No repo root yet: short TEMP path (historical). Junctions under TEMP work.
+    const tempRoot = env.TEMP || env.TMP || os.tmpdir();
+    return path.join(tempRoot, "gb", "w");
+  }
+
+  // POSIX: same-volume preference when we know the repo; otherwise historical.
+  if (repoRoot) {
+    return path.join(os.tmpdir(), "gb", "w");
+  }
+  if (env.CLAUDE_PLUGIN_DATA) {
+    return path.join(env.CLAUDE_PLUGIN_DATA, "worktrees");
+  }
+  return path.join(os.tmpdir(), "grok-cc-worktrees");
+}
+
 /**
  * Where a NEW worktree for `runId` should be created.
  *
- * Honour an explicit `dataDir` (tests and callers that own the layout). On
- * win32 the default is deliberately short: `%TEMP%\gb\w\<8-char>` — not under
- * CLAUDE_PLUGIN_DATA (path too long for deep Godot caches to delete) and not
- * bare `%LOCALAPPDATA%\gb` (junctions fail to resolve there on Windows).
- * Elsewhere keep the historical CLAUDE_PLUGIN_DATA / tmpdir layout.
+ * Honour an explicit `dataDir` (tests and callers that own the layout). Prefer
+ * the same volume as the repository when known — see `resolveWorktreeRoot`.
  *
  * Existing worktrees recorded under the old path must still be found, removed
  * and landed — resolve those from the stored job descriptor, never by calling
  * this function again.
  *
  * @param {string} runId
- * @param {{ dataDir?: string, env?: NodeJS.ProcessEnv, platform?: string }} [options]
+ * @param {{ dataDir?: string, env?: NodeJS.ProcessEnv, platform?: string, repoRoot?: string }} [options]
  */
 export function resolveWorktreePath(runId, options = {}) {
   const env = options.env ?? process.env;
   if (options.dataDir) {
+    // Tests keep the full run id so paths stay readable in fixtures.
     return path.join(options.dataDir, "worktrees", runId);
   }
+  const root = resolveWorktreeRoot({ ...options, env });
   const platform = options.platform ?? process.platform;
-  if (platform === "win32") {
-    // TEMP, not LOCALAPPDATA: Windows junctions under bare %LOCALAPPDATA%\…
-    // (outside Temp) fail to resolve on this host class — mklink succeeds but
-    // dir/existsSync through the junction returns ENOENT. That breaks blender
-    // sandbox and provisioned link-dirs. %TEMP% is still short enough that an
-    // 8-char digest keeps deep .godot/imported paths under MAX_PATH.
-    const tempRoot = env.TEMP || env.TMP || os.tmpdir();
-    return path.join(tempRoot, "gb", "w", shortWorktreeId(runId));
+  // Short digest under gb/w (win32 default, GROK_BUILD_WORKTREE_ROOT, or the
+  // same-volume default). Full run id under the historical CLAUDE_PLUGIN_DATA
+  // / grok-cc-worktrees layouts so older operators and docs still match.
+  const usesShortId =
+    platform === "win32" ||
+    Boolean(env?.[WORKTREE_ROOT_ENV] && String(env[WORKTREE_ROOT_ENV]).trim()) ||
+    path.basename(root) === "w";
+  if (usesShortId) {
+    return path.join(root, shortWorktreeId(runId));
   }
-  if (env.CLAUDE_PLUGIN_DATA) {
-    return path.join(env.CLAUDE_PLUGIN_DATA, "worktrees", runId);
-  }
-  return path.join(os.tmpdir(), "grok-cc-worktrees", runId);
+  return path.join(root, runId);
 }
 
 /**
@@ -318,19 +382,25 @@ export function toWin32LongPath(targetPath) {
  * Free space a worktree checkout is required to have available before git is
  * allowed to start writing one.
  *
- * Deliberately a flat floor rather than a per-repo estimate. The obvious
- * estimate - `git ls-tree -r --long HEAD` summed - is itself a full tree walk
- * on exactly the tens-of-GB repositories it would be protecting, and it
- * undercounts LFS pointers by orders of magnitude, so the number printed would
- * be most wrong on the repos the warning exists for. What this catches is the
- * common case: a disk that is essentially full, where git otherwise fails
- * halfway through the checkout and leaves an opaque stderr behind a partial
- * worktree directory.
+ * Base floor is deliberately flat rather than a per-repo tree walk: summing
+ * `git ls-tree -r --long HEAD` undercounts LFS and is itself expensive on the
+ * repos that need the warning. Ecosystem floors raise the bar when the run is
+ * expected to build (Rust cargo target dirs alone have measured multi-GB).
+ * Override with GROK_BUILD_MIN_FREE_BYTES (0 disables).
  */
 const MIN_WORKTREE_FREE_BYTES = 512 * 1024 * 1024;
 const MIN_WORKTREE_FREE_BYTES_ENV = "GROK_BUILD_MIN_FREE_BYTES";
 
-function formatBytes(bytes) {
+/** Per-ecosystem free-space floors (bytes). Highest matching ecosystem wins. */
+export const ECOSYSTEM_MIN_FREE_BYTES = Object.freeze({
+  rust: 2 * 1024 * 1024 * 1024,
+  godot: 1024 * 1024 * 1024,
+  blender: 1024 * 1024 * 1024,
+  node: 512 * 1024 * 1024,
+  python: 512 * 1024 * 1024
+});
+
+export function formatBytes(bytes) {
   const value = Number(bytes);
   if (!Number.isFinite(value) || value < 0) {
     return "unknown";
@@ -345,12 +415,31 @@ function formatBytes(bytes) {
   return `${index === 0 ? scaled : scaled.toFixed(1)} ${units[index]}`;
 }
 
-function resolveMinFreeBytes(env) {
+/**
+ * Resolve the free-space floor for a worktree create.
+ *
+ * @param {NodeJS.ProcessEnv} [env]
+ * @param {{ ecosystems?: Array<string|{id?: string}>, minFreeBytes?: number }} [options]
+ * @returns {number}
+ */
+export function resolveMinFreeBytes(env, options = {}) {
+  if (Number.isFinite(options.minFreeBytes) && options.minFreeBytes >= 0) {
+    return Math.floor(options.minFreeBytes);
+  }
   const raw = Number(env?.[MIN_WORKTREE_FREE_BYTES_ENV]);
   if (Number.isFinite(raw) && raw >= 0) {
     return Math.floor(raw);
   }
-  return MIN_WORKTREE_FREE_BYTES;
+  let floor = MIN_WORKTREE_FREE_BYTES;
+  const ecosystems = Array.isArray(options.ecosystems) ? options.ecosystems : [];
+  for (const entry of ecosystems) {
+    const id = typeof entry === "string" ? entry : entry?.id;
+    const needed = id ? ECOSYSTEM_MIN_FREE_BYTES[id] : null;
+    if (Number.isFinite(needed) && needed > floor) {
+      floor = needed;
+    }
+  }
+  return floor;
 }
 
 /**
@@ -364,9 +453,10 @@ function resolveMinFreeBytes(env) {
  * @param {string} parentDir directory the worktree will be created inside
  * @param {(dir: string) => {bsize: number, bavail: number}} statfsImpl
  * @param {NodeJS.ProcessEnv} env
+ * @param {{ ecosystems?: Array<string|{id?: string}>, minFreeBytes?: number }} [options]
  */
-function assertFreeSpaceForWorktree(parentDir, statfsImpl, env) {
-  const required = resolveMinFreeBytes(env);
+function assertFreeSpaceForWorktree(parentDir, statfsImpl, env, options = {}) {
+  const required = resolveMinFreeBytes(env, options);
   if (required <= 0) {
     return;
   }
@@ -417,6 +507,8 @@ function assertFreeSpaceForWorktree(parentDir, statfsImpl, env) {
  * @param {string} [options.dataDir]
  * @param {string} [options.worktreePath] - explicit path (sibling placement)
  * @param {NodeJS.ProcessEnv} [options.env]
+ * @param {Array<string|{id?: string}>} [options.ecosystems] - raise free-space floor
+ * @param {number} [options.minFreeBytes] - explicit free-space floor override
  * @param {typeof fs.statfsSync} [options.statfsImpl]
  * @param {typeof git} [options.gitImpl]
  */
@@ -427,6 +519,8 @@ export function createWorktree({
   dataDir,
   worktreePath: worktreePathOverride,
   env,
+  ecosystems,
+  minFreeBytes,
   statfsImpl = fs.statfsSync,
   gitImpl = git
 }) {
@@ -438,7 +532,7 @@ export function createWorktree({
   const branchName = `grok-build/${runId}`;
   const worktreePath = worktreePathOverride
     ? path.resolve(String(worktreePathOverride))
-    : resolveWorktreePath(runId, { dataDir, env });
+    : resolveWorktreePath(runId, { dataDir, env, repoRoot });
   const baseSha = gitChecked(repoRoot, ["rev-parse", baseRef]).stdout.trim();
 
   fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
@@ -450,7 +544,10 @@ export function createWorktree({
   // After the mkdir so the directory being measured exists, and before the
   // first git write so a full disk costs a clear message instead of a partial
   // checkout plus `Failed to create worktree: <git stderr>`.
-  assertFreeSpaceForWorktree(path.dirname(worktreePath), statfsImpl, env ?? process.env);
+  assertFreeSpaceForWorktree(path.dirname(worktreePath), statfsImpl, env ?? process.env, {
+    ecosystems,
+    minFreeBytes
+  });
 
   const result = gitImpl(repoRoot, ["worktree", "add", "-b", branchName, worktreePath, baseSha]);
   if (result.status !== 0) {
@@ -597,6 +694,97 @@ export function removeDirectoryTree(targetPath, options = {}) {
   };
 }
 
+/**
+ * Best-effort recursive byte size of a directory tree (follows neither
+ * junctions nor symlinks — only real files). Used to report private cargo
+ * target / scratch dirs before teardown.
+ *
+ * @param {string} targetPath
+ * @param {{ maxEntries?: number }} [options]
+ * @returns {{ bytes: number, truncated: boolean }}
+ */
+export function measureDirectorySize(targetPath, options = {}) {
+  const maxEntries = Number.isFinite(options.maxEntries) ? options.maxEntries : 50_000;
+  let bytes = 0;
+  let entries = 0;
+  let truncated = false;
+
+  const walk = (dir) => {
+    if (truncated) {
+      return;
+    }
+    let listing;
+    try {
+      listing = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of listing) {
+      if (truncated) {
+        return;
+      }
+      entries += 1;
+      if (entries > maxEntries) {
+        truncated = true;
+        return;
+      }
+      const full = path.join(dir, entry.name);
+      // Do not follow reparse points — measuring through a junction into the
+      // user's real node_modules would inflate the number and risk walking off
+      // the worktree entirely.
+      if (entry.isSymbolicLink()) {
+        continue;
+      }
+      if (entry.isDirectory()) {
+        walk(full);
+        continue;
+      }
+      if (entry.isFile()) {
+        try {
+          bytes += fs.statSync(full).size;
+        } catch {
+          // skip unreadable
+        }
+      }
+    }
+  };
+
+  if (targetPath && fs.existsSync(targetPath)) {
+    walk(targetPath);
+  }
+  return { bytes, truncated };
+}
+
+/**
+ * Relative path of the per-worktree private cargo target (mirrors provision.mjs
+ * CARGO_TARGET_DIR_RELATIVE without importing that module — cycle risk).
+ */
+const PRIVATE_CARGO_TARGET_RELATIVE = path.join(".grok-build", "cargo-target");
+
+/**
+ * Measure the private CARGO_TARGET_DIR inside a worktree before removal.
+ * Returns null when the directory is absent.
+ *
+ * @param {string} worktreePath
+ * @returns {{ path: string, bytes: number, truncated: boolean, label: string }|null}
+ */
+export function measurePrivateTargetDir(worktreePath) {
+  if (!worktreePath) {
+    return null;
+  }
+  const targetPath = path.join(worktreePath, PRIVATE_CARGO_TARGET_RELATIVE);
+  if (!fs.existsSync(targetPath)) {
+    return null;
+  }
+  const measured = measureDirectorySize(targetPath);
+  return {
+    path: targetPath,
+    bytes: measured.bytes,
+    truncated: measured.truncated,
+    label: `private cargo target ${formatBytes(measured.bytes)}${measured.truncated ? " (partial)" : ""}`
+  };
+}
+
 export function removeWorktree({
   repoRoot,
   worktreePath,
@@ -608,6 +796,9 @@ export function removeWorktree({
 }) {
   const exists = existsImpl ?? ((p) => fs.existsSync(p));
   let removeError = null;
+  // Report private target size before teardown so operators can see why a
+  // volume filled (field: 7.5 GB CARGO_TARGET_DIR on the wrong drive).
+  const privateTarget = measurePrivateTargetDir(worktreePath);
 
   if (worktreePath && exists(worktreePath)) {
     unlinkReparsePointsSync(worktreePath);
@@ -654,11 +845,158 @@ export function removeWorktree({
       reason: reasons.join("; "),
       // Loud rather than quietly deregistered: the caller (prune, land) must
       // list anything it could not delete so an operator can free the disk.
-      orphanedPath: stillOnDisk ? worktreePath : null
+      orphanedPath: stillOnDisk ? worktreePath : null,
+      privateTarget
     };
   }
 
-  return { removed: true, worktreePath, branchName, orphanedPath: null };
+  return { removed: true, worktreePath, branchName, orphanedPath: null, privateTarget };
+}
+
+/**
+ * Walk a worktree root and report directories that have no corresponding job
+ * record (and are not registered with `git worktree list`).
+ *
+ * Used by prune to surface the unbounded orphan accumulation measured in the
+ * field (hundreds of directories under the shared root while git only knew
+ * about a handful). Never force-deletes: the caller applies work-preservation
+ * rules (uncommitted work stays).
+ *
+ * @param {object} options
+ * @param {string} options.worktreeRoot - directory whose immediate children are candidates
+ * @param {Iterable<string>|string[]} [options.knownPaths] - job-record worktree paths
+ * @param {string} [options.repoRoot] - for git worktree list cross-check
+ * @param {typeof git} [options.gitImpl]
+ * @param {typeof fs.readdirSync} [options.readdirSyncImpl]
+ * @param {typeof fs.existsSync} [options.existsSyncImpl]
+ * @returns {{ orphans: Array<{ path: string, hasUncommittedWork: boolean, detail: string }>, root: string, scanned: number }}
+ */
+export function reconcileOrphanWorktrees({
+  worktreeRoot,
+  knownPaths = [],
+  repoRoot = null,
+  gitImpl = git,
+  readdirSyncImpl = fs.readdirSync.bind(fs),
+  existsSyncImpl = fs.existsSync.bind(fs)
+}) {
+  const root = worktreeRoot ? path.resolve(String(worktreeRoot)) : "";
+  if (!root || !existsSyncImpl(root)) {
+    return { orphans: [], root, scanned: 0 };
+  }
+
+  const known = new Set();
+  for (const entry of knownPaths) {
+    if (entry == null || !String(entry).trim()) {
+      continue;
+    }
+    try {
+      known.add(path.resolve(String(entry)));
+    } catch {
+      known.add(String(entry));
+    }
+  }
+
+  // git worktree list --porcelain: "worktree <path>" lines are registered trees.
+  if (repoRoot) {
+    const listed = gitImpl(repoRoot, ["worktree", "list", "--porcelain"]);
+    if (listed.status === 0) {
+      for (const line of String(listed.stdout ?? "").split(/\r?\n/)) {
+        if (line.startsWith("worktree ")) {
+          const wt = line.slice("worktree ".length).trim();
+          if (wt) {
+            try {
+              known.add(path.resolve(wt));
+            } catch {
+              known.add(wt);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  let children;
+  try {
+    children = readdirSyncImpl(root, { withFileTypes: true });
+  } catch {
+    return { orphans: [], root, scanned: 0 };
+  }
+
+  const orphans = [];
+  let scanned = 0;
+  for (const entry of children) {
+    if (!entry.isDirectory() && !entry.isSymbolicLink()) {
+      continue;
+    }
+    const childPath = path.join(root, entry.name);
+    scanned += 1;
+    let resolved = childPath;
+    try {
+      resolved = path.resolve(childPath);
+    } catch {
+      // keep childPath
+    }
+    if (known.has(resolved)) {
+      continue;
+    }
+    // Also match by basename when known paths used a different root (legacy
+    // TEMP vs volume root): a job that still points at the live directory
+    // should not be reported as orphan.
+    const base = entry.name;
+    let matchedByName = false;
+    for (const k of known) {
+      if (path.basename(k) === base) {
+        matchedByName = true;
+        break;
+      }
+    }
+    if (matchedByName) {
+      continue;
+    }
+
+    const hasUncommittedWork = worktreeHasUncommittedWorkSafe(childPath, gitImpl);
+    orphans.push({
+      path: childPath,
+      hasUncommittedWork,
+      detail: hasUncommittedWork
+        ? `Orphan worktree at ${childPath} has uncommitted work; not safe to auto-delete.`
+        : `Orphan worktree directory at ${childPath} has no job record.`
+    });
+  }
+
+  return { orphans, root, scanned };
+}
+
+/**
+ * Best-effort uncommitted-work check that never throws (orphan scan must not
+ * fail the whole prune plan because one directory is unreadable).
+ *
+ * @param {string} worktreePath
+ * @param {typeof git} [gitImpl]
+ * @returns {boolean}
+ */
+function worktreeHasUncommittedWorkSafe(worktreePath, gitImpl = git) {
+  try {
+    const status = gitImpl(worktreePath, [
+      "status",
+      "--porcelain",
+      "--untracked-files=all",
+      "--",
+      ".",
+      ...artifactExcludePathspecs()
+    ]);
+    if (status.status !== 0) {
+      const fallback = gitImpl(worktreePath, ["status", "--porcelain", "--untracked-files=all"]);
+      if (fallback.status !== 0) {
+        // Unknown state: treat as protected so we never force-delete real work.
+        return true;
+      }
+      return Boolean(String(fallback.stdout ?? "").trim());
+    }
+    return Boolean(String(status.stdout ?? "").trim());
+  } catch {
+    return true;
+  }
 }
 
 /**

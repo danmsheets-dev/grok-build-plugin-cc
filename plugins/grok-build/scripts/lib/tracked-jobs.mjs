@@ -41,6 +41,38 @@ function redactTerminalClaimPatch(patch = {}) {
   return next;
 }
 
+/**
+ * Persist isolation outcome on the terminal job record so it survives worktree
+ * cleanup (R6-2). `worktree` may later be nulled by land; `isolation` remains.
+ */
+function buildIsolationRecord(execution, job = {}) {
+  const wt = execution.worktree ?? job.worktree ?? null;
+  const prev =
+    execution.isolation ?? job.isolation ?? execution.payload?.isolation ?? null;
+  const breached = Boolean(
+    execution.isolationBreached ||
+      execution.payload?.isolationBreached ||
+      wt?.breached ||
+      prev?.breached
+  );
+  const path = wt?.path ?? prev?.worktree ?? null;
+  const source =
+    execution.isolateSource ??
+    job.isolateSource ??
+    execution.payload?.isolateSource ??
+    prev?.source ??
+    null;
+  return {
+    active: Boolean(path || prev?.active || execution.isolate || job.isolate),
+    worktree: path,
+    branch: wt?.branch ?? prev?.branch ?? null,
+    baseSha: wt?.baseSha ?? prev?.baseSha ?? null,
+    headSha: wt?.sha ?? wt?.headSha ?? prev?.headSha ?? null,
+    breached,
+    source
+  };
+}
+
 export const SESSION_ID_ENV = "GROK_CC_SESSION_ID";
 
 /** stopReasons that mean a clean, full completion rather than an early exit. */
@@ -706,6 +738,12 @@ export async function runTrackedJob(job, runner, options = {}) {
         grokVersion: execution.grokVersion ?? null,
         verify: redactedVerify ?? null,
         worktree: execution.worktree ?? job.worktree ?? null,
+        isolationBreached:
+          Boolean(execution.isolationBreached) || Boolean(execution.payload?.isolationBreached),
+        isolationLeak: execution.isolationLeak ?? execution.payload?.isolationLeak ?? null,
+        isolateSource:
+          execution.isolateSource ?? job.isolateSource ?? execution.payload?.isolateSource ?? null,
+        isolation: buildIsolationRecord(execution, job),
         budget: execution.budget ?? null,
         rendered: redactedRendered,
         // Nested delegation linkage — additive; older runners leave them null.

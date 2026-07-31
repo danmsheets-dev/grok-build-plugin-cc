@@ -95,6 +95,10 @@
         "baseSha": { "type": ["string", "null"] },
         "headSha": { "type": ["string", "null"] },
         "breached": { "type": "boolean" },
+        "source": {
+          "type": ["string", "null"],
+          "description": "Why isolation was on/off (e.g. forced-programmatic, write-default, read-only-default, cli)."
+        },
         "leakedPaths": {
           "type": "array",
           "items": { "type": "string" }

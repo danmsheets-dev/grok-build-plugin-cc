@@ -169,7 +169,9 @@ import {
   isGeneratedArtifactPath,
   listCommittedChanges,
   partitionWorkAndDebris,
-  removeWorktree
+  reconcileOrphanWorktrees,
+  removeWorktree,
+  resolveWorktreeRoot
 } from "./lib/worktree.mjs";
 import {
   buildRunManifest,
@@ -2531,7 +2533,50 @@ function collectPrunePlan(cwd, options = {}) {
     });
   }
 
-  return { workspaceRoot, actions, awaitingLand };
+  // R6-7: directories under the worktree root with no job record. Offer removal
+  // only when the tree has no uncommitted work (same preservation rules as
+  // job-backed prune).
+  const knownPaths = [];
+  for (const job of jobs) {
+    const stored = readStoredJob(workspaceRoot, job.id) ?? job;
+    const p = stored?.worktree?.path ?? stored?.isolation?.worktree;
+    if (p) {
+      knownPaths.push(p);
+    }
+  }
+  const worktreeRoot = resolveWorktreeRoot({ repoRoot: workspaceRoot, env: process.env });
+  const orphanScan = reconcileOrphanWorktrees({
+    worktreeRoot,
+    knownPaths,
+    repoRoot: workspaceRoot
+  });
+  /** @type {{ path: string, hasUncommittedWork: boolean, detail: string }[]} */
+  const orphanWorktrees = orphanScan.orphans;
+  for (const orphan of orphanWorktrees) {
+    if (orphan.hasUncommittedWork && !includeUnlanded) {
+      awaitingLand.push({
+        jobId: `(orphan)`,
+        branch: null,
+        unmergedCommits: 0,
+        detail: orphan.detail
+      });
+      continue;
+    }
+    actions.push({
+      type: "orphan-worktree",
+      jobId: `(orphan:${path.basename(orphan.path)})`,
+      detail: `Remove orphan worktree directory ${orphan.path} (no job record).`,
+      apply: () =>
+        removeWorktree({
+          repoRoot: workspaceRoot,
+          worktreePath: orphan.path,
+          branchName: null,
+          deleteBranch: false
+        })
+    });
+  }
+
+  return { workspaceRoot, actions, awaitingLand, orphanWorktrees, worktreeRoot };
 }
 
 function renderPruneReport(plan, applied) {
@@ -2644,6 +2689,32 @@ function ensureGrokAvailable(cwd) {
 }
 
 /**
+ * Isolation outcome for runs --json / show. Survives worktree cleanup (R6-2):
+ * after land the path is null on `worktree` but `isolation.worktree` still
+ * records where the run lived and whether it was isolated.
+ */
+function projectIsolationFields(record, worktree) {
+  const stored =
+    record?.isolation && typeof record.isolation === "object" ? record.isolation : null;
+  const path =
+    stored?.worktree ?? worktree?.path ?? null;
+  const active = Boolean(
+    stored?.active || path || worktree?.path || record?.isolate === true
+  );
+  return {
+    active,
+    worktree: path,
+    branch: stored?.branch ?? worktree?.branch ?? null,
+    baseSha: stored?.baseSha ?? worktree?.baseSha ?? null,
+    headSha: stored?.headSha ?? worktree?.sha ?? worktree?.headSha ?? null,
+    breached: Boolean(
+      stored?.breached || worktree?.breached || record?.isolationBreached || record?.status === "isolation-breached"
+    ),
+    source: stored?.source ?? record?.isolateSource ?? null
+  };
+}
+
+/**
  * Project a job into the runs --json v2 row shape.
  * Hydrates missing fields from jobs/<id>.json when the index never mirrored them.
  */
@@ -2671,12 +2742,7 @@ function projectRunJsonRow(job, storedJob = null) {
       result?.changedFiles?.total ??
       worktree?.changedFileCount ??
       null,
-    isolation: {
-      active: Boolean(worktree?.path),
-      worktree: worktree?.path ?? null,
-      branch: worktree?.branch ?? null,
-      breached: Boolean(worktree?.breached || record.isolationBreached)
-    },
+    isolation: projectIsolationFields(record, worktree),
     usage,
     model: record.model ?? storedJob?.model ?? null,
     resolvedModel: record.resolvedModel ?? storedJob?.resolvedModel ?? usage?.resolvedModel ?? null,
@@ -2716,6 +2782,9 @@ function hydrateJobFromStored(workspaceRoot, job) {
     "changedFileCount",
     "toolCallCount",
     "worktree",
+    "isolation",
+    "isolationBreached",
+    "isolateSource",
     "grokVersion",
     "model",
     "parentRunId",
@@ -3303,11 +3372,11 @@ async function executeTaskRun(request) {
     noSandbox: Boolean(request.noBlenderSandbox)
   });
 
-  if (isolate && write) {
-    // Nested children: sibling of the parent worktree, never inside it. A
-    // worktree inside a worktree breaks `git worktree remove`, doubles path
-    // length on Windows, and makes the artifact excludes and `land` graph
-    // incoherent. See nest.mjs deriveSiblingWorktreePath.
+  if (isolate) {
+    // Isolated for write AND read-only (R6-1). Read-only gets a worktree with
+    // no live-state provisioning — cheap, and the previous "run in main with
+    // unrestricted shell" path was the weakest surface once write isolation
+    // landed. Nested children: sibling of the parent worktree, never inside it.
     let nestedWorktreePath = null;
     if (request.parentWorktree && request.jobId) {
       nestedWorktreePath = deriveSiblingWorktreePath(request.parentWorktree, request.jobId);
@@ -3318,7 +3387,8 @@ async function executeTaskRun(request) {
       // Child starts from the parent's base commit (not the parent's HEAD with
       // partial agent edits) so each nested run is a clean sibling branch.
       baseRef: request.baseRef || "HEAD",
-      worktreePath: nestedWorktreePath ?? undefined
+      worktreePath: nestedWorktreePath ?? undefined,
+      ecosystems: runEcosystems
     });
     // Persist worktree descriptor immediately so cancel/crash cannot orphan it
     // from land/prune/doctor (descriptor must not wait until the run returns).
@@ -3326,6 +3396,15 @@ async function executeTaskRun(request) {
       patchJobIfActive(workspaceRoot, request.jobId, {
         parentRunId: request.parentRunId ?? null,
         nestDepth: request.nestDepth ?? 0,
+        isolateSource,
+        isolation: {
+          active: true,
+          worktree: created.worktreePath,
+          branch: created.branchName,
+          baseSha: created.baseSha,
+          breached: false,
+          source: isolateSource
+        },
         worktree: {
           path: created.worktreePath,
           branch: created.branchName,
@@ -3333,97 +3412,108 @@ async function executeTaskRun(request) {
         }
       });
     }
-    const nestedProjectDirs = runEcosystems
-      .map((entry) => entry.projectDir)
-      .filter((d) => typeof d === "string" && d !== "." && d !== "");
-    const plan = planWorktreeLinks(created.repoRoot, created.worktreePath, {
-      // Only ever true/false when the project config said so; undefined lets
-      // resolveGodotCacheMode fall through to env / the isolated private default.
-      copyGodotCache: request.provisionCopy,
-      provisionFiles: request.provisionFiles,
-      dirPolicy: request.provisionLink,
-      linkDirs: request.linkDirs,
-      nestedProjectDirs,
-      isWorkspace: Boolean(nodeDescriptor?.isWorkspace)
-    });
-    godotCacheMode = plan.godotCache ?? null;
-    if (plan.env && Object.keys(plan.env).length > 0) {
-      provisionEnv = { ...plan.env };
-    }
-    // Fingerprint read-mostly SHARED dirs in the main checkout BEFORE the agent
-    // runs. Post-run comparison detects junction write-through that git status
-    // cannot see (gitignored caches).
-    if (Array.isArray(plan.sharedDirs) && plan.sharedDirs.length > 0) {
-      sharedDirFingerprintsBefore = fingerprintSharedDirs(created.repoRoot, plan.sharedDirs);
-    }
-    // The result used to be discarded outright, so a link that failed - the
-    // commonest being a `.godot` that is tracked in git and therefore already
-    // checked out into the worktree - was invisible, and the run just got
-    // mysteriously slower.
-    provisionSummary = summarizeProvisionResult(provisionWorktree(plan));
 
-    // Progress channel FIRST — the shared-cache warning must reach the user
-    // before a long agent turn, not only in the final report after a corrupted
-    // import has already burned the run.
-    for (const note of provisionSummary.notes ?? []) {
-      request.onProgress?.({
-        phase: "starting",
-        message: `Provisioning: ${note}`
+    // Live-state provisioning is for write runs only. Read-only isolation is a
+    // clean checkout so the agent cannot mutate caches through junctions.
+    if (write) {
+      const nestedProjectDirs = runEcosystems
+        .map((entry) => entry.projectDir)
+        .filter((d) => typeof d === "string" && d !== "." && d !== "");
+      const plan = planWorktreeLinks(created.repoRoot, created.worktreePath, {
+        // Only ever true/false when the project config said so; undefined lets
+        // resolveGodotCacheMode fall through to env / the isolated private default.
+        copyGodotCache: request.provisionCopy,
+        provisionFiles: request.provisionFiles,
+        dirPolicy: request.provisionLink,
+        linkDirs: request.linkDirs,
+        nestedProjectDirs,
+        isWorkspace: Boolean(nodeDescriptor?.isWorkspace)
       });
-    }
+      godotCacheMode = plan.godotCache ?? null;
+      if (plan.env && Object.keys(plan.env).length > 0) {
+        provisionEnv = { ...plan.env };
+      }
+      // Fingerprint read-mostly SHARED dirs in the main checkout BEFORE the agent
+      // runs. Post-run comparison detects junction write-through that git status
+      // cannot see (gitignored caches).
+      if (Array.isArray(plan.sharedDirs) && plan.sharedDirs.length > 0) {
+        sharedDirFingerprintsBefore = fingerprintSharedDirs(created.repoRoot, plan.sharedDirs);
+      }
+      // The result used to be discarded outright, so a link that failed - the
+      // commonest being a `.godot` that is tracked in git and therefore already
+      // checked out into the worktree - was invisible, and the run just got
+      // mysteriously slower.
+      provisionSummary = summarizeProvisionResult(provisionWorktree(plan));
 
-    if (godotCacheMode && !godotCacheMode.private) {
-      // Shared with the main checkout: lock around engine access. The linked
-      // path in the worktree is a junction/symlink to the real cache. Honour
-      // projectDir so game/.godot monorepos lock the right tree.
-      const godotRoot =
-        godotDescriptor?.projectDir && godotDescriptor.projectDir !== "."
-          ? path.join(created.repoRoot, ...String(godotDescriptor.projectDir).split("/"))
-          : created.repoRoot;
-      for (const name of GODOT_CACHE_DIRS) {
-        const candidate = path.join(godotRoot, name);
-        if (fs.existsSync(candidate)) {
-          sharedGodotCachePath = candidate;
-          break;
+      // Progress channel FIRST — the shared-cache warning must reach the user
+      // before a long agent turn, not only in the final report after a corrupted
+      // import has already burned the run.
+      for (const note of provisionSummary.notes ?? []) {
+        request.onProgress?.({
+          phase: "starting",
+          message: `Provisioning: ${note}`
+        });
+      }
+
+      if (godotCacheMode && !godotCacheMode.private) {
+        // Shared with the main checkout: lock around engine access. The linked
+        // path in the worktree is a junction/symlink to the real cache. Honour
+        // projectDir so game/.godot monorepos lock the right tree.
+        const godotRoot =
+          godotDescriptor?.projectDir && godotDescriptor.projectDir !== "."
+            ? path.join(created.repoRoot, ...String(godotDescriptor.projectDir).split("/"))
+            : created.repoRoot;
+        for (const name of GODOT_CACHE_DIRS) {
+          const candidate = path.join(godotRoot, name);
+          if (fs.existsSync(candidate)) {
+            sharedGodotCachePath = candidate;
+            break;
+          }
         }
       }
-    }
 
-    if (wantBlenderSandbox) {
-      // Inside the worktree, so unlinkReparsePointsSync already tears the
-      // junction down with the rest of the run, and `.grok-build/` is excluded
-      // from the commit so the linked add-on cannot be committed twice.
-      const sandboxPlan = planBlenderScriptSandbox(created.worktreePath, {
-        repoRoot: created.repoRoot
-      });
-      const sandboxResult = summarizeProvisionResult(provisionWorktree(sandboxPlan));
-      provisionSummary = {
-        provisioned: [...provisionSummary.provisioned, ...sandboxResult.provisioned],
-        failed: [...provisionSummary.failed, ...sandboxResult.failed],
-        notes: [...provisionSummary.notes, ...sandboxResult.notes]
-      };
-      for (const note of sandboxResult.notes ?? []) {
-        request.onProgress?.({ phase: "starting", message: `Provisioning: ${note}` });
-      }
-      // Only claim the sandbox when the link actually landed. Setting
-      // BLENDER_USER_SCRIPTS at an add-on directory that does not exist is
-      // strictly worse than not sandboxing at all: Blender would then find NO
-      // add-ons, and the verify command fails for a reason that has nothing to
-      // do with the code.
-      if (Object.keys(sandboxPlan.env).length > 0 && sandboxResult.failed.length === 0) {
-        blenderSandboxEnv = sandboxPlan.env;
-        blenderSandboxInfo = sandboxPlan.blenderSandbox ?? {
-          moduleName: sandboxPlan.moduleName,
-          addonName: sandboxPlan.addonName,
-          isExtension: sandboxPlan.isExtension,
-          scriptsDir: sandboxPlan.scriptsDir,
-          extensionsDir: sandboxPlan.extensionsDir
+      if (wantBlenderSandbox) {
+        // Inside the worktree, so unlinkReparsePointsSync already tears the
+        // junction down with the rest of the run, and `.grok-build/` is excluded
+        // from the commit so the linked add-on cannot be committed twice.
+        const sandboxPlan = planBlenderScriptSandbox(created.worktreePath, {
+          repoRoot: created.repoRoot
+        });
+        const sandboxResult = summarizeProvisionResult(provisionWorktree(sandboxPlan));
+        provisionSummary = {
+          provisioned: [...provisionSummary.provisioned, ...sandboxResult.provisioned],
+          failed: [...provisionSummary.failed, ...sandboxResult.failed],
+          notes: [...provisionSummary.notes, ...sandboxResult.notes]
         };
-      } else if (sandboxResult.failed.length > 0) {
-        provisionSummary.notes.push(
-          "--blender-sandbox: the add-on could not be linked, so BLENDER_USER_SCRIPTS was left alone and Blender will use your real add-on directory."
-        );
+        for (const note of sandboxResult.notes ?? []) {
+          request.onProgress?.({ phase: "starting", message: `Provisioning: ${note}` });
+        }
+        // Only claim the sandbox when the link actually landed. Setting
+        // BLENDER_USER_SCRIPTS at an add-on directory that does not exist is
+        // strictly worse than not sandboxing at all: Blender would then find NO
+        // add-ons, and the verify command fails for a reason that has nothing to
+        // do with the code.
+        if (Object.keys(sandboxPlan.env).length > 0 && sandboxResult.failed.length === 0) {
+          blenderSandboxEnv = sandboxPlan.env;
+          blenderSandboxInfo = sandboxPlan.blenderSandbox ?? {
+            moduleName: sandboxPlan.moduleName,
+            addonName: sandboxPlan.addonName,
+            isExtension: sandboxPlan.isExtension,
+            scriptsDir: sandboxPlan.scriptsDir,
+            extensionsDir: sandboxPlan.extensionsDir
+          };
+        } else if (sandboxResult.failed.length > 0) {
+          provisionSummary.notes.push(
+            "--blender-sandbox: the add-on could not be linked, so BLENDER_USER_SCRIPTS was left alone and Blender will use your real add-on directory."
+          );
+        }
       }
+    } else {
+      provisionSummary = {
+        provisioned: [],
+        failed: [],
+        notes: ["read-only isolation: worktree created without live-state provisioning"]
+      };
     }
 
     // Inject ecosystem skills into the worktree so the agent (not only the
@@ -3505,7 +3595,8 @@ async function executeTaskRun(request) {
 
     // Snapshot *.uid before the agent so a regenerated companion is reported
     // as the silent reference-break it is. Root at the Godot projectDir.
-    if (runEcosystem?.id === "godot" || ecosystemIds.includes("godot") || godotDescriptor) {
+    // Write runs only — read-only isolation does not expect uid mutations.
+    if (write && (runEcosystem?.id === "godot" || ecosystemIds.includes("godot") || godotDescriptor)) {
       uidSnapshotRoot =
         godotDescriptor?.projectDir && godotDescriptor.projectDir !== "."
           ? path.join(created.worktreePath, ...String(godotDescriptor.projectDir).split("/"))
@@ -3746,11 +3837,11 @@ async function executeTaskRun(request) {
   const dirtyBeforeRun = write && !created ? porcelainChangeEntries(runCwd) : null;
   const dirtyBeforeRunPaths = dirtyBeforeRun ? new Set(dirtyBeforeRun.keys()) : null;
 
-  // Isolated runs: snapshot the MAIN checkout (workspaceRoot), not the
-  // worktree. Newly dirty paths there after the agent finishes are an isolation
-  // breach — the agent obeyed an absolute path in the brief. Same post-baseline
-  // timing as the non-isolated snapshot above.
-  const mainDirtyBeforeRun = write && created ? porcelainChangeEntries(workspaceRoot) : null;
+  // Isolated runs (write or read-only): snapshot the MAIN checkout
+  // (workspaceRoot), not the worktree. Newly dirty paths there after the agent
+  // finishes are an isolation breach — the agent obeyed an absolute path in the
+  // brief. Same post-baseline timing as the non-isolated snapshot above.
+  const mainDirtyBeforeRun = created ? porcelainChangeEntries(workspaceRoot) : null;
   const mainDirtyBeforeRunPaths = mainDirtyBeforeRun ? new Set(mainDirtyBeforeRun.keys()) : null;
 
   // Isolation header line only on this branch (WP-P1 owns CLI/model/verify plan
@@ -3854,11 +3945,12 @@ async function executeTaskRun(request) {
   // read-only sandbox AND deny rules on Edit/Write/NotebookEdit, because the
   // sandbox is inert on Windows (see buildHeadlessPermissionOptions).
   //
-  // Isolated write runs ADD deny rules on the main checkout so absolute paths
-  // in the task brief cannot edit it even under --always-approve. Measured:
-  // deny beats always-approve and covers the shell too.
+  // Isolated runs ADD deny rules on the main checkout so absolute paths in the
+  // task brief cannot edit it (write: even under --always-approve; read-only:
+  // defence in depth beyond the plan sandbox). Measured: deny beats
+  // always-approve and covers the shell too.
   const permissionOptions = buildHeadlessPermissionOptions(write);
-  if (created && write) {
+  if (created) {
     // The segment-anchored deny rule is what closes a `../` traversal into the
     // main checkout, but it must not fire when the repository's own directory
     // name also occurs inside the worktree — `**/src/**` on a repo called `src`
@@ -4326,16 +4418,25 @@ async function executeTaskRun(request) {
   /** @type {{entries: string[], total: number, truncated: boolean}|null} */
   let debris = null;
 
-  // Early collect: needed for isolation before the full stream aggregate below.
+  // Early collect: needed for the progress line before the full stream aggregate.
   const earlyConfineViolations = agentResults.flatMap((entry) =>
     Array.isArray(entry?.confineViolations) ? entry.confineViolations : []
   );
-  // Hyper already caught escape attempts on the wire — honour them even when
-  // the dirty-set diff cannot (blocked writes never dirty the main tree).
+  // WP-B7-FIX rule (do not re-merge these):
+  // - Blocked confine attempts alone (CLI reported confine_violation, main tree
+  //   clean) → NOT a breach. The defence worked; the write never dirtied main.
+  //   Surface the signal; leave isolationBreached false so the run stays
+  //   landable and can still be verified.
+  // - Main checkout actually changed (dirty-set diff below, or shared-dir
+  //   fingerprint) → BREACH on that strength alone, whether or not the CLI
+  //   also reported blocked attempts.
+  // Hyper already caught escape attempts on the wire — report them clearly
+  // even when the dirty-set diff cannot (blocked writes never dirty main).
   if (earlyConfineViolations.length > 0) {
-    isolationBreached = true;
+    const n = earlyConfineViolations.length;
     request.onProgress?.({
-      message: `Isolation BREACHED: ${earlyConfineViolations.length} confine violation(s) reported by the CLI.`,
+      message:
+        `${n} confine attempt${n === 1 ? "" : "s"} blocked by the CLI (isolation held).`,
       phase: "finalizing"
     });
   }
@@ -4541,8 +4642,41 @@ async function executeTaskRun(request) {
       changedFiles: worktreeSide?.entries ?? null,
       changedFileCount: combinedTotal,
       breached: isolationBreached,
-      isolationLeak
+      isolationLeak,
+      // Dual lists for operator recovery on a split write (R7-1).
+      worktreeFiles: worktreeSide?.entries ?? [],
+      mainTreeFiles: mainTreeSide?.entries ?? isolationLeak?.entries ?? []
     };
+
+    // R7-1: any work outside the worktree fails the run. Name BOTH file lists
+    // so recovery is possible — a split state is worse than no isolation.
+    if (isolationBreached) {
+      const wtList = worktreeSide?.entries ?? [];
+      const mainList = mainTreeSide?.entries ?? isolationLeak?.entries ?? [];
+      const formatList = (entries) =>
+        entries.length === 0
+          ? "(none)"
+          : entries
+              .slice(0, 40)
+              .map((e) => `    ${e}`)
+              .join("\n") +
+            (entries.length > 40 ? `\n    … ${entries.length - 40} more` : "");
+      const recovery =
+        `Recovery:\n` +
+        `  1. Inspect both trees before touching either.\n` +
+        `  2. Main-tree leaks (if still wanted): copy or re-apply them into the worktree at ${created.worktreePath}, then commit there.\n` +
+        `  3. Do NOT run land on this job — land refuses a breached run so a partial worktree (e.g. deletions only) cannot destroy the main tree.\n` +
+        `  4. After reconciling: land ${request.jobId ?? "<run-id>"} --discard to drop the worktree, or manually merge the complete change set.\n` +
+        `  5. If the main-tree changes were concurrent human edits, re-check with git status and keep them; only the agent half is untrustworthy.`;
+      request.onProgress?.({
+        message:
+          `Isolation BREACHED (split write): worktree has ${wtList.length} path(s); main checkout leaked ${mainList.length} path(s).\n` +
+          `  In the worktree:\n${formatList(wtList)}\n` +
+          `  Leaked to main checkout:\n${formatList(mainList)}\n` +
+          recovery,
+        phase: "finalizing"
+      });
+    }
   } else if (write) {
     const collected = collectWorkingTreeChanges(runCwd, dirtyBeforeRunPaths);
     if (collected) {
@@ -4963,6 +5097,16 @@ async function executeTaskRun(request) {
     worktree,
     isolationBreached,
     isolationLeak,
+    isolateSource,
+    isolation: {
+      active: Boolean(created),
+      worktree: created?.worktreePath ?? worktree?.path ?? null,
+      branch: created?.branchName ?? worktree?.branch ?? null,
+      baseSha: created?.baseSha ?? worktree?.baseSha ?? null,
+      headSha: worktree?.sha ?? null,
+      breached: isolationBreached,
+      source: isolateSource
+    },
     // Which environment variables this run imposed on the verify commands and
     // the agent, with sensitive VALUES withheld by key name. Recorded because
     // "why did this pass here and fail for me?" is otherwise unanswerable, and
@@ -5026,6 +5170,16 @@ async function executeTaskRun(request) {
     worktree,
     isolationBreached,
     isolationLeak,
+    isolateSource,
+    isolation: {
+      active: Boolean(created),
+      worktree: created?.worktreePath ?? worktree?.path ?? null,
+      branch: created?.branchName ?? worktree?.branch ?? null,
+      baseSha: created?.baseSha ?? worktree?.baseSha ?? null,
+      headSha: worktree?.sha ?? null,
+      breached: isolationBreached,
+      source: isolateSource
+    },
     grokVersion,
     verify,
     usage: cumulativeUsage ?? null,
@@ -6442,11 +6596,42 @@ function recoverFromFailedNestedLand(parentWorktreePath, childJobId, parentRunId
  * left to land.
  */
 function markJobLanded(workspaceRoot, jobId, storedJob, action) {
-  writeJobFile(workspaceRoot, jobId, {
+  // R6-2: worktree path is cleared after land/discard, but the isolation
+  // outcome must survive so `runs --all --json` can still answer "was this
+  // run isolated?" after cleanup.
+  const prevWt = storedJob.worktree && typeof storedJob.worktree === "object" ? storedJob.worktree : null;
+  const prevIso =
+    storedJob.isolation && typeof storedJob.isolation === "object" ? storedJob.isolation : null;
+  const isolation = {
+    active: Boolean(prevWt?.path || prevIso?.active || prevIso?.worktree),
+    worktree: prevIso?.worktree ?? prevWt?.path ?? null,
+    branch: prevIso?.branch ?? prevWt?.branch ?? null,
+    baseSha: prevIso?.baseSha ?? prevWt?.baseSha ?? null,
+    headSha: prevIso?.headSha ?? prevWt?.sha ?? prevWt?.headSha ?? null,
+    breached: Boolean(
+      prevWt?.breached || storedJob.isolationBreached || prevIso?.breached || storedJob.status === "isolation-breached"
+    ),
+    source: prevIso?.source ?? storedJob.isolateSource ?? null
+  };
+  const next = {
     ...storedJob,
     worktree: null,
+    isolation,
+    isolationBreached: isolation.breached,
+    isolateSource: isolation.source,
     landedAt: nowIso(),
     landAction: action
+  };
+  writeJobFile(workspaceRoot, jobId, next);
+  upsertJob(workspaceRoot, {
+    id: jobId,
+    worktree: null,
+    isolation,
+    isolationBreached: isolation.breached,
+    isolateSource: isolation.source,
+    landedAt: next.landedAt,
+    landAction: action,
+    status: storedJob.status
   });
 }
 
@@ -6463,6 +6648,43 @@ async function handleLand(argv) {
 
   if (!worktree || typeof worktree !== "object" || !worktree.path) {
     throw new Error(`Run ${job.id} has no worktree to land. It ran without isolation.`);
+  }
+
+  // R7-1: refuse to land a breached (split) run. Landing would apply only the
+  // worktree half — field report: deletions in the worktree, creates/modifies
+  // in main, and land would have destroyed a menu with no replacement.
+  const isBreached =
+    storedJob.status === "isolation-breached" ||
+    Boolean(storedJob.isolationBreached) ||
+    Boolean(worktree.breached) ||
+    Boolean(storedJob.isolation?.breached);
+  if (isBreached && !options.discard) {
+    const wtFiles =
+      worktree.worktreeFiles ??
+      worktree.changedFiles ??
+      storedJob.result?.changedFiles?.worktree?.entries ??
+      [];
+    const mainFiles =
+      worktree.mainTreeFiles ??
+      storedJob.isolationLeak?.entries ??
+      storedJob.result?.changedFiles?.mainTree?.entries ??
+      storedJob.result?.isolationLeak?.entries ??
+      [];
+    const fmt = (list) =>
+      Array.isArray(list) && list.length > 0
+        ? list
+            .slice(0, 30)
+            .map((e) => `  ${e}`)
+            .join("\n")
+        : "  (none recorded)";
+    throw new Error(
+      `Refusing to land ${job.id}: isolation was breached (split write). ` +
+        `Landing would apply only the worktree half and can destroy the main checkout.\n` +
+        `In the worktree:\n${fmt(wtFiles)}\n` +
+        `Leaked to main checkout:\n${fmt(mainFiles)}\n` +
+        `Recovery: inspect both trees; copy wanted main-tree files into the worktree (or re-apply the full change set by hand); ` +
+        `then \`land ${job.id} --discard\` to drop the incomplete worktree. Do not land a partial change.`
+    );
   }
 
   const repoRoot = ensureGitRepository(workspaceRoot);
@@ -6631,7 +6853,7 @@ async function handleLand(argv) {
     } catch {
       // Best-effort listing; discard still proceeds (user asked explicitly).
     }
-    removeWorktree({
+    const removed = removeWorktree({
       repoRoot,
       worktreePath,
       branchName,
@@ -6643,13 +6865,17 @@ async function handleLand(argv) {
       action: "discard",
       worktree,
       diffStat: null,
-      discardedUncommitted: discardDirty
+      discardedUncommitted: discardDirty,
+      privateTarget: removed.privateTarget ?? null
     };
     const dirtyNote =
       discardDirty.length > 0
         ? ` Discarded uncommitted paths: ${discardDirty.slice(0, 8).join(", ")}${discardDirty.length > 8 ? ", …" : ""}.`
         : "";
-    const rendered = `Discarded ${job.id}: worktree and branch removed.${dirtyNote}\n`;
+    const targetNote = removed.privateTarget
+      ? ` Freed ${removed.privateTarget.label}.`
+      : "";
+    const rendered = `Discarded ${job.id}: worktree and branch removed.${dirtyNote}${targetNote}\n`;
     outputCommandResult(payload, rendered, options.json);
     return;
   }
@@ -6841,7 +7067,7 @@ async function handleLand(argv) {
     throw new Error(recoverFromFailedLandMerge(repoRoot, job.id, branchName, merge));
   }
 
-  removeWorktree({
+  const removed = removeWorktree({
     repoRoot,
     worktreePath,
     branchName,
@@ -6856,7 +7082,8 @@ async function handleLand(argv) {
     worktree,
     diffStat,
     totalBinaryFiles,
-    ignoredDirtyArtifacts
+    ignoredDirtyArtifacts,
+    privateTarget: removed.privateTarget ?? null
   };
   const text =
     (diffStat ? `${diffStat}\n\n` : "") +
@@ -6864,6 +7091,7 @@ async function handleLand(argv) {
     (ignoredDirtyArtifacts.length > 0
       ? `Ignored ${ignoredDirtyArtifacts.length} dirty generated artifact path(s) in the dirty-tree check: ${ignoredDirtyArtifacts.slice(0, 5).join(", ")}\n\n`
       : "") +
+    (removed.privateTarget ? `Removed ${removed.privateTarget.label}.\n\n` : "") +
     `Landed ${job.id} onto ${currentBranch}. Changes are staged; review with git diff --cached and commit when ready.\n`;
   outputCommandResult(payload, text, options.json);
 }

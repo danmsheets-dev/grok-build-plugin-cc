@@ -798,20 +798,35 @@ test("renderStoredJobResult composes answer with stored status trailer", () => {
   assert.match(output, /===BRIDGE-RESULT===/);
 });
 
-test("buildTaskStatusLines surfaces stream errors and confine violations", () => {
-  const lines = buildTaskStatusLines({
+test("buildTaskStatusLines surfaces stream errors and blocked confine attempts", () => {
+  // WP-B7-FIX: blocked confine attempts alone are NOT a breach.
+  const blockedOnly = buildTaskStatusLines({
     streamErrors: [{ message: "Connection closed unexpectedly" }],
     confineViolations: [
       { tool: "Write", path: "x", resolvedPath: "/repo/x", root: "/tmp/wt" }
     ],
-    isolationBreached: true,
-    status: "isolation-breached"
+    isolationBreached: false,
+    status: "completed"
   });
-  const text = lines.join("\n");
-  assert.match(text, /Stream error: Connection closed unexpectedly/);
-  assert.match(text, /Confine violation/);
-  assert.match(text, /tool=Write/);
-  assert.match(text, /Isolation BREACHED/);
+  const blockedText = blockedOnly.join("\n");
+  assert.match(blockedText, /Stream error: Connection closed unexpectedly/);
+  assert.match(blockedText, /1 confine attempt blocked by the CLI \(isolation held\)/);
+  assert.match(blockedText, /tool=Write/);
+  assert.doesNotMatch(blockedText, /Isolation BREACHED/);
+
+  // Real breach still names BREACHED; blocked attempts remain a separate line.
+  const both = buildTaskStatusLines({
+    confineViolations: [
+      { tool: "Write", path: "x", resolvedPath: "/repo/x", root: "/tmp/wt" }
+    ],
+    isolationBreached: true,
+    status: "isolation-breached",
+    isolationLeak: { entries: ["A\tleaked.txt"], total: 1, truncated: false }
+  });
+  const bothText = both.join("\n");
+  assert.match(bothText, /confine attempt blocked by the CLI \(isolation held\)/);
+  assert.match(bothText, /Isolation BREACHED: the main checkout changed/);
+  assert.doesNotMatch(bothText, /CLI reported confine violation\(s\) and\/or/);
 });
 
 test("formatUsageLine prints unavailable for partial cost, never \$0.00", () => {
@@ -912,12 +927,43 @@ test("buildRunManifest emits schemaVersion and stream channel fields", () => {
   assert.equal(manifest.usage.costIsPartial, true);
   assert.equal(manifest.usage.costUsd, null);
   assert.equal(manifest.agent.errors[0].message, "rate limited");
+  // WP-B7-FIX: confineViolations are their own key; they do not set breached.
   assert.equal(manifest.isolation.confineViolations.length, 1);
-  assert.ok(manifest.isolation.breached);
+  assert.equal(manifest.isolation.breached, false);
   assert.ok(manifest.report.contractHonoured);
   assert.ok(manifest.assumptions.some((a) => /assumed X/.test(a)));
   assert.ok(manifest.followUps.some((f) => /do Y/.test(f)));
   assert.equal(manifest.children.length, 1);
   assert.ok(manifest.compat.job);
   assert.ok(manifest.compat.storedJob);
+});
+
+test("buildRunManifest sets breached only from isolation flags, not confineViolations", () => {
+  const clean = buildRunManifest(
+    { id: "run-block-only", status: "completed", isolationBreached: false },
+    {
+      result: {
+        confineViolations: [{ tool: "run_terminal_command", path: "cd /wt", root: "/wt" }]
+      }
+    }
+  );
+  assert.equal(clean.isolation.breached, false);
+  assert.equal(clean.isolation.confineViolations.length, 1);
+
+  const breached = buildRunManifest(
+    {
+      id: "run-real-breach",
+      status: "isolation-breached",
+      isolationBreached: true,
+      isolationLeak: { entries: ["A\tleaked.txt"] }
+    },
+    {
+      result: {
+        confineViolations: [{ tool: "Write", resolvedPath: "/x", root: "/wt" }]
+      }
+    }
+  );
+  assert.equal(breached.isolation.breached, true);
+  assert.equal(breached.isolation.confineViolations.length, 1);
+  assert.deepEqual(breached.isolation.leakedPaths, ["A\tleaked.txt"]);
 });

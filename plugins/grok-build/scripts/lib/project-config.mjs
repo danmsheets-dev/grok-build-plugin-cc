@@ -581,7 +581,7 @@ export function resolveRunSettings(input = {}) {
  * Pure and injectable — every input is a parameter so tests do not need to
  * poke process.env.
  *
- * @returns {{ isolate: boolean, source: "forced-programmatic"|"cli"|"config"|"write-default"|"read-only" }}
+ * @returns {{ isolate: boolean, source: "forced-programmatic"|"cli"|"config"|"write-default"|"read-only-default"|"read-only" }}
  */
 export function resolveIsolateSetting({
   cliIsolate,
@@ -613,7 +613,7 @@ export function resolveIsolateSetting({
     return { isolate: true, source: "forced-programmatic" };
   }
 
-  // Human (or non-write programmatic) path — identical precedence to 0.4.x.
+  // Human (or non-write programmatic) path.
   if (cliNoIsolate) {
     return { isolate: false, source: "cli" };
   }
@@ -626,7 +626,10 @@ export function resolveIsolateSetting({
   if (write) {
     return { isolate: true, source: "write-default" };
   }
-  return { isolate: false, source: "read-only" };
+  // Read-only runs isolate by default too (R6-1). A worktree with no live-state
+  // provisioning is cheap, and the previous "share main checkout + unrestricted
+  // shell" path was the weakest surface once write isolation landed.
+  return { isolate: true, source: "read-only-default" };
 }
 
 /** Human-readable label for a verify-plan source, used in the run header. */

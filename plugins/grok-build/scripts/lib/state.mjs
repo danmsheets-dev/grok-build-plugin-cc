@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { resolveGitCommonDir, resolveMainWorktreeRoot } from "./git.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 const STATE_VERSION = 1;
@@ -46,21 +47,95 @@ function resolveBridgePidField(existing = {}, patch = {}) {
   return existing.bridgePid ?? existing.companionPid ?? null;
 }
 
-export function resolveStateDir(cwd) {
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
-  let canonicalWorkspaceRoot = workspaceRoot;
-  try {
-    canonicalWorkspaceRoot = fs.realpathSync.native(workspaceRoot);
-  } catch {
-    canonicalWorkspaceRoot = workspaceRoot;
-  }
-
-  const slugSource = path.basename(workspaceRoot) || "workspace";
-  const slug = slugSource.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
-  const hash = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex").slice(0, 16);
+/**
+ * Build a state directory path under the plugin data / temp root for a given
+ * identity key and slug source path.
+ *
+ * @param {string} identityKey - stable string hashed into the directory name
+ * @param {string} slugSource - human-readable basename source
+ * @returns {string}
+ */
+function stateDirForIdentity(identityKey, slugSource) {
+  const slug =
+    String(slugSource || "workspace")
+      .replace(/[^a-zA-Z0-9._-]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "workspace";
+  const hash = createHash("sha256").update(String(identityKey)).digest("hex").slice(0, 16);
   const pluginDataDir = process.env[PLUGIN_DATA_ENV];
   const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
   return path.join(stateRoot, `${slug}-${hash}`);
+}
+
+/**
+ * Canonical state directory for a workspace.
+ *
+ * Keyed on `git rev-parse --git-common-dir` when available so a run launched
+ * from inside a linked worktree records into the SAME state dir as one launched
+ * from the main checkout. Nested Hyper children started from a parent's
+ * worktree otherwise wrote history the top-level caller never listed.
+ *
+ * @param {string} cwd
+ * @returns {string}
+ */
+export function resolveStateDir(cwd) {
+  const commonDir = resolveGitCommonDir(cwd);
+  if (commonDir) {
+    const mainRoot = resolveMainWorktreeRoot(cwd);
+    const slugSource = path.basename(mainRoot) || "workspace";
+    return stateDirForIdentity(commonDir, slugSource);
+  }
+
+  // Non-git cwd (or git unavailable): historical show-toplevel / path identity.
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  let canonical = workspaceRoot;
+  try {
+    canonical = fs.realpathSync.native(workspaceRoot);
+  } catch {
+    canonical = workspaceRoot;
+  }
+  return stateDirForIdentity(canonical, path.basename(workspaceRoot) || "workspace");
+}
+
+/**
+ * Pre-common-dir state directory (keyed on show-toplevel / worktree path).
+ *
+ * Runs launched from inside a worktree before R6-3 recorded here. Readers
+ * still consult this path so land/prune/runs do not strand those records.
+ *
+ * @param {string} cwd
+ * @returns {string|null} null when it coincides with the canonical dir
+ */
+export function resolveLegacyStateDir(cwd) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  let canonical = workspaceRoot;
+  try {
+    canonical = fs.realpathSync.native(workspaceRoot);
+  } catch {
+    canonical = workspaceRoot;
+  }
+  const legacy = stateDirForIdentity(canonical, path.basename(workspaceRoot) || "workspace");
+  const primary = resolveStateDir(cwd);
+  if (path.resolve(legacy) === path.resolve(primary)) {
+    return null;
+  }
+  return legacy;
+}
+
+/**
+ * Ordered state directories to consult for reads: primary first, then legacy
+ * when it differs and still exists on disk.
+ *
+ * @param {string} cwd
+ * @returns {string[]}
+ */
+export function resolveStateDirCandidates(cwd) {
+  const primary = resolveStateDir(cwd);
+  const legacy = resolveLegacyStateDir(cwd);
+  const out = [primary];
+  if (legacy && fs.existsSync(legacy)) {
+    out.push(legacy);
+  }
+  return out;
 }
 
 export function resolveStateFile(cwd) {
@@ -287,6 +362,10 @@ const INDEX_TERMINAL_MIRROR_FIELDS = [
   "changedFileCount",
   "toolCallCount",
   "worktree",
+  // Isolation outcome that survives worktree cleanup (R6-2).
+  "isolation",
+  "isolationBreached",
+  "isolateSource",
   "grokVersion",
   "model",
   // Nested delegation linkage: runs groups children under parents when these
@@ -682,8 +761,59 @@ export function upsertJob(cwd, jobPatch) {
   });
 }
 
+/**
+ * Load state.json from an explicit state directory (not via resolveStateDir).
+ * @param {string} stateDir
+ */
+function loadStateFromDir(stateDir) {
+  const stateFile = path.join(stateDir, STATE_FILE_NAME);
+  if (!fs.existsSync(stateFile)) {
+    return defaultState();
+  }
+  let raw = "";
+  try {
+    raw = fs.readFileSync(stateFile, "utf8");
+  } catch {
+    return defaultState();
+  }
+  if (!raw.trim()) {
+    return defaultState();
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    return {
+      ...defaultState(),
+      ...parsed,
+      config: {
+        ...defaultState().config,
+        ...(parsed.config ?? {})
+      },
+      jobs: Array.isArray(parsed.jobs) ? parsed.jobs : []
+    };
+  } catch {
+    return defaultState();
+  }
+}
+
+/**
+ * Jobs from the canonical state dir, plus any jobs that only exist under a
+ * legacy per-worktree state dir (pre-R6-3). Primary wins on id collision.
+ *
+ * @param {string} cwd
+ * @returns {object[]}
+ */
 export function listJobs(cwd) {
-  return loadState(cwd).jobs;
+  const primary = loadState(cwd).jobs;
+  const byId = new Map(primary.map((job) => [job.id, job]));
+  const legacy = resolveLegacyStateDir(cwd);
+  if (legacy && fs.existsSync(legacy)) {
+    for (const job of loadStateFromDir(legacy).jobs) {
+      if (job?.id && !byId.has(job.id)) {
+        byId.set(job.id, job);
+      }
+    }
+  }
+  return [...byId.values()];
 }
 
 export function setConfig(cwd, key, value) {
@@ -747,10 +877,31 @@ function removeJobFile(jobFile) {
 
 export function resolveJobLogFile(cwd, jobId) {
   ensureStateDir(cwd);
+  // Prefer an existing log under primary or legacy; new writes go to primary.
+  for (const dir of resolveStateDirCandidates(cwd)) {
+    const candidate = path.join(dir, JOBS_DIR_NAME, `${jobId}.log`);
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
   return path.join(resolveJobsDir(cwd), `${jobId}.log`);
 }
 
+/**
+ * Path of a job's JSON record. Reads check legacy state dirs so pre-R6-3
+ * records remain landable; new writes always target the canonical dir.
+ *
+ * @param {string} cwd
+ * @param {string} jobId
+ * @returns {string}
+ */
 export function resolveJobFile(cwd, jobId) {
   ensureStateDir(cwd);
+  for (const dir of resolveStateDirCandidates(cwd)) {
+    const candidate = path.join(dir, JOBS_DIR_NAME, `${jobId}.json`);
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
   return path.join(resolveJobsDir(cwd), `${jobId}.json`);
 }

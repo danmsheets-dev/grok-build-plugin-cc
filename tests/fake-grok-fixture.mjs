@@ -27,6 +27,9 @@ export const FAKE_GROK_LONG_TURN_TEXT = "A".repeat(400);
  * - Absolute-path leaks for isolation-breach tests: FAKE_GROK_WRITE_ABSOLUTE is
  *   a JSON object of absolute path -> contents, written regardless of scenario
  *   when set (so an isolated run can dirty the main checkout on purpose).
+ * - CLI-blocked confine attempts (not a breach): FAKE_GROK_CONFINE_VIOLATIONS is
+ *   a JSON array of {tool, path, resolvedPath, root} objects emitted as
+ *   streaming `confine_violation` events before the normal turn text.
  * - `long-turn` emits a single completed message far longer than any progress
  *   preview should be (400 chars, no newlines), so a test can assert the
  *   preview is shortened while the full body still reaches the log via
@@ -156,6 +159,22 @@ if (isPrint || hasFlag("-r") || hasFlag("--resume") || hasFlag("-c") || hasFlag(
       num_turns: 2,
       total_cost_usd: 0.0123
     };
+
+    // Emit CLI-blocked confine attempts (defence working). Independent of
+    // scenario so a clean write run can still report blocked escapes without
+    // dirtying the main checkout.
+    if (process.env.FAKE_GROK_CONFINE_VIOLATIONS) {
+      const violations = JSON.parse(process.env.FAKE_GROK_CONFINE_VIOLATIONS);
+      for (const v of violations) {
+        emit({
+          type: "confine_violation",
+          tool: v.tool ?? "Write",
+          path: v.path ?? null,
+          resolvedPath: v.resolvedPath ?? v.resolved_path ?? null,
+          root: v.root ?? null
+        });
+      }
+    }
 
     // A CLI whose streaming vocabulary the bridge has never heard of. Every
     // event is unrecognized, so the transcript comes back empty while stdout is
@@ -287,6 +306,18 @@ export function buildEnv(binDir, extra = {}) {
   for (const key of ["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_PLUGIN_ROOT", "GROK_BUILD_CALLER"]) {
     if (!Object.prototype.hasOwnProperty.call(extra, key)) {
       delete env[key];
+    }
+  }
+
+  // R6-7 / R6-8: never let tests create worktrees under the shared volume root
+  // (`H:\gb\w` / `%TEMP%\gb\w`). That was the measured source of 500+ orphan
+  // directories. Pin to a per-test directory under CLAUDE_PLUGIN_DATA when the
+  // caller did not already set GROK_BUILD_WORKTREE_ROOT.
+  if (!Object.prototype.hasOwnProperty.call(extra, "GROK_BUILD_WORKTREE_ROOT")) {
+    if (env.CLAUDE_PLUGIN_DATA) {
+      env.GROK_BUILD_WORKTREE_ROOT = path.join(env.CLAUDE_PLUGIN_DATA, "wt-root");
+    } else {
+      delete env.GROK_BUILD_WORKTREE_ROOT;
     }
   }
 
