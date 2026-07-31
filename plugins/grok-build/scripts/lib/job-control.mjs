@@ -394,7 +394,9 @@ export function buildStatusSnapshot(cwd, options = {}) {
     sessionRuntime: getSessionRuntimeStatus(),
     running,
     latestFinished,
-    recent
+    recent,
+    // Propagated so runs --json --all can attach sessionTotals by model.
+    all: Boolean(options.all)
   };
 }
 

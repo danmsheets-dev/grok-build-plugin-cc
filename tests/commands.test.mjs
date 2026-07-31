@@ -85,7 +85,7 @@ test("plugin surfaces use /grok-build names and grok binary, not codex", () => {
   assert.match(review, /The bridge script parses `--wait` and `--background`/);
   assert.match(review, /\(Recommended\)/);
   assert.match(review, /--model <model>/);
-  assert.match(review, /--effort <low\|medium\|high>/);
+  assert.match(review, /--effort <none\|minimal\|low\|medium\|high\|xhigh\|max\|ultra>/);
 
   const critique = read("commands/critique.md");
   assert.match(critique, /\/grok-build:critique/);
@@ -93,7 +93,7 @@ test("plugin surfaces use /grok-build names and grok binary, not codex", () => {
   assert.match(critique, /uses the same review target selection as `\/grok-build:review`/i);
   assert.match(critique, /can still take extra focus text after the flags/i);
   assert.match(critique, /--model <model>/);
-  assert.match(critique, /--effort <low\|medium\|high>/);
+  assert.match(critique, /--effort <none\|minimal\|low\|medium\|high\|xhigh\|max\|ultra>/);
 
   const delegate = read("commands/delegate.md");
   assert.match(delegate, /subagent_type: "grok-build:grok-delegate"/);
@@ -369,13 +369,14 @@ test("the docs promise a changed-files manifest, including for a run that change
   const readme = fs.readFileSync(path.join(PLUGIN_ROOT, "README.md"), "utf8");
 
   assert.match(readme, /Changed files/);
-  // The Godot import-cache case, which is where a silent result is most
-  // confusing: the worktree is full of files and the commit is empty.
-  assert.match(readme, /none \(run produced only excluded build artifacts\)/);
+  // Dual-tree accounting + honest empty cases (BRIDGE-3).
+  assert.match(readme, /worktree and main-tree/i);
+  assert.match(readme, /nothing was written/);
+  assert.match(readme, /only excluded build artifacts/);
   // The non-isolated path cannot tell the user's in-flight edits from the
   // agent's, and has to say which is which rather than claim them all.
-  assert.match(readme, /already dirty/i);
-  assert.match(readme, /Log: <path>/);
+  assert.match(readme, /already dirty|pre-run snapshot/i);
+  assert.match(readme, /Log: <path>|===RUN-LOG-HEADER===/);
 
   const skill = read("skills/grok-run-output/SKILL.md");
   assert.match(skill, /measured from git, not claimed by the model/);

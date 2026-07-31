@@ -52,7 +52,19 @@ export const TRUST_STATE_KEY = "verifyTrustHash";
  */
 export const EXECUTABLE_KEYS = Object.freeze(["verify", "tools", "env"]);
 
-const VALID_EFFORTS = new Set(["low", "medium", "high"]);
+// Full Hyper ladder (HYPER-2). Keep in sync with KNOWN_REASONING_EFFORTS in
+// grok-bridge.mjs — the CLI is still the authority at runtime, but the config
+// schema should not reject a valid tier the bridge accepts.
+const VALID_EFFORTS = new Set([
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra"
+]);
 
 function fieldError(key, expected) {
   return `${key}: expected ${expected}`;
@@ -184,7 +196,7 @@ const SCHEMA = Object.freeze({
   maxTurns: { normalize: normalizePositiveInteger, expected: "an integer >= 1" },
   maxCostUsd: { normalize: normalizePositiveNumber, expected: "a positive number of dollars" },
   model: { normalize: normalizeString, expected: "a non-empty string" },
-  effort: { normalize: normalizeEffort, expected: "low, medium, or high" },
+  effort: { normalize: normalizeEffort, expected: "none, minimal, low, medium, high, xhigh, max, or ultra" },
   env: { normalize: normalizeStringMap, expected: "an object of string values", executable: true },
   tools: { normalize: normalizeTools, expected: "an object with godot / blender paths", executable: true }
 });

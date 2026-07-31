@@ -1,6 +1,6 @@
 ---
 description: Delegate investigation, an explicit fix request, or follow-up work to the Grok Build delegate subagent
-argument-hint: "[--background|--wait|--foreground] [--resume|--fresh] [--model <model>] [--effort <low|medium|high>] [--verify <cmd>] [--no-verify] [--env KEY=VALUE] [--blender-sandbox|--no-blender-sandbox] [--godot-export-smoke] [--no-isolate] [--max-duration <s>] [what Grok should investigate, solve, or continue]"
+argument-hint: "[--background|--wait|--foreground] [--resume|--fresh] [--model <model>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--verify <cmd>] [--no-verify] [--env KEY=VALUE] [--blender-sandbox|--no-blender-sandbox] [--godot-export-smoke] [--no-isolate] [--max-duration <s>] [what Grok should investigate, solve, or continue]"
 allowed-tools: Bash(node:*), AskUserQuestion, Agent
 ---
 
@@ -56,7 +56,7 @@ Operating rules:
 - Return the Grok bridge stdout verbatim to the user.
 - Do not paraphrase, summarize, rewrite, or add commentary before or after it.
 - Do not ask the subagent to inspect files, monitor progress, poll `/grok-build:runs`, fetch `/grok-build:show`, call `/grok-build:stop`, summarize output, or do follow-up work of its own. The main thread may wait with `wait <id>` / `runs <id> --wait` after a background launch.
-- Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort.
+- Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort (`none|minimal|low|medium|high|xhigh|max|ultra`; unknown values are passed through to the CLI).
 - Leave the model unset unless the user explicitly asks for one.
 - Leave `--resume` and `--fresh` in the forwarded request. The subagent handles that routing when it builds the `run` command.
 - If the helper reports that Grok is missing or unauthenticated, stop and tell the user to run `/grok-build:check`.

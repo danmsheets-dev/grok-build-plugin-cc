@@ -171,6 +171,8 @@ test("cliSupportsConfine probes --help once and caches", () => {
 test("loadRunRules appends isolation preamble only for isolated runs", () => {
   const plain = loadRunRules({ isolated: false });
   assert.match(plain, /GROK-FINAL-REPORT/);
+  // HYPER-1: headless discipline is on every run, not only isolated ones.
+  assert.match(plain, /non-interactive/i);
   assert.doesNotMatch(plain, /only writable root/);
 
   const isolated = loadRunRules({
@@ -179,6 +181,7 @@ test("loadRunRules appends isolation preamble only for isolated runs", () => {
     workspaceRoot: "/home/me/repo"
   });
   assert.match(isolated, /GROK-FINAL-REPORT/);
+  assert.match(isolated, /non-interactive/i);
   assert.match(isolated, /only writable root/);
   assert.match(isolated, /\/tmp\/wt\/run-1/);
   assert.match(isolated, /\/home\/me\/repo/);

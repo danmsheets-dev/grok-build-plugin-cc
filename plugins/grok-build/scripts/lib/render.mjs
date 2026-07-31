@@ -170,7 +170,42 @@ export function formatUsageLine(usage, options = {}) {
     ? `${formatCount(usage.inputTokens)} in (${formatCount(cached)} cached)`
     : `${formatCount(usage.inputTokens)} in`;
 
-  const parts = [`Tokens: ${inputPart} / ${formatCount(usage.outputTokens)} out`];
+  // Compact form leads with inference-call count when present (BRIDGE-5): the
+  // field that made Luna look cheap on the rate card and expensive per asset.
+  const parts = [];
+  if (options.compact && Number.isFinite(Number(usage.modelCalls)) && Number(usage.modelCalls) >= 0) {
+    const calls = Number(usage.modelCalls);
+    parts.push(`${calls} ${calls === 1 ? "call" : "calls"}`);
+  }
+  if (options.compact) {
+    if (Number.isFinite(Number(usage.numTurns)) && Number(usage.numTurns) > 0) {
+      const turns = Number(usage.numTurns);
+      parts.push(`${turns} ${turns === 1 ? "turn" : "turns"}`);
+    }
+    if (usage.costUsd != null && Number.isFinite(Number(usage.costUsd))) {
+      parts.push(`$${Number(usage.costUsd).toFixed(2)}`);
+    }
+    const requested = options.model ?? usage.model ?? null;
+    const served = options.resolvedModel ?? usage.resolvedModel ?? null;
+    if (requested || served) {
+      if (requested && served && String(requested) !== String(served)) {
+        parts.push(`model ${requested} -> ${served}`);
+      } else {
+        parts.push(`model ${served || requested}`);
+      }
+    }
+    // Keep the token detail as a trailing clause when compact already has a head.
+    if (parts.length > 0) {
+      parts.push(`${inputPart} / ${formatCount(usage.outputTokens)} out`);
+      return parts.join(" · ");
+    }
+  }
+
+  parts.push(`Tokens: ${inputPart} / ${formatCount(usage.outputTokens)} out`);
+  if (Number.isFinite(Number(usage.modelCalls)) && Number(usage.modelCalls) >= 0) {
+    const calls = Number(usage.modelCalls);
+    parts.push(`${calls} ${calls === 1 ? "call" : "calls"}`);
+  }
   if (Number.isFinite(Number(usage.numTurns)) && Number(usage.numTurns) > 0) {
     const turns = Number(usage.numTurns);
     parts.push(`${turns} ${turns === 1 ? "turn" : "turns"}`);
@@ -188,6 +223,63 @@ export function formatUsageLine(usage, options = {}) {
     }
   }
   return parts.join(" · ");
+}
+
+/**
+ * Group finished runs by resolvedModel for "which model was cheaper" without
+ * joining unified.jsonl. Only meaningful when usage fields are populated.
+ *
+ * @param {Array<object>} runs
+ * @returns {{ byResolvedModel: Record<string, object>, runCount: number }}
+ */
+export function buildSessionTotalsByModel(runs) {
+  const byResolvedModel = {};
+  let runCount = 0;
+  for (const job of Array.isArray(runs) ? runs : []) {
+    if (!job || typeof job !== "object") {
+      continue;
+    }
+    runCount += 1;
+    const key =
+      (job.resolvedModel && String(job.resolvedModel).trim()) ||
+      (job.model && String(job.model).trim()) ||
+      "unknown";
+    if (!byResolvedModel[key]) {
+      byResolvedModel[key] = {
+        resolvedModel: key,
+        runs: 0,
+        costUsd: 0,
+        modelCalls: 0,
+        totalTokens: 0,
+        changedFileCount: 0,
+        durationMs: 0,
+        durationSamples: 0
+      };
+    }
+    const bucket = byResolvedModel[key];
+    bucket.runs += 1;
+    const usage = job.usage && typeof job.usage === "object" ? job.usage : null;
+    if (usage?.costUsd != null && Number.isFinite(Number(usage.costUsd))) {
+      bucket.costUsd += Number(usage.costUsd);
+    }
+    if (usage?.modelCalls != null && Number.isFinite(Number(usage.modelCalls))) {
+      bucket.modelCalls += Number(usage.modelCalls);
+    }
+    if (usage?.totalTokens != null && Number.isFinite(Number(usage.totalTokens))) {
+      bucket.totalTokens += Number(usage.totalTokens);
+    }
+    const files = job.changedFileCount;
+    if (files != null && Number.isFinite(Number(files))) {
+      bucket.changedFileCount += Number(files);
+    }
+    // duration may be a string like "1m 2s" from the status projector; prefer ms.
+    const ms = job.durationMs ?? job.elapsedMs ?? null;
+    if (ms != null && Number.isFinite(Number(ms))) {
+      bucket.durationMs += Number(ms);
+      bucket.durationSamples += 1;
+    }
+  }
+  return { byResolvedModel, runCount };
 }
 
 /**
@@ -586,40 +678,77 @@ function pushProvisionLines(lines, provision) {
 const CHANGED_FILES_RENDER_LIMIT = 40;
 
 /**
+ * Render one side of the dual changed-file accounting (worktree vs main tree).
+ * BRIDGE-3: never conflate the two numbers into one label.
+ *
+ * @param {string[]} lines
+ * @param {string} label
+ * @param {{entries?: string[], total?: number, truncated?: boolean, emptyReason?: string|null}|null|undefined} side
+ */
+function pushOneChangedSide(lines, label, side) {
+  if (!side || typeof side !== "object") {
+    return;
+  }
+  const entries = Array.isArray(side.entries) ? side.entries : [];
+  const total = Number.isFinite(Number(side.total)) ? Number(side.total) : entries.length;
+  if (entries.length === 0 && total === 0) {
+    // Distinguish "wrote nothing" from "only excluded caches" — the reporter
+    // saw the artifact wording on runs that had written many real files into
+    // the other tree, and on runs that truly touched nothing.
+    const reason =
+      side.emptyReason === "excluded-artifacts"
+        ? "run produced only excluded build artifacts"
+        : side.emptyReason === "nothing-written"
+          ? "nothing was written"
+          : side.emptyReason === "working-tree-clean"
+            ? "the agent wrote nothing outside excluded build artifacts"
+            : "nothing was written";
+    lines.push(`${label}: none (${reason}).`);
+    return;
+  }
+  lines.push(`${label}: ${total}`);
+  for (const entry of entries.slice(0, CHANGED_FILES_RENDER_LIMIT)) {
+    lines.push(`  ${String(entry).replace(/\t/g, " ")}`);
+  }
+  const remaining = total - Math.min(entries.length, CHANGED_FILES_RENDER_LIMIT);
+  if (remaining > 0) {
+    lines.push(`  ... ${remaining} more`);
+  }
+}
+
+/**
  * What the run actually changed on disk.
  *
- * For a Godot or Blender run this is the whole deliverable, and the status
- * block used to report only Verified/Worktree/Budget - a user could not tell a
- * run that rebuilt a scene from one that produced nothing but an import cache.
- * The empty case is therefore rendered EXPLICITLY rather than omitted: "none"
- * with the reason is an answer, a missing block is the silent-result complaint
- * all over again in exactly the import-cache case.
+ * Dual-tree accounting (BRIDGE-3): isolated runs report worktree and main-tree
+ * sides separately when both moved. A single conflated number was how main-
+ * checkout writes showed as "none".
  */
 function pushChangedFileLines(lines, changed) {
   if (!changed || typeof changed !== "object") {
     return;
   }
-  const entries = Array.isArray(changed.entries) ? changed.entries : [];
-  const total = Number.isFinite(Number(changed.total)) ? Number(changed.total) : entries.length;
-  const label = changed.source === "working-tree" ? "Working tree changes" : "Changed files";
 
-  if (entries.length === 0) {
-    lines.push(
-      changed.source === "working-tree"
-        ? `${label}: none (the agent wrote nothing outside excluded build artifacts).`
-        : `${label}: none (run produced only excluded build artifacts).`
-    );
+  // Preferred dual shape from executeTaskRun.
+  if (changed.worktree || changed.mainTree) {
+    pushOneChangedSide(lines, "Changed files (worktree)", changed.worktree);
+    pushOneChangedSide(lines, "Changed files (main tree)", changed.mainTree);
   } else {
-    lines.push(`${label} (${total}):`);
-    for (const entry of entries.slice(0, CHANGED_FILES_RENDER_LIMIT)) {
-      // git's own `<status>\t<path>` shape; the tab renders as an alignment gap
-      // nowhere in particular, so make it a plain space.
-      lines.push(`  ${String(entry).replace(/\t/g, " ")}`);
-    }
-    const remaining = total - Math.min(entries.length, CHANGED_FILES_RENDER_LIMIT);
-    if (remaining > 0) {
-      lines.push(`  ... ${remaining} more`);
-    }
+    // Legacy single-manifest shape (non-isolated write, or older stored jobs).
+    const entries = Array.isArray(changed.entries) ? changed.entries : [];
+    const total = Number.isFinite(Number(changed.total)) ? Number(changed.total) : entries.length;
+    const label =
+      changed.source === "working-tree"
+        ? "Changed files (main tree)"
+        : changed.source === "commit"
+          ? "Changed files (worktree)"
+          : "Changed files";
+    pushOneChangedSide(lines, label, {
+      entries,
+      total,
+      emptyReason:
+        changed.emptyReason ??
+        (changed.source === "working-tree" ? "working-tree-clean" : "nothing-written")
+    });
   }
 
   // Only the non-isolated path can have these: paths that were already dirty
@@ -631,6 +760,33 @@ function pushChangedFileLines(lines, changed) {
       `  (${preexisting} path${preexisting === 1 ? " was" : "s were"} already modified before the run and ${preexisting === 1 ? "is" : "are"} not listed)`
     );
   }
+}
+
+/**
+ * Report unaccounted debris the run left behind (BRIDGE-12).
+ * Never delete and never stage — only make the files visible.
+ */
+function pushDebrisLines(lines, debris) {
+  if (!debris || typeof debris !== "object") {
+    return;
+  }
+  const entries = Array.isArray(debris.entries) ? debris.entries : Array.isArray(debris) ? debris : [];
+  const total = Number.isFinite(Number(debris.total)) ? Number(debris.total) : entries.length;
+  if (total === 0 || entries.length === 0) {
+    return;
+  }
+  const names = entries.map((entry) => {
+    const text = String(entry);
+    const tab = text.indexOf("\t");
+    const pathPart = tab >= 0 ? text.slice(tab + 1).trim() : text.trim();
+    return pathPart.replace(/\s+\(.*\)$/, "");
+  });
+  const shown = names.slice(0, CHANGED_FILES_RENDER_LIMIT);
+  lines.push(
+    `Debris: ${total} file${total === 1 ? "" : "s"} the run left behind and did not commit (${shown.join(", ")}${
+      names.length > shown.length ? `, … +${names.length - shown.length} more` : ""
+    }).`
+  );
 }
 
 /**
@@ -781,6 +937,29 @@ export function buildTaskStatusLines(meta = {}, rawOutput = "") {
   // Before the worktree line on purpose: what changed is the answer to "what
   // did this run do", and the path is only where to go and look at it.
   pushChangedFileLines(lines, meta.changedFiles);
+  pushDebrisLines(lines, meta.debris);
+
+  // Signal, not a new terminal status (BRIDGE-1 bonus). completed-noop /
+  // completed-blind already carry the verdict; this is corroborating evidence.
+  if (meta.implausiblyShort) {
+    const seconds = Number.isFinite(Number(meta.durationSeconds))
+      ? Math.round(Number(meta.durationSeconds))
+      : Number.isFinite(Number(meta.durationMs))
+        ? Math.round(Number(meta.durationMs) / 1000)
+        : null;
+    const tools =
+      meta.toolCallCount == null ? "unknown" : String(meta.toolCallCount);
+    const secLabel = seconds != null ? `${seconds}s` : "under the floor";
+    lines.push(
+      `Implausibly short: this write run finished in ${secLabel} having changed nothing and made ${tools} tool calls — treat the result as suspect.`
+    );
+  }
+
+  if (meta.autoContinued) {
+    lines.push(
+      "Auto-continued once: the first turn ended on a user-facing question with no tool calls; re-issued with a non-interactive nudge."
+    );
+  }
 
   if (meta.isolationBreached || meta.status === "isolation-breached") {
     // Deliberately "changed during this run" rather than "the agent wrote":

@@ -109,6 +109,115 @@ const GENERATED_ARTIFACT_PATTERNS = Object.freeze([
 const NEVER_COMMIT_PATTERNS = Object.freeze(["export_credentials.cfg"]);
 
 /**
+ * Unaccounted debris the agent left behind — not committed work, not a
+ * recognised build cache. Field-report BRIDGE-12: Sol left
+ * `build_wreck_headless.log` / `verify_wreck_gate.log` at the repo root and
+ * the bridge classed them as "excluded artifacts", so they were invisible.
+ * These stay on disk and stay out of the commit; they are only reported.
+ */
+const DEBRIS_BASENAME_PATTERNS = Object.freeze([
+  /^.*\.log$/i,
+  /^.*\.tmp$/i,
+  /^.*\.temp$/i,
+  /^.*\.swp$/i,
+  /^.*\.swo$/i,
+  /^core$/i,
+  /^core\.\d+$/i,
+  /^.*\.dmp$/i,
+  /^.*\.stackdump$/i,
+  /^hs_err_pid\d+\.log$/i,
+  /^npm-debug\.log.*$/i,
+  /^yarn-error\.log$/i
+]);
+
+/**
+ * Convert a GENERATED_ARTIFACT_PATTERNS entry into a path matcher.
+ * Directory patterns end with `/`; file globs use `*`.
+ *
+ * @param {string} pattern
+ * @returns {(relPath: string) => boolean}
+ */
+function compileArtifactPattern(pattern) {
+  const raw = String(pattern ?? "");
+  if (raw.endsWith("/")) {
+    const dir = raw.slice(0, -1).replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*");
+    const re = new RegExp(`(?:^|/)${dir}(?:/|$)`);
+    return (relPath) => re.test(String(relPath).replace(/\\/g, "/"));
+  }
+  const body = raw.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*");
+  const re = new RegExp(`(?:^|/)${body}$`);
+  return (relPath) => re.test(String(relPath).replace(/\\/g, "/"));
+}
+
+const GENERATED_ARTIFACT_MATCHERS = GENERATED_ARTIFACT_PATTERNS.map(compileArtifactPattern);
+const NEVER_COMMIT_MATCHERS = NEVER_COMMIT_PATTERNS.map(compileArtifactPattern);
+
+/**
+ * True when a repository-relative path is a recognised generated build cache
+ * (or a never-commit secret), i.e. correctly excluded from the commit.
+ *
+ * @param {string} relPath
+ * @returns {boolean}
+ */
+export function isGeneratedArtifactPath(relPath) {
+  const normalized = String(relPath ?? "").replace(/\\/g, "/").replace(/^\.\//, "");
+  if (!normalized) {
+    return false;
+  }
+  return (
+    GENERATED_ARTIFACT_MATCHERS.some((match) => match(normalized)) ||
+    NEVER_COMMIT_MATCHERS.some((match) => match(normalized))
+  );
+}
+
+/**
+ * True when a path looks like unaccounted debris (loose logs, temps, dumps)
+ * rather than intentional source or a known cache. Root-level `*.log` is the
+ * field-report case; nested temps count too.
+ *
+ * @param {string} relPath
+ * @returns {boolean}
+ */
+export function isDebrisPath(relPath) {
+  const normalized = String(relPath ?? "").replace(/\\/g, "/").replace(/^\.\//, "");
+  if (!normalized || isGeneratedArtifactPath(normalized)) {
+    return false;
+  }
+  const base = normalized.includes("/") ? normalized.slice(normalized.lastIndexOf("/") + 1) : normalized;
+  return DEBRIS_BASENAME_PATTERNS.some((re) => re.test(base));
+}
+
+/**
+ * Split status entries (`<letter>\\t<path>`) into real work vs debris.
+ * Generated artifacts should already have been filtered by the caller; if any
+ * remain they are dropped rather than counted as either side.
+ *
+ * @param {string[]} entries
+ * @returns {{ work: string[], debris: string[] }}
+ */
+export function partitionWorkAndDebris(entries) {
+  const work = [];
+  const debris = [];
+  for (const entry of Array.isArray(entries) ? entries : []) {
+    const tab = String(entry).indexOf("\t");
+    const rel = tab >= 0 ? String(entry).slice(tab + 1).trim() : String(entry).trim();
+    // Annotation suffix " (scene edit)" etc. — strip for classification.
+    const pathOnly = rel.replace(/\s+\(.*\)$/, "");
+    if (!pathOnly || isGeneratedArtifactPath(pathOnly)) {
+      continue;
+    }
+    if (isDebrisPath(pathOnly)) {
+      debris.push(entry);
+    } else {
+      work.push(entry);
+    }
+  }
+  return { work, debris };
+}
+
+export { GENERATED_ARTIFACT_PATTERNS, NEVER_COMMIT_PATTERNS };
+
+/**
  * Stable 8-character digest of a run id for short Windows worktree paths.
  *
  * Deep engine caches (`.godot/imported/…`) under a long plugin-data prefix

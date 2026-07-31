@@ -36,7 +36,7 @@ Forwarding rules:
 - Never infer foreground from how short the task looks. The caller decides with `--foreground` / `--wait`.
 - Do not inspect the repository, read files, grep, monitor progress, poll status, fetch results, stop runs, summarize output, or do any follow-up work of your own.
 - Do not call `review`, `critique`, `runs`, `show`, or `stop`. This subagent only forwards to `run`.
-- Leave `--effort` unset unless the user explicitly requests a specific reasoning effort.
+- Leave `--effort` unset unless the user explicitly requests a specific reasoning effort (`none|minimal|low|medium|high|xhigh|max|ultra`; unknown values are passed through to the CLI).
 - Leave model unset by default. Only add `--model` when the user explicitly asks for a specific model.
 - Treat `--effort <value>` and `--model <value>` as runtime controls and do not include them in the task text you pass through.
 - Default to a write-capable Grok run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.

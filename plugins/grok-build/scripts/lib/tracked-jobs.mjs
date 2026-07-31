@@ -175,6 +175,92 @@ export function createJobLogFile(workspaceRoot, jobId, title) {
   return logFile;
 }
 
+/**
+ * Structured header every run log starts with so a log file is independently
+ * interpretable without the job JSON. Field-report BRIDGE-5: tokens/cost live
+ * in ~/.grok/logs/unified.jsonl keyed by session id (sid), but the human .log
+ * never carried that join key — concurrent runs were un-attributable.
+ *
+ * Written at the top (or immediately after "Starting …") and may be re-written
+ * once the served model is known; later progress lines append below.
+ *
+ * @param {{
+ *   runId?: string|null,
+ *   grokSessionId?: string|null,
+ *   threadId?: string|null,
+ *   binary?: string|null,
+ *   version?: string|null,
+ *   cliLabel?: string|null,
+ *   modelRequested?: string|null,
+ *   modelServed?: string|null,
+ *   isolation?: string|null,
+ *   workspaceRoot?: string|null
+ * }} fields
+ * @returns {string}
+ */
+export function formatRunLogHeader(fields = {}) {
+  const sessionId = fields.grokSessionId ?? fields.threadId ?? null;
+  const cliParts = [fields.cliLabel, fields.version, fields.binary ? `(${fields.binary})` : null]
+    .filter(Boolean)
+    .join(" ");
+  const lines = [
+    "===RUN-LOG-HEADER===",
+    `runId: ${fields.runId ?? "unknown"}`,
+    // Join key for ~/.grok/logs/unified.jsonl (sid) — print even when still
+    // pending so the field is always present for grepping.
+    `grokSessionId: ${sessionId && String(sessionId).trim() ? sessionId : "pending"}`,
+    `cli: ${cliParts || "unknown"}`,
+    `modelRequested: ${fields.modelRequested && String(fields.modelRequested).trim() ? fields.modelRequested : "default"}`,
+    `modelServed: ${fields.modelServed && String(fields.modelServed).trim() ? fields.modelServed : "pending"}`,
+    `isolation: ${fields.isolation && String(fields.isolation).trim() ? fields.isolation : "unknown"}`,
+    `workspaceRoot: ${fields.workspaceRoot ?? "unknown"}`,
+    "===END-RUN-LOG-HEADER==="
+  ];
+  return lines.join("\n");
+}
+
+/**
+ * Write (or refresh) the structured run-log header at the top of the log file.
+ * Progress lines that already exist below the previous header are preserved.
+ *
+ * @param {string|null} logFile
+ * @param {Parameters<typeof formatRunLogHeader>[0]} fields
+ */
+export function writeRunLogHeader(logFile, fields = {}) {
+  if (!logFile) {
+    return;
+  }
+  const block = `${formatRunLogHeader(fields)}\n`;
+  let existing = "";
+  try {
+    existing = fs.readFileSync(logFile, "utf8");
+  } catch {
+    existing = "";
+  }
+  const open = "===RUN-LOG-HEADER===";
+  const close = "===END-RUN-LOG-HEADER===";
+  const start = existing.indexOf(open);
+  const end = existing.indexOf(close);
+  let next;
+  if (start >= 0 && end > start) {
+    const afterClose = end + close.length;
+    const rest = existing.slice(afterClose).replace(/^\r?\n/, "");
+    const prefix = existing.slice(0, start);
+    next = `${prefix}${block}${rest}`;
+  } else {
+    // Prefer header after the first "Starting …" line when present.
+    const firstNl = existing.indexOf("\n");
+    if (firstNl >= 0 && /^\[.*?\] Starting /m.test(existing.slice(0, firstNl + 1))) {
+      next = `${existing.slice(0, firstNl + 1)}${block}${existing.slice(firstNl + 1)}`;
+    } else if (existing) {
+      next = `${block}${existing}`;
+    } else {
+      next = block;
+    }
+  }
+  fs.writeFileSync(logFile, next, "utf8");
+}
+
 export function createJobRecord(base, options = {}) {
   const env = options.env ?? process.env;
   const sessionId = env[options.sessionIdEnv ?? SESSION_ID_ENV];

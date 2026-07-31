@@ -631,7 +631,9 @@ test("buildTaskStatusLines lists what changed before it says where the worktree 
     }
   });
 
-  const manifestIndex = lines.findIndex((line) => line.startsWith("Changed files (2)"));
+  const manifestIndex = lines.findIndex((line) =>
+    line.startsWith("Changed files (worktree): 2") || line.startsWith("Changed files (2)")
+  );
   const worktreeIndex = lines.findIndex((line) => line.startsWith("Worktree:"));
   assert.ok(manifestIndex >= 0, lines.join("\n"));
   assert.ok(worktreeIndex > manifestIndex, "the manifest comes before the path to it");
@@ -654,15 +656,21 @@ test("an empty manifest is reported as none, never omitted", () => {
   // Omitting the block is how the silent-result complaint reappears in exactly
   // the Godot import-cache case: a run whose every output was excluded.
   const lines = buildTaskStatusLines({
-    changedFiles: { source: "commit", entries: [], total: 0, truncated: false }
+    changedFiles: {
+      source: "commit",
+      entries: [],
+      total: 0,
+      truncated: false,
+      emptyReason: "excluded-artifacts"
+    }
   });
   assert.ok(
-    lines.some((line) => /Changed files: none \(run produced only excluded build artifacts\)/.test(line)),
+    lines.some((line) => /Changed files \(worktree\): none \(run produced only excluded build artifacts\)/.test(line)),
     lines.join("\n")
   );
 });
 
-test("a non-isolated run labels its manifest as working-tree and counts pre-existing edits", () => {
+test("a non-isolated run labels its manifest as main tree and counts pre-existing edits", () => {
   const lines = buildTaskStatusLines({
     changedFiles: {
       source: "working-tree",
@@ -673,7 +681,7 @@ test("a non-isolated run labels its manifest as working-tree and counts pre-exis
     }
   });
 
-  assert.ok(lines.some((line) => line.startsWith("Working tree changes (1):")), lines.join("\n"));
+  assert.ok(lines.some((line) => line.startsWith("Changed files (main tree): 1")), lines.join("\n"));
   assert.ok(
     lines.some((line) => /2 paths were already modified before the run/.test(line)),
     lines.join("\n")

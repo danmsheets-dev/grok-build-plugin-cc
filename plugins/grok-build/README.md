@@ -290,15 +290,24 @@ Three things changed:
 
 A run also reports what it did to the disk and how it was captured:
 
-- **Changed files.** A write run lists what it changed — `A`/`M`/`D` plus the path, first 40 in the
-  terminal and up to 200 in `payload.changedFiles`. An isolated run reads them out of the agent's
-  commit, so build artifacts are already excluded; a `--no-isolate` run diffs the working tree
-  against a snapshot taken before the agent started, and reports separately how many paths were
-  already dirty at that point. **A run that changed nothing says so**:
-  `Changed files: none (run produced only excluded build artifacts)` is the honest answer for a
-  Godot run whose entire output was an import cache.
-- **The log path.** Every run prints `Log: <path>`. That file holds the run's progress lines and the
-  complete rendered result, and it outlives the terminal.
+- **Changed files (dual tree).** A write run reports worktree and main-tree sides **separately**
+  when both exist — never one conflated number. An isolated run reads worktree changes from the
+  agent's commit and main-tree changes from the post-run breach scan; a `--no-isolate` run diffs the
+  working tree against a pre-run snapshot. The count that feeds `decideCompletionStatus` is the
+  **sum across both**, so a main-only write is never `completed-noop`. Empty cases distinguish
+  "nothing was written" from "only excluded build artifacts".
+- **Debris.** Loose `*.log` / `*.tmp` / crash dumps the run left behind are listed as `Debris: …`
+  rather than silent "excluded artifacts". They are not deleted and not committed.
+- **The log path.** Every run prints `Log: <path>`. That file starts with a structured
+  `===RUN-LOG-HEADER===` naming run id, **Grok session id** (the join key for
+  `~/.grok/logs/unified.jsonl`), CLI binary/version, model requested/served, isolation decision, and
+  workspace root — so a log file is independently interpretable. Progress lines and the complete
+  rendered result follow.
+- **Cost attribution.** Usage includes `modelCalls` (Hyper inference-call count), tokens, cost, and
+  served model. `runs --json --all` adds `sessionTotals.byResolvedModel` so model-vs-model cost
+  comparison needs no external join. For deeper per-inference analysis, join
+  `~/.grok/logs/unified.jsonl` on the same session id the bridge prints in the log header and on
+  the job record as `threadId`.
 - **stderr and unrecognized events.** When a run produces no answer at all, the last 20 lines of the
   CLI's stderr are shown — an exit-0 run with empty output and a warning on stderr is what a
   truncated response looks like. If the CLI streams event types this bridge does not know, they are
@@ -313,6 +322,12 @@ A run also reports what it did to the disk and how it was captured:
 - `show` always appends `===BRIDGE-RESULT===`; run header prints CLI, model, isolation, verify plan.
 - New `models [--json]` subcommand; pay-per-token models need `GROK_BUILD_ALLOW_PAY_PER_TOKEN=1`.
 - Every subcommand accepts `--help` / `-h`.
+- **Cost attribution (BRIDGE-5):** log-file header carries Grok session id (join key for `~/.grok/logs/unified.jsonl`); `usage.modelCalls` summed across turns; `runs --json --all` emits `sessionTotals` by `resolvedModel`.
+- **Dual-tree accounting (BRIDGE-3):** worktree vs main-tree changed files reported separately; status uses the sum; empty wording distinguishes nothing-written vs excluded-artifacts only.
+- **Implausible-duration signal (BRIDGE-1 bonus):** short write runs with no files and few/no tool calls set `implausiblyShort` and a report line (not a new terminal status). Floor via `GROK_BUILD_MIN_PLAUSIBLE_WRITE_SECONDS` (default 90).
+- **Full reasoning-effort ladder (HYPER-2):** `none|minimal|low|medium|high|xhigh|max|ultra`; unknown values warn and pass through to the CLI.
+- **Debris reporting (BRIDGE-12):** loose logs/temps/dumps listed as debris, not classed as excluded caches.
+- **Headless discipline (HYPER-1):** `prompts/headless.md` on every run; one auto-continue when a turn ends on a user question with zero tool calls.
 
 ## Requirements
 

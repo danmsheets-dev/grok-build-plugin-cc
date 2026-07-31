@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -120,7 +121,7 @@ import {
   PARENT_RUN_ID_ENV
 } from "./lib/nest.mjs";
 import { redactSecrets, redactSecretsDeep } from "./lib/redact.mjs";
-import { MESSAGE_SEPARATOR } from "./lib/stream-events.mjs";
+import { addUsage, MESSAGE_SEPARATOR } from "./lib/stream-events.mjs";
 import {
   appendLogLine,
   createJobLogFile,
@@ -128,10 +129,12 @@ import {
   createJobRecord,
   createProgressReporter,
   decideCompletionStatus,
+  formatRunLogHeader,
   nowIso,
   resolveJobKillTargets,
   runTrackedJob,
-  SESSION_ID_ENV
+  SESSION_ID_ENV,
+  writeRunLogHeader
 } from "./lib/tracked-jobs.mjs";
 import {
   classifyVerifyFailure,
@@ -150,10 +153,14 @@ import {
   capChangedFiles,
   commitWorktreeChanges,
   createWorktree,
+  isDebrisPath,
+  isGeneratedArtifactPath,
   listCommittedChanges,
+  partitionWorkAndDebris,
   removeWorktree
 } from "./lib/worktree.mjs";
 import {
+  buildSessionTotalsByModel,
   formatUsageLine,
   renderCancelReport,
   renderJobStatusReport,
@@ -170,7 +177,29 @@ const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
-const VALID_REASONING_EFFORTS = new Set(["low", "medium", "high"]);
+// Measured in Hyper (crates/codegen/xai-grok-sampling-types): the real ladder is
+// none · minimal · low · medium (default) · high · xhigh · max · ultra.
+// The CLI flag is an unvalidated Option<String>, so the bridge must not be the
+// authority that refuses a new tier — a plugin release must not be required
+// when Hyper adds one. Known values pass cleanly; unknown values warn and pass
+// through (HYPER-2).
+export const KNOWN_REASONING_EFFORTS = Object.freeze([
+  "none",
+  "minimal",
+  "low",
+  "medium",
+  "high",
+  "xhigh",
+  "max",
+  "ultra"
+]);
+const KNOWN_REASONING_EFFORT_SET = new Set(KNOWN_REASONING_EFFORTS);
+
+// Floor for the implausible-duration signal on write runs (BRIDGE-1 bonus).
+// Overridable via GROK_BUILD_MIN_PLAUSIBLE_WRITE_SECONDS. Signal only — never
+// invents a new terminal status.
+const DEFAULT_MIN_PLAUSIBLE_WRITE_SECONDS = 90;
+
 // Generous on purpose: this is the only chance to learn what already failed
 // before the agent ran. A tight cap here silently produced an empty baseline
 // on a slow cold build, misattributing every pre-existing failure to the run.
@@ -849,15 +878,26 @@ function loadIsolationRulesTemplate() {
   return isolationRulesCache;
 }
 
+// Headless discipline (HYPER-1): every bridge run is non-interactive. Keep this
+// short — it costs argv budget on the Windows cmd-shim path.
+let headlessRulesCache = null;
+function loadHeadlessRules() {
+  if (headlessRulesCache == null) {
+    headlessRulesCache = loadPromptTemplate(ROOT_DIR, "headless").trim();
+  }
+  return headlessRulesCache;
+}
+
 /**
- * System-prompt rules for a run. Always includes the final-report contract;
- * isolated runs also get the isolation preamble naming the only writable root.
+ * System-prompt rules for a run. Always includes the final-report contract and
+ * the headless non-interactive rule; isolated runs also get the isolation
+ * preamble naming the only writable root.
  *
  * @param {{ isolated?: boolean, worktreePath?: string|null, workspaceRoot?: string|null }} [options]
  * @returns {string}
  */
 function loadRunRules(options = {}) {
-  const parts = [loadRunReportRules()];
+  const parts = [loadRunReportRules(), loadHeadlessRules()];
   if (options.isolated && options.worktreePath && options.workspaceRoot) {
     parts.push(
       interpolateTemplate(loadIsolationRulesTemplate(), {
@@ -907,35 +947,6 @@ function reconcileAbandonedInWorkspace(workspaceRoot, options = {}) {
   return results;
 }
 
-/**
- * Sum two usage objects. The verify-fix loop can invoke the agent multiple
- * times (initial run plus one per fix attempt); reporting only the last
- * call's usage silently discarded every earlier turn's tokens and cost, and
- * checking --max-cost against a single call's cost rather than the running
- * total meant N calls each under budget could together blow well past it.
- */
-function addUsage(a, b) {
-  if (!b) {
-    return a;
-  }
-  if (!a) {
-    return { ...b };
-  }
-  const numeric = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
-  return {
-    inputTokens: numeric(a.inputTokens) + numeric(b.inputTokens),
-    cachedInputTokens: numeric(a.cachedInputTokens) + numeric(b.cachedInputTokens),
-    outputTokens: numeric(a.outputTokens) + numeric(b.outputTokens),
-    reasoningTokens: numeric(a.reasoningTokens) + numeric(b.reasoningTokens),
-    totalTokens: numeric(a.totalTokens) + numeric(b.totalTokens),
-    costUsd: numeric(a.costUsd) + numeric(b.costUsd),
-    numTurns: numeric(a.numTurns) + numeric(b.numTurns),
-    // Served model from the latest turn wins - provider can remap mid-run.
-    resolvedModel: b.resolvedModel ?? a.resolvedModel ?? null,
-    modelUsage: b.modelUsage ?? a.modelUsage ?? undefined
-  };
-}
-
 function outputResult(value, asJson) {
   if (asJson) {
     console.log(JSON.stringify(value, null, 2));
@@ -948,21 +959,113 @@ function outputCommandResult(payload, rendered, asJson) {
   outputResult(asJson ? payload : rendered, asJson);
 }
 
-function normalizeReasoningEffort(effort) {
+/**
+ * Normalise a reasoning-effort flag.
+ *
+ * Accepts the full Hyper ladder. Values outside it warn and pass through
+ * rather than refusing — the CLI is the authority on what it accepts
+ * (HYPER-2). Returns `{ value, warning }` so callers can log once.
+ *
+ * @param {string|null|undefined} effort
+ * @param {{ supportedEfforts?: string[]|null }} [options]
+ * @returns {{ value: string|null, warning: string|null }}
+ */
+export function normalizeReasoningEffort(effort, options = {}) {
   if (effort == null) {
-    return null;
+    return { value: null, warning: null };
   }
   const normalized = String(effort).trim().toLowerCase();
   if (!normalized) {
-    return null;
+    return { value: null, warning: null };
   }
-  if (!VALID_REASONING_EFFORTS.has(normalized)) {
-    throw new Error(
-      `Unsupported reasoning effort "${effort}". Use one of: low, medium, high.`
-    );
+  let warning = null;
+  if (!KNOWN_REASONING_EFFORT_SET.has(normalized)) {
+    // Pass through: a new Hyper tier must not require a plugin release.
+    warning =
+      `Unknown reasoning effort "${effort}" (known: ${KNOWN_REASONING_EFFORTS.join(", ")}). ` +
+      `Passing through to the CLI, which is the authority on accepted values.`;
   }
-  return normalized;
+  const supported = options.supportedEfforts;
+  if (Array.isArray(supported) && supported.length > 0) {
+    const allowed = new Set(supported.map((entry) => String(entry).trim().toLowerCase()).filter(Boolean));
+    if (allowed.size > 0 && !allowed.has(normalized)) {
+      const mismatch =
+        `Reasoning effort "${normalized}" is not in this model's reported support ` +
+        `(${[...allowed].join(", ")}). Passing through anyway — never hard-fail on the plugin's opinion.`;
+      warning = warning ? `${warning} ${mismatch}` : mismatch;
+    }
+  }
+  return { value: normalized, warning };
 }
+
+/**
+ * True when the final assistant message looks like a question to the user.
+ * HYPER-1: a headless --background run that ends on "Would you like X?" is a
+ * failed turn — nobody will answer.
+ *
+ * @param {string|null|undefined} message
+ * @returns {boolean}
+ */
+export function looksLikeUserQuestion(message) {
+  const text = String(message ?? "").trim();
+  if (!text) {
+    return false;
+  }
+  // Prefer the trailing prose: long reports can mention "?" mid-body.
+  const tail = text
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .slice(-6)
+    .join(" ");
+  if (/\?\s*$/.test(tail)) {
+    return true;
+  }
+  return /\b(would you like|do you want|should i|shall i|can you confirm|want me to|please confirm|is that ok|is that okay|which (?:one|option) do you|how would you like)\b/i.test(
+    tail
+  );
+}
+
+/**
+ * Cheap plausibility signal for write runs that finished impossibly fast with
+ * no work (BRIDGE-1 bonus). Signal only — does not invent a terminal status.
+ *
+ * @param {{
+ *   write?: boolean,
+ *   durationMs?: number|null,
+ *   changedFileCount?: number|null,
+ *   toolCallCount?: number|null,
+ *   env?: NodeJS.ProcessEnv
+ * }} input
+ * @returns {boolean}
+ */
+export function detectImplausiblyShort(input = {}) {
+  if (!input.write) {
+    return false;
+  }
+  const env = input.env ?? process.env;
+  const floorSec = Number(env.GROK_BUILD_MIN_PLAUSIBLE_WRITE_SECONDS);
+  const floorMs =
+    (Number.isFinite(floorSec) && floorSec > 0 ? floorSec : DEFAULT_MIN_PLAUSIBLE_WRITE_SECONDS) * 1000;
+  const durationMs = Number(input.durationMs);
+  if (!Number.isFinite(durationMs) || durationMs < 0 || durationMs >= floorMs) {
+    return false;
+  }
+  const changed = input.changedFileCount;
+  if (changed != null && Number(changed) > 0) {
+    return false;
+  }
+  // Few or no tool calls. null (unknown) still flags when the write finished
+  // empty under the floor — that is the blind-hero-kit field case.
+  const tools = input.toolCallCount;
+  if (tools != null && Number.isFinite(Number(tools)) && Number(tools) > 1) {
+    return false;
+  }
+  return true;
+}
+
+const HEADLESS_AUTO_CONTINUE_NUDGE =
+  "There is no interactive user. Assume no to any optional feature and carry out the task as given.";
 
 function normalizeArgv(argv) {
   if (argv.length === 1) {
@@ -2222,6 +2325,7 @@ function projectRunJsonRow(job, storedJob = null) {
   const record = { ...job, ...(storedJob ?? {}) };
   const worktree = record.worktree ?? null;
   const usage = record.usage ?? storedJob?.usage ?? storedJob?.result?.usage ?? null;
+  const result = storedJob?.result ?? record.result ?? null;
   return {
     id: record.id,
     status: record.status,
@@ -2232,13 +2336,13 @@ function projectRunJsonRow(job, storedJob = null) {
     kindLabel: record.kindLabel ?? resolveJobKindLabel(record.kind, record.jobClass),
     title: record.title ?? null,
     write: record.write ?? null,
-    verified: record.verified ?? storedJob?.verified ?? storedJob?.result?.verified ?? null,
-    stopReason: record.stopReason ?? storedJob?.stopReason ?? storedJob?.result?.stopReason ?? null,
-    toolCallCount: record.toolCallCount ?? storedJob?.toolCallCount ?? storedJob?.result?.toolCallCount ?? null,
+    verified: record.verified ?? storedJob?.verified ?? result?.verified ?? null,
+    stopReason: record.stopReason ?? storedJob?.stopReason ?? result?.stopReason ?? null,
+    toolCallCount: record.toolCallCount ?? storedJob?.toolCallCount ?? result?.toolCallCount ?? null,
     changedFileCount:
       record.changedFileCount ??
       storedJob?.changedFileCount ??
-      storedJob?.result?.changedFiles?.total ??
+      result?.changedFiles?.total ??
       worktree?.changedFileCount ??
       null,
     isolation: {
@@ -2252,6 +2356,10 @@ function projectRunJsonRow(job, storedJob = null) {
     resolvedModel: record.resolvedModel ?? storedJob?.resolvedModel ?? usage?.resolvedModel ?? null,
     elapsed: record.elapsed ?? null,
     duration: record.duration ?? null,
+    durationMs: record.durationMs ?? result?.durationMs ?? null,
+    implausiblyShort: Boolean(record.implausiblyShort ?? result?.implausiblyShort),
+    autoContinued: Boolean(record.autoContinued ?? result?.autoContinued),
+    debris: result?.debris ?? record.debris ?? { entries: [], total: 0, truncated: false },
     threadId: record.threadId ?? null,
     logFile: record.logFile ?? null,
     createdAt: record.createdAt ?? null,
@@ -2331,11 +2439,12 @@ function renderStatusPayload(report, asJson) {
   const recent = (report.recent ?? []).map((job) =>
     projectRunJsonRow(hydrateJobFromStored(workspaceRoot, job), readStoredJob(workspaceRoot, job.id))
   );
-  return {
+  const runs = [...running, ...(latestFinished ? [latestFinished] : []), ...recent];
+  const payload = {
     schemaVersion: 2,
     workspaceRoot,
     sessionRuntime: report.sessionRuntime,
-    runs: [...running, ...(latestFinished ? [latestFinished] : []), ...recent],
+    runs,
     compat: {
       running,
       latestFinished,
@@ -2346,6 +2455,12 @@ function renderStatusPayload(report, asJson) {
     latestFinished,
     recent
   };
+  // BRIDGE-5: session totals grouped by resolvedModel so "which model was
+  // cheaper for this job" needs no unified.jsonl join. Present on --all.
+  if (report.all) {
+    payload.sessionTotals = buildSessionTotalsByModel(runs);
+  }
+  return payload;
 }
 
 function isActiveJobStatus(status) {
@@ -2577,25 +2692,14 @@ async function executeReviewRun(request) {
  * @param {string} cwd
  * @returns {Map<string, string>|null}
  */
-function porcelainChangeEntries(cwd) {
-  // -uall because git otherwise collapses a wholly untracked directory to a
-  // single `src/` entry, and "the agent created src/" is not a manifest. The
-  // extra walk is bounded by the same artifact excludes as the commit path, so
-  // the heavyweight directories (node_modules, target, .godot) are not
-  // enumerated, and this only runs on a --write --no-isolate run.
-  const args = ["status", "--porcelain", "--untracked-files=all"];
-  let status = git(cwd, [...args, "--", ".", ...artifactExcludePathspecs()]);
-  if (status.status !== 0) {
-    // Mirror the land gate's fallback: an ancient git that rejects pathspec
-    // magic degrades to an unfiltered listing rather than losing the manifest.
-    status = git(cwd, args);
-  }
-  if (status.status !== 0 || status.error) {
-    return null;
-  }
-
+/**
+ * Parse `git status --porcelain` into path -> status letter.
+ * @param {string} stdout
+ * @returns {Map<string, string>}
+ */
+function parsePorcelainStdout(stdout) {
   const entries = new Map();
-  for (const line of String(status.stdout ?? "").split(/\r?\n/)) {
+  for (const line of String(stdout ?? "").split(/\r?\n/)) {
     const trimmed = line.trimEnd();
     if (!trimmed) {
       continue;
@@ -2614,6 +2718,72 @@ function porcelainChangeEntries(cwd) {
     entries.set(filePath, letter);
   }
   return entries;
+}
+
+function porcelainChangeEntries(cwd) {
+  // -uall because git otherwise collapses a wholly untracked directory to a
+  // single `src/` entry, and "the agent created src/" is not a manifest. The
+  // extra walk is bounded by the same artifact excludes as the commit path, so
+  // the heavyweight directories (node_modules, target, .godot) are not
+  // enumerated, and this only runs on a --write --no-isolate run.
+  const args = ["status", "--porcelain", "--untracked-files=all"];
+  let status = git(cwd, [...args, "--", ".", ...artifactExcludePathspecs()]);
+  if (status.status !== 0) {
+    // Mirror the land gate's fallback: an ancient git that rejects pathspec
+    // magic degrades to an unfiltered listing rather than losing the manifest.
+    status = git(cwd, args);
+  }
+  if (status.status !== 0 || status.error) {
+    return null;
+  }
+  return parsePorcelainStdout(status.stdout);
+}
+
+/**
+ * Unfiltered porcelain (includes generated artifacts). Used only to decide
+ * whether an empty work-manifest means "wrote nothing" vs "only caches".
+ * BRIDGE-3: never render the artifact wording when the tree is truly clean.
+ *
+ * @param {string} cwd
+ * @returns {Map<string, string>|null}
+ */
+function porcelainChangeEntriesRaw(cwd) {
+  const status = git(cwd, ["status", "--porcelain", "--untracked-files=all"]);
+  if (status.status !== 0 || status.error) {
+    return null;
+  }
+  return parsePorcelainStdout(status.stdout);
+}
+
+/**
+ * Classify an empty non-artifact manifest: nothing written at all, or only
+ * excluded build caches.
+ *
+ * @param {string} cwd
+ * @param {Set<string>|null} [beforePaths]
+ * @returns {"nothing-written"|"excluded-artifacts"|"working-tree-clean"}
+ */
+function emptyChangeReason(cwd, beforePaths = null) {
+  const raw = porcelainChangeEntriesRaw(cwd);
+  if (!raw) {
+    return "nothing-written";
+  }
+  let artifactOnly = false;
+  for (const filePath of raw.keys()) {
+    if (beforePaths && beforePaths.has(filePath)) {
+      continue;
+    }
+    if (isGeneratedArtifactPath(filePath)) {
+      artifactOnly = true;
+      continue;
+    }
+    // Something real is dirty but was filtered elsewhere — still not "nothing".
+    if (!isDebrisPath(filePath)) {
+      return "excluded-artifacts";
+    }
+    artifactOnly = true;
+  }
+  return artifactOnly ? "excluded-artifacts" : "nothing-written";
 }
 
 /**
@@ -2643,12 +2813,28 @@ function collectWorkingTreeChanges(cwd, before) {
     }
     fresh.push(`${letter}\t${filePath}`);
   }
-  return { source: "working-tree", ...capChangedFiles(fresh), preexistingDirty };
+  // Split debris out of the work manifest (BRIDGE-12).
+  const { work, debris } = partitionWorkAndDebris(fresh);
+  const cappedWork = capChangedFiles(work);
+  const cappedDebris = capChangedFiles(debris);
+  const emptyReason =
+    cappedWork.total === 0 ? emptyChangeReason(cwd, before) : null;
+  return {
+    source: "working-tree",
+    ...cappedWork,
+    preexistingDirty,
+    emptyReason,
+    debris: cappedDebris
+  };
 }
 
 async function executeTaskRun(request) {
   const workspaceRoot = resolveWorkspaceRoot(request.cwd);
   ensureGrokAvailable(request.cwd);
+  // Wall clock for the implausible-duration signal (BRIDGE-1 bonus). Captured
+  // before worktree create / baseline probe so a hero kit finishing in 56s is
+  // measured honestly, not after the probe already spent minutes.
+  const runStartedAtMs = Date.now();
 
   // Derived rather than plumbed: `meta.logFile` is created in
   // runForegroundCommand AFTER the runner closure that calls this function is
@@ -2657,6 +2843,12 @@ async function executeTaskRun(request) {
   // rendered result to it - the durable artifact of the run, and useless if the
   // user is never told where it is.
   const logFile = request.jobId ? resolveJobLogFile(workspaceRoot, request.jobId) : null;
+  // Grok session id is assigned here so the log header can print the join key
+  // for ~/.grok/logs/unified.jsonl before the agent starts (BRIDGE-5).
+  const assignedSessionId =
+    request.resumeLast || request.resumeSessionId
+      ? null
+      : crypto.randomUUID();
 
   const taskMetadata = buildTaskRunMetadata({
     prompt: request.prompt,
@@ -3126,15 +3318,16 @@ async function executeTaskRun(request) {
   // Isolation header line only on this branch (WP-P1 owns CLI/model/verify plan
   // lines). Emitted through the existing progress channel so it lands in the
   // log and the live preview, not only the final report.
+  const isolationHeader = formatIsolationHeaderLine({
+    active: Boolean(created),
+    worktreePath: created?.worktreePath ?? null,
+    branch: created?.branchName ?? null,
+    baseSha: created?.baseSha ?? null,
+    workspaceRoot,
+    source: isolateSource
+  });
   request.onProgress?.({
-    message: formatIsolationHeaderLine({
-      active: Boolean(created),
-      worktreePath: created?.worktreePath ?? null,
-      branch: created?.branchName ?? null,
-      baseSha: created?.baseSha ?? null,
-      workspaceRoot,
-      source: isolateSource
-    }),
+    message: isolationHeader,
     phase: "starting"
   });
 
@@ -3148,6 +3341,28 @@ async function executeTaskRun(request) {
   ];
   for (const line of headerLines) {
     request.onProgress?.({ message: line, phase: "starting" });
+  }
+
+  // Structured log header with the Grok session join key (BRIDGE-5). Re-written
+  // later when the served model is known.
+  const initialSessionId = resumeSessionId || assignedSessionId;
+  writeRunLogHeader(logFile, {
+    runId: request.jobId ?? null,
+    grokSessionId: initialSessionId,
+    binary: availability.binary ?? resolveGrokBinary(),
+    version: availability.detail ?? null,
+    cliLabel: cliBrand.label,
+    modelRequested: request.model ?? null,
+    modelServed: null,
+    isolation: isolationHeader,
+    workspaceRoot
+  });
+  if (initialSessionId) {
+    request.onProgress?.({
+      message: `Grok session ID: ${initialSessionId}`,
+      phase: "starting",
+      threadId: initialSessionId
+    });
   }
   if (verifyPlan || verifyCommands.length > 0) {
     const planLines = [];
@@ -3249,6 +3464,9 @@ async function executeTaskRun(request) {
     {
       prompt,
       resumeSessionId,
+      // Pre-assigned so the log header and job record share the same sid that
+      // ~/.grok/logs/unified.jsonl keys on (BRIDGE-5).
+      sessionId: resumeSessionId ? undefined : assignedSessionId ?? undefined,
       model: request.model,
       effort: request.effort,
       ...permissionOptions,
@@ -3286,6 +3504,48 @@ async function executeTaskRun(request) {
   const agentResults = [firstAgent.result];
   let timedOut = firstAgent.timedOut;
   let cumulativeUsage = result.usage ? { ...result.usage } : null;
+  // HYPER-1: one auto-continue when the agent spent its turn asking a question
+  // nobody will answer. Bound to exactly one retry — never loop.
+  let autoContinued = false;
+  if (
+    !timedOut &&
+    result.status === 0 &&
+    result.threadId &&
+    result.toolCallCount === 0 &&
+    looksLikeUserQuestion(result.lastMessage || result.finalMessage || result.finalReport)
+  ) {
+    request.onProgress?.({
+      phase: "running",
+      message:
+        "First turn ended on a user-facing question with zero tool calls; auto-continuing once (non-interactive)."
+    });
+    const continueAgent = await runHeadlessAgentWithDurationBudget(
+      runCwd,
+      {
+        prompt: HEADLESS_AUTO_CONTINUE_NUDGE,
+        resumeSessionId: result.threadId,
+        model: request.model,
+        effort: request.effort,
+        ...permissionOptions,
+        maxTurns,
+        // No report/isolation rules on the nudge turn — it is an internal
+        // continuation, and a second final-report would overwrite the real one.
+        outputFormat: "streaming-json",
+        onProgress: request.onProgress,
+        env: runEnv,
+        promptFileDir: resolveStateDir(workspaceRoot),
+        cwd: runCwd
+      },
+      maxDurationSeconds
+    );
+    autoContinued = true;
+    result = continueAgent.result;
+    agentResults.push(continueAgent.result);
+    cumulativeUsage = addUsage(cumulativeUsage, continueAgent.result.usage);
+    if (continueAgent.timedOut) {
+      timedOut = true;
+    }
+  }
 
   // Cost is only known when a turn ends (from the end event's total_cost_usd),
   // so max-cost is a post-hoc stop — not a pre-emptive cap. The run stops before
@@ -3546,16 +3806,19 @@ async function executeTaskRun(request) {
   }
 
   let worktree = null;
-  /** @type {{source: string, entries: string[], total: number, truncated: boolean, preexistingDirty?: number}|null} */
+  /** @type {object|null} */
   let changedFiles = null;
   /** @type {{entries: string[], total: number, truncated: boolean}|null} */
   let isolationLeak = null;
   let isolationBreached = false;
+  /** @type {{entries: string[], total: number, truncated: boolean}|null} */
+  let debris = null;
 
   // Breach detection: any path newly dirty in the MAIN checkout after an
   // isolated run means the agent wrote outside the worktree. artifact excludes
   // (and thus junctioned node_modules/.godot/…) are already applied by
   // porcelainChangeEntries, so provisioned link targets cannot false-positive.
+  let mainTreeSide = null;
   if (created && mainDirtyBeforeRunPaths) {
     const mainAfter = porcelainChangeEntries(workspaceRoot);
     if (mainAfter) {
@@ -3566,13 +3829,28 @@ async function executeTaskRun(request) {
         }
         leaked.push(`${letter}\t${filePath}`);
       }
-      if (leaked.length > 0) {
+      const { work: mainWork, debris: mainDebris } = partitionWorkAndDebris(leaked);
+      if (mainDebris.length > 0) {
+        debris = capChangedFiles(mainDebris);
+      }
+      if (mainWork.length > 0) {
         isolationBreached = true;
-        isolationLeak = capChangedFiles(leaked);
+        isolationLeak = capChangedFiles(mainWork);
+        mainTreeSide = {
+          ...isolationLeak,
+          emptyReason: null
+        };
         request.onProgress?.({
           message: `Isolation BREACHED: ${isolationLeak.total} path(s) changed in the main checkout during this run (agent escape, or a concurrent edit of your own).`,
           phase: "finalizing"
         });
+      } else {
+        mainTreeSide = {
+          entries: [],
+          total: 0,
+          truncated: false,
+          emptyReason: emptyChangeReason(workspaceRoot, mainDirtyBeforeRunPaths)
+        };
       }
     }
   }
@@ -3611,14 +3889,63 @@ async function executeTaskRun(request) {
     // A commit that FAILED is left as null (unknown), never as an empty set:
     // the work is still on disk in the worktree and "changed nothing" would be a
     // lie about it.
+    let worktreeSide = null;
     if (committed.sha && committed.sha !== created.baseSha) {
       const listed = listCommittedChanges(created.worktreePath, created.baseSha, committed.sha);
       // A diff that failed is NOT an empty change set - reporting "none" for it
       // would claim the run produced nothing when nobody managed to look.
-      changedFiles = listed.error ? null : { source: "commit", ...listed };
+      if (!listed.error) {
+        const { work, debris: commitDebris } = partitionWorkAndDebris(listed.entries ?? []);
+        // Debris is not in the commit by definition; residual uncommitted debris
+        // is collected from the worktree working tree below.
+        worktreeSide = { ...capChangedFiles(work), emptyReason: null };
+        void commitDebris;
+      }
     } else if (!committed.error) {
-      changedFiles = { source: "commit", entries: [], total: 0, truncated: false };
+      worktreeSide = {
+        entries: [],
+        total: 0,
+        truncated: false,
+        emptyReason: emptyChangeReason(created.worktreePath)
+      };
     }
+
+    // Uncommitted debris left in the worktree after the commit (BRIDGE-12).
+    const residual = porcelainChangeEntries(created.worktreePath);
+    if (residual) {
+      const residualEntries = [];
+      for (const [filePath, letter] of residual) {
+        residualEntries.push(`${letter}\t${filePath}`);
+      }
+      const { debris: residualDebris } = partitionWorkAndDebris(residualEntries);
+      if (residualDebris.length > 0) {
+        const capped = capChangedFiles(residualDebris);
+        debris = debris
+          ? capChangedFiles([...(debris.entries ?? []), ...capped.entries])
+          : capped;
+      }
+    }
+
+    // Dual accounting (BRIDGE-3): never conflate worktree and main-tree counts.
+    // Status uses the SUM so a main-only write is never completed-noop.
+    const worktreeTotal = worktreeSide?.total ?? 0;
+    const mainTotal = mainTreeSide?.total ?? 0;
+    const combinedTotal =
+      worktreeSide == null && mainTreeSide == null ? null : worktreeTotal + mainTotal;
+    changedFiles = {
+      source: "dual",
+      worktree: worktreeSide,
+      mainTree: mainTreeSide,
+      // Legacy flat fields for older consumers / decideCompletionStatus.
+      entries: worktreeSide?.entries ?? [],
+      total: combinedTotal ?? 0,
+      truncated: Boolean(worktreeSide?.truncated || mainTreeSide?.truncated),
+      emptyReason:
+        combinedTotal === 0
+          ? worktreeSide?.emptyReason ?? mainTreeSide?.emptyReason ?? "nothing-written"
+          : null
+    };
+
     worktree = {
       path: created.worktreePath,
       branch: created.branchName,
@@ -3631,13 +3958,31 @@ async function executeTaskRun(request) {
       commitError: committed.error ?? null,
       // The deliverable, named. For a Godot or Blender run this is the whole
       // point of the run, and the payload used to carry only a path.
-      changedFiles: changedFiles?.entries ?? null,
-      changedFileCount: changedFiles?.total ?? null,
+      changedFiles: worktreeSide?.entries ?? null,
+      changedFileCount: combinedTotal,
       breached: isolationBreached,
       isolationLeak
     };
   } else if (write) {
-    changedFiles = collectWorkingTreeChanges(runCwd, dirtyBeforeRunPaths);
+    const collected = collectWorkingTreeChanges(runCwd, dirtyBeforeRunPaths);
+    if (collected) {
+      debris = collected.debris?.total ? collected.debris : null;
+      changedFiles = {
+        source: "working-tree",
+        worktree: null,
+        mainTree: {
+          entries: collected.entries,
+          total: collected.total,
+          truncated: collected.truncated,
+          emptyReason: collected.emptyReason
+        },
+        entries: collected.entries,
+        total: collected.total,
+        truncated: collected.truncated,
+        preexistingDirty: collected.preexistingDirty,
+        emptyReason: collected.emptyReason
+      };
+    }
   }
 
   // The text channel is the ONE thing that accumulates across turns. `result`
@@ -3708,6 +4053,8 @@ async function executeTaskRun(request) {
       phase: "finalizing"
     });
   }
+  // Total across BOTH trees feeds decideCompletionStatus (BRIDGE-3): a run that
+  // wrote only into the main checkout is never completed-noop.
   const changedFileCount =
     changedFiles?.total != null
       ? Number(changedFiles.total)
@@ -3731,6 +4078,26 @@ async function executeTaskRun(request) {
       : changedFiles && Number.isFinite(Number(changedFiles.total))
         ? Number(changedFiles.total)
         : null;
+  const durationMs = Date.now() - runStartedAtMs;
+  const implausiblyShort = detectImplausiblyShort({
+    write,
+    durationMs,
+    changedFileCount: effectiveChangedFileCount,
+    toolCallCount,
+    env: process.env
+  });
+  // Refresh the log header now that session id + served model are known.
+  writeRunLogHeader(logFile, {
+    runId: request.jobId ?? null,
+    grokSessionId: result.threadId ?? initialSessionId,
+    binary: availability.binary ?? resolveGrokBinary(),
+    version: availability.detail ?? null,
+    cliLabel: cliBrand.label,
+    modelRequested: request.model ?? null,
+    modelServed: resolvedModel,
+    isolation: isolationHeader,
+    workspaceRoot
+  });
   const terminalStatus = decideCompletionStatus({
     timedOut,
     exitStatus: timedOut ? 1 : result.status,
@@ -3781,6 +4148,7 @@ async function executeTaskRun(request) {
           streamParsed,
           unknownEventTypes,
           changedFiles,
+          debris,
           write,
           verified: isolationBreached ? false : verified,
           verifyNote: isolationBreached
@@ -3793,6 +4161,11 @@ async function executeTaskRun(request) {
           resolvedModel,
           isolationBreached,
           isolationLeak,
+          implausiblyShort,
+          durationMs,
+          durationSeconds: durationMs / 1000,
+          toolCallCount,
+          autoContinued,
           // Which command(s) tripped an exit-0 output-failure marker, and what
           // matched - the only evidence available without reading --json for
           // a command whose exit code alone says it passed. Computed here
@@ -3913,8 +4286,14 @@ async function executeTaskRun(request) {
     logFile,
     // What the run changed on disk - the deliverable itself for an engine
     // project. Null when there was nothing to measure (a read-only run) or
-    // nobody could measure it (a failed commit or diff).
+    // nobody could measure it (a failed commit or diff). Dual-tree shape when
+    // isolated (BRIDGE-3).
     changedFiles,
+    // Unaccounted debris left on disk and not committed (BRIDGE-12).
+    debris: debris ?? { entries: [], total: 0, truncated: false },
+    implausiblyShort,
+    durationMs,
+    autoContinued,
     verified: isolationBreached ? false : verified,
     worktree,
     isolationBreached,
@@ -3990,6 +4369,10 @@ async function executeTaskRun(request) {
     changedFileCount: effectiveChangedFileCount,
     model: request.model ?? null,
     resolvedModel,
+    implausiblyShort,
+    durationMs,
+    autoContinued,
+    debris: debris ?? { entries: [], total: 0, truncated: false },
     hadWork: Boolean(prompt)
   };
 }
@@ -4313,7 +4696,11 @@ async function handleReviewCommand(argv, config) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const model = options.model ? String(options.model).trim() : null;
-  const effort = normalizeReasoningEffort(options.effort);
+  const effortNorm = normalizeReasoningEffort(options.effort);
+  if (effortNorm.warning) {
+    process.stderr.write(`[grok-build] ${effortNorm.warning}\n`);
+  }
+  const effort = effortNorm.value;
   const billingGate = assertModelBillingAllowed(model, process.env);
   if (!billingGate.allowed) {
     throw new Error(billingGate.message);
@@ -4496,11 +4883,14 @@ async function handleTask(argv) {
     cliSettings
   );
 
-  // normalizeReasoningEffort still runs on the CLI value first so an
-  // unsupported --effort keeps failing loudly; the config's value has already
-  // been validated by the schema.
+  // Effort: full Hyper ladder accepted; unknown values warn and pass through
+  // (HYPER-2). The config value is already schema-checked when present.
   const model = options.model ? String(options.model).trim() : (settings.model ?? null);
-  const effort = normalizeReasoningEffort(options.effort) ?? settings.effort ?? null;
+  const effortNorm = normalizeReasoningEffort(options.effort ?? settings.effort ?? null);
+  if (effortNorm.warning) {
+    process.stderr.write(`[grok-build] ${effortNorm.warning}\n`);
+  }
+  const effort = effortNorm.value;
   // Pay-per-token models (openai/*) require an explicit opt-in so a typo does
   // not silently burn metered budget.
   const billingGate = assertModelBillingAllowed(model, process.env);
@@ -5893,6 +6283,8 @@ export {
   buildDoctorReport,
   buildEcosystemChecks,
   formatIsolationHeaderLine,
+  // detectImplausiblyShort, looksLikeUserQuestion, normalizeReasoningEffort,
+  // and KNOWN_REASONING_EFFORTS are already exported at definition.
   loadRunRules,
   main,
   normalizeDoctorCheck,

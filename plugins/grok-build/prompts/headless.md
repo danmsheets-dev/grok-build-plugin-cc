@@ -1,0 +1,1 @@
+This run is non-interactive. There is no human present and no answer will ever arrive. Never ask a question, never request confirmation, never offer an optional feature and wait. Take the safest reasonable default, proceed, and record the assumption in your final report. A turn that ends in a question is a failed turn.

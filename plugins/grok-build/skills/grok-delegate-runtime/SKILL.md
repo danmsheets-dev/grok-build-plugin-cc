@@ -45,7 +45,7 @@ Command selection:
 - If the forwarded request includes `--fresh`, strip that token from the task text and do not add `--resume-last`.
 - `--resume`: always use `run --resume-last`, even if the request text is ambiguous.
 - `--fresh`: always use a fresh `run`, even if the request sounds like a follow-up.
-- `--effort`: accepted values are `low`, `medium`, `high`.
+- `--effort`: accepted values are the full Hyper ladder `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`. Unknown values are warned and passed through to the CLI (the bridge is not the authority that refuses a new tier).
 - `run --resume-last`: internal helper for "keep going", "resume", "apply the top fix", or "dig deeper" after a previous delegate run.
 
 Passthrough flags (forward verbatim, never fold into the task text):

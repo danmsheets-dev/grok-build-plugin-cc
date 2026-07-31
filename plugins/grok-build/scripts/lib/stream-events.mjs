@@ -215,6 +215,109 @@ function readExplicitToolCallCount(event) {
   return null;
 }
 
+/**
+ * Sum modelCalls across Hyper's per-served-model breakdown.
+ * Field-report BRIDGE-5: rate-card comparison alone picked the wrong model
+ * because Luna made 134 inference calls to Terra's 29; that count lived only
+ * inside modelUsage and was never surfaced.
+ */
+export function sumModelCalls(modelUsage) {
+  if (!modelUsage || typeof modelUsage !== "object" || Array.isArray(modelUsage)) {
+    return null;
+  }
+  let total = 0;
+  let saw = false;
+  for (const value of Object.values(modelUsage)) {
+    if (!value || typeof value !== "object") {
+      continue;
+    }
+    const raw = value.modelCalls ?? value.model_calls;
+    if (raw == null) {
+      continue;
+    }
+    const n = Number(raw);
+    if (Number.isFinite(n) && n >= 0) {
+      total += n;
+      saw = true;
+    }
+  }
+  return saw ? total : null;
+}
+
+/**
+ * Merge two modelUsage maps by summing numeric fields per served-model key.
+ * Used by addUsage so multi-turn runs do not keep only the last turn's map.
+ */
+export function mergeModelUsage(a, b) {
+  if (!b) {
+    return a && typeof a === "object" ? { ...a } : undefined;
+  }
+  if (!a) {
+    return b && typeof b === "object" ? { ...b } : undefined;
+  }
+  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
+  const out = {};
+  for (const key of keys) {
+    const left = a[key] && typeof a[key] === "object" ? a[key] : {};
+    const right = b[key] && typeof b[key] === "object" ? b[key] : {};
+    const numeric = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
+    out[key] = {
+      ...left,
+      ...right,
+      inputTokens: numeric(left.inputTokens ?? left.input_tokens) + numeric(right.inputTokens ?? right.input_tokens),
+      outputTokens:
+        numeric(left.outputTokens ?? left.output_tokens) + numeric(right.outputTokens ?? right.output_tokens),
+      cacheReadInputTokens:
+        numeric(left.cacheReadInputTokens ?? left.cache_read_input_tokens) +
+        numeric(right.cacheReadInputTokens ?? right.cache_read_input_tokens),
+      modelCalls: numeric(left.modelCalls ?? left.model_calls) + numeric(right.modelCalls ?? right.model_calls),
+      costUSD: numeric(left.costUSD ?? left.costUsd) + numeric(right.costUSD ?? right.costUsd)
+    };
+  }
+  return out;
+}
+
+/**
+ * Sum two usage objects across turns. The verify-fix loop can invoke the agent
+ * multiple times; reporting only the last call silently discarded earlier
+ * tokens, cost, and modelCalls — which is how a multi-turn run under-reported
+ * cost and hid the inference-call count the rate-card comparison needs.
+ */
+export function addUsage(a, b) {
+  if (!b) {
+    return a;
+  }
+  if (!a) {
+    return { ...b };
+  }
+  const numeric = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
+  const modelUsage = mergeModelUsage(a.modelUsage, b.modelUsage);
+  const modelCallsFromMap = sumModelCalls(modelUsage);
+  let modelCalls = modelCallsFromMap;
+  if (modelCalls == null) {
+    const left = a.modelCalls;
+    const right = b.modelCalls;
+    if (left != null || right != null) {
+      modelCalls = numeric(left) + numeric(right);
+    }
+  }
+  const resolvedModel = b.resolvedModel ?? a.resolvedModel ?? resolveModelFromUsage(modelUsage);
+  return {
+    inputTokens: numeric(a.inputTokens) + numeric(b.inputTokens),
+    cachedInputTokens: numeric(a.cachedInputTokens) + numeric(b.cachedInputTokens),
+    outputTokens: numeric(a.outputTokens) + numeric(b.outputTokens),
+    reasoningTokens: numeric(a.reasoningTokens) + numeric(b.reasoningTokens),
+    totalTokens: numeric(a.totalTokens) + numeric(b.totalTokens),
+    costUsd: numeric(a.costUsd) + numeric(b.costUsd),
+    numTurns: numeric(a.numTurns) + numeric(b.numTurns),
+    // Summed modelCalls — do not take max or last-turn only (BRIDGE-5).
+    ...(modelCalls != null ? { modelCalls } : {}),
+    // Served model from the latest turn wins - provider can remap mid-run.
+    ...(resolvedModel ? { resolvedModel } : {}),
+    ...(modelUsage ? { modelUsage } : {})
+  };
+}
+
 export function normalizeUsage(event) {
   const usage = event?.usage;
   if (!usage || typeof usage !== "object") {
@@ -227,6 +330,14 @@ export function normalizeUsage(event) {
         ? usage.modelUsage
         : null;
   const resolvedModel = resolveModelFromUsage(modelUsage);
+  // Prefer an explicit top-level count, else sum the per-model breakdown.
+  // modelCalls is the inference-call count the rate card alone cannot provide.
+  const explicitCalls = usage.modelCalls ?? usage.model_calls ?? event?.modelCalls ?? event?.model_calls;
+  const summedCalls = sumModelCalls(modelUsage);
+  const modelCalls =
+    explicitCalls != null && Number.isFinite(Number(explicitCalls))
+      ? Number(explicitCalls)
+      : summedCalls;
   return {
     inputTokens: toFiniteNumber(usage.input_tokens ?? usage.inputTokens),
     cachedInputTokens: toFiniteNumber(usage.cache_read_input_tokens ?? usage.cachedInputTokens),
@@ -239,6 +350,7 @@ export function normalizeUsage(event) {
     numTurns: Number.isFinite(Number(event.num_turns ?? event.numTurns ?? usage.numTurns))
       ? Number(event.num_turns ?? event.numTurns ?? usage.numTurns)
       : null,
+    ...(modelCalls != null ? { modelCalls } : {}),
     ...(modelUsage ? { modelUsage } : {}),
     ...(resolvedModel ? { resolvedModel } : {})
   };

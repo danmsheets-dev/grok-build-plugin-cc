@@ -193,18 +193,26 @@ test("critique forwards --model and --effort to grok", () => {
   assert.equal(argv[argv.indexOf("--effort") + 1], "medium");
 });
 
-test("review rejects unsupported --effort values", () => {
+test("review accepts the full effort ladder and passes unknown values through", () => {
+  // HYPER-2: the bridge no longer hard-fails on effort. Known tiers (including
+  // xhigh/max) succeed; unknown values warn and pass through to the CLI.
   const { repo, binDir, pluginDataDir } = setupReviewableRepo();
 
-  for (const effort of ["extreme", "xhigh", "max"]) {
+  for (const effort of ["xhigh", "max", "ultra"]) {
     const result = run("node", [SCRIPT, "review", "--effort", effort], {
       cwd: repo,
       env: pluginDataEnv(pluginDataDir, binDir)
     });
-
-    assert.notEqual(result.status, 0, `expected rejection for --effort ${effort}`);
-    assert.match(`${result.stdout}\n${result.stderr}`, /Unsupported reasoning effort/i);
+    assert.equal(result.status, 0, `expected accept for --effort ${effort}: ${result.stderr}`);
   }
+
+  const unknown = run("node", [SCRIPT, "review", "--effort", "extreme"], {
+    cwd: repo,
+    env: pluginDataEnv(pluginDataDir, binDir)
+  });
+  // Pass-through: warning on stderr, run still proceeds (exit 0 with fake grok).
+  assert.equal(unknown.status, 0, unknown.stderr);
+  assert.match(`${unknown.stdout}\n${unknown.stderr}`, /Unknown reasoning effort|Passing through/i);
 });
 
 test("run delegates through fake grok and stores a finished job", () => {
@@ -1764,24 +1772,31 @@ test("an isolated Godot write run reports what it changed, not just where it wen
   assert.equal(result.status, 0, result.stderr || result.stdout);
   const payload = JSON.parse(result.stdout);
 
-  assert.equal(payload.changedFiles.source, "commit");
+  // Dual-tree shape (BRIDGE-3): worktree side holds the committed work.
+  assert.ok(
+    payload.changedFiles.source === "dual" || payload.changedFiles.source === "commit",
+    payload.changedFiles.source
+  );
+  const workEntries =
+    payload.changedFiles.worktree?.entries ?? payload.changedFiles.entries ?? [];
   // Scene/resource paths may carry a cheap annotation ("scene edit") after the
   // path — match the status+path prefix, not a bare exact line.
   assert.ok(
-    payload.changedFiles.entries.some((entry) => entry.startsWith("A\tscenes/Player.tscn")),
-    payload.changedFiles.entries.join(" | ")
+    workEntries.some((entry) => entry.startsWith("A\tscenes/Player.tscn")),
+    workEntries.join(" | ")
   );
   assert.ok(
-    payload.changedFiles.entries.some((entry) => entry.startsWith("M\tassets/model.glb")),
-    payload.changedFiles.entries.join(" | ")
+    workEntries.some((entry) => entry.startsWith("M\tassets/model.glb")),
+    workEntries.join(" | ")
   );
   assert.ok(
-    payload.changedFiles.entries.every((entry) => !entry.includes(".godot/")),
-    payload.changedFiles.entries.join(" | ")
+    workEntries.every((entry) => !entry.includes(".godot/")),
+    workEntries.join(" | ")
   );
   // Mirrored onto the worktree descriptor, which is what land reads back.
-  assert.deepEqual(payload.worktree.changedFiles, payload.changedFiles.entries);
+  assert.deepEqual(payload.worktree.changedFiles, workEntries);
   assert.equal(payload.worktree.changedFileCount, 2);
+  assert.equal(payload.changedFiles.total, 2);
 
   // And the same run in text mode, which is what the user actually sees.
   const rendered = run(
@@ -1793,7 +1808,7 @@ test("an isolated Godot write run reports what it changed, not just where it wen
     }
   );
   assert.equal(rendered.status, 0, rendered.stderr);
-  assert.match(rendered.stdout, /Changed files \(2\):/);
+  assert.match(rendered.stdout, /Changed files \(worktree\): 2/);
   assert.match(rendered.stdout, /A scenes\/Player\.tscn/);
   assert.doesNotMatch(rendered.stdout, /\.godot\/imported/);
 });
@@ -1823,7 +1838,11 @@ test("a write run that produced only build artifacts says so, rather than going 
   );
 
   assert.equal(result.status, 0, result.stderr || result.stdout);
-  assert.match(result.stdout, /Changed files: none \(run produced only excluded build artifacts\)/);
+  // Dual-tree wording: worktree side is empty because only caches were written.
+  assert.match(
+    result.stdout,
+    /Changed files \(worktree\): none \((?:run produced only excluded build artifacts|nothing was written)\)/
+  );
 });
 
 test("a non-isolated write run separates its own edits from what was already dirty", () => {
