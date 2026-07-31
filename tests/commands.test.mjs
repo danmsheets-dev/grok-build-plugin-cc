@@ -216,7 +216,7 @@ test("the plugin README states the isolation guarantee plainly", () => {
   // isolation can still surprise someone, and each cost real reasoning to establish.
   assert.match(readme, /--no-isolate/, "the opt-out must be documented");
   assert.match(readme, /not a sandbox/i, "must not imply filesystem isolation");
-  assert.match(readme, /linked, not copied/i, "linked dirs write through to the real repo");
+  assert.match(readme, /linked, not copied/i, "shared dirs still write through to the real repo");
   assert.match(readme, /only copy of unlanded work/i, "prune can destroy unlanded work");
 });
 
@@ -428,22 +428,22 @@ test("the delegate argument-hint mentions the passthrough flags a user can type"
   assert.match(hint, /--env\b/);
 });
 
-test("the README's linked-dirs paragraph does not drift from PROVISION_LINK_DIRS", () => {
+test("the README's provisioned-dirs paragraph does not drift from PROVISION_LINK_DIRS", () => {
   // Token-shaped drift guard scoped to the paragraph, not the whole file:
   // ".venv" is a substring of "venv", and "target"/"vendor"/".next" all occur
   // in ordinary prose elsewhere in this README.
   const readme = fs.readFileSync(path.join(PLUGIN_ROOT, "README.md"), "utf8");
   const match = readme.match(
-    /- \*\*Heavyweight directories are linked, not copied\.\*\*[\s\S]*?(?=\n- \*\*A worktree holds)/
+    /- \*\*Heavyweight directories are provisioned, not blindly linked\.\*\*[\s\S]*?(?=\n- \*\*A worktree holds)/
   );
-  assert.ok(match, "the linked-dirs paragraph must exist in the plugin README");
+  assert.ok(match, "the provisioned-dirs paragraph must exist in the plugin README");
   const paragraph = match[0];
   assert.ok(PROVISION_LINK_DIRS.length > 0);
   for (const dir of PROVISION_LINK_DIRS) {
     assert.match(
       paragraph,
       new RegExp("`" + escapeRegExp(dir) + "`"),
-      `linked-dirs paragraph is missing ${dir}`
+      `provisioned-dirs paragraph is missing ${dir}`
     );
   }
 });

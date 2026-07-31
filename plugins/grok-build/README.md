@@ -28,17 +28,24 @@ What isolation **does not** guarantee:
 - **A worktree is not a sandbox.** The agent still runs with your permissions and can
   reach anything on the machine outside the repository. Isolation protects your *working
   tree*, not your filesystem.
-- **Heavyweight directories are linked, not copied.** `node_modules`, `.venv`, `venv`,
-  `target`, `vendor`, `.tox`, `__pypackages__`, `.next`, `.nuxt`, `.svelte-kit`,
-  `.turbo`, `.parcel-cache`, and Godot's import cache (`.godot`, `.import`) are
-  junctioned (Windows) or symlinked (POSIX) from your repo so the verify command can
-  run without redoing work the checkout deliberately reuses. **Writes through those
-  links reach your real directories.** For Godot's cache specifically, the run header
-  says so: **close the Godot editor before a run verifies**, or the editor and the
-  headless run are writing the same cache. To opt out, set `GROK_BUILD_LINK_GODOT_CACHE=0`
-  or put `{"provision": {"copy": true}}` in `.grok-build.json` — the worktree then gets a
-  private cold cache seeded with only the small state files, and the first verify
-  re-imports. `.godot/imported` is never copied; it is the multi-gigabyte part.
+- **Heavyweight directories are provisioned, not blindly linked.** Live-state dirs —
+  `node_modules`, `.venv`, `venv`, `target`, `.tox`, `__pypackages__`, `.next`,
+  `.nuxt`, `.svelte-kit`, `.turbo`, `.parcel-cache`, and Godot's import cache
+  (`.godot`, `.import`) — are **private to the worktree** (hardlink-seeded from
+  your checkout when the filesystem allows it, otherwise copied). `target` is not
+  copied at all: the run sets `CARGO_TARGET_DIR` to a worktree-private path under
+  `.grok-build/cargo-target`. Only read-mostly caches such as `vendor` are still
+  **linked, not copied** — junctioned (Windows) or symlinked (POSIX) — so
+  **writes through those shared links reach your real directories**. The run
+  header names every SHARED directory, and a post-run fingerprint fails the run
+  if a shared dir mutates. For Godot's cache the isolated default is private
+  (`GROK_BUILD_LINK_GODOT_CACHE=0` / `{"provision": {"copy": true}}`); set
+  `GROK_BUILD_LINK_GODOT_CACHE=1` or `{"provision": {"copy": false}}` to share,
+  and when shared **close the Godot editor before a run verifies**. Private
+  Godot caches are seeded with only the small state files — `.godot/imported` is never copied;
+  it is the multi-gigabyte part. Untracked runtime files (`.env`, `.env.local`,
+  `.npmrc`, `local_settings.py`, …) are **copied** into the worktree so verify
+  can run, and are excluded from the run commit.
 - **A worktree holds the only copy of unlanded work.** `/grok-build:prune` removes
   worktrees for finished runs. Land before you prune.
 - **A checkout needs room.** An isolated run refuses to start when the volume holding

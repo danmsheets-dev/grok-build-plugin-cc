@@ -80,6 +80,8 @@ import {
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   GODOT_CACHE_DIRS,
+  diffSharedFingerprints,
+  fingerprintSharedDirs,
   injectRuntimePlugin,
   planBlenderScriptSandbox,
   planWorktreeLinks,
@@ -2929,6 +2931,10 @@ async function executeTaskRun(request) {
   let godotCacheMode = null;
   /** Shared-cache path for the cross-process import lock; null when private. */
   let sharedGodotCachePath = null;
+  /** @type {Record<string, { exists: boolean, entryCount: number, maxMtimeMs: number }>|null} */
+  let sharedDirFingerprintsBefore = null;
+  /** Env vars provisioned for the worktree (e.g. CARGO_TARGET_DIR). */
+  let provisionEnv = null;
   /** @type {Map<string, string>|null} */
   let uidSnapshotBefore = null;
   /** @type {{ ok: boolean, notes: string[] }|null} */
@@ -2986,9 +2992,21 @@ async function executeTaskRun(request) {
     const plan = planWorktreeLinks(created.repoRoot, created.worktreePath, {
       // Only ever true/false when the project config said so; undefined lets
       // resolveGodotCacheMode fall through to env / the isolated private default.
-      copyGodotCache: request.provisionCopy
+      copyGodotCache: request.provisionCopy,
+      provisionFiles: request.provisionFiles,
+      dirPolicy: request.provisionLink,
+      linkDirs: request.linkDirs
     });
     godotCacheMode = plan.godotCache ?? null;
+    if (plan.env && Object.keys(plan.env).length > 0) {
+      provisionEnv = { ...plan.env };
+    }
+    // Fingerprint read-mostly SHARED dirs in the main checkout BEFORE the agent
+    // runs. Post-run comparison detects junction write-through that git status
+    // cannot see (gitignored caches).
+    if (Array.isArray(plan.sharedDirs) && plan.sharedDirs.length > 0) {
+      sharedDirFingerprintsBefore = fingerprintSharedDirs(created.repoRoot, plan.sharedDirs);
+    }
     // The result used to be discarded outright, so a link that failed - the
     // commonest being a `.godot` that is tracked in git and therefore already
     // checked out into the worktree - was invisible, and the run just got
@@ -3141,10 +3159,14 @@ async function executeTaskRun(request) {
     };
   }
 
-  // Layered so the sandbox is a DERIVED default and an explicit --env still
-  // wins: a user who typed BLENDER_USER_SCRIPTS themselves gets the value they
-  // typed.
-  const runEnv = buildRunEnvironment({ ...(blenderSandboxEnv ?? {}), ...envOverrides });
+  // Layered so the sandbox / cargo target dir are DERIVED defaults and an
+  // explicit --env still wins: a user who typed BLENDER_USER_SCRIPTS or
+  // CARGO_TARGET_DIR themselves gets the value they typed.
+  const runEnv = buildRunEnvironment({
+    ...(provisionEnv ?? {}),
+    ...(blenderSandboxEnv ?? {}),
+    ...envOverrides
+  });
 
   // Blender pre-flight: locked .blend files and version_min vs binary.
   if (runEcosystem?.id === "blender" && verifyCommands.length > 0) {
@@ -3816,8 +3838,8 @@ async function executeTaskRun(request) {
 
   // Breach detection: any path newly dirty in the MAIN checkout after an
   // isolated run means the agent wrote outside the worktree. artifact excludes
-  // (and thus junctioned node_modules/.godot/…) are already applied by
-  // porcelainChangeEntries, so provisioned link targets cannot false-positive.
+  // are applied by porcelainChangeEntries. Separately, shared (junctioned)
+  // read-mostly dirs are fingerprinted because git status never lists them.
   let mainTreeSide = null;
   if (created && mainDirtyBeforeRunPaths) {
     const mainAfter = porcelainChangeEntries(workspaceRoot);
@@ -3852,6 +3874,40 @@ async function executeTaskRun(request) {
           emptyReason: emptyChangeReason(workspaceRoot, mainDirtyBeforeRunPaths)
         };
       }
+    }
+  }
+
+  // Post-run assertion on SHARED (read-mostly) provision dirs in the main
+  // checkout. A mutation here is an isolation leak that git porcelain cannot
+  // see — fail the run loudly with the paths that changed.
+  if (created && sharedDirFingerprintsBefore) {
+    const sharedNames = Object.keys(sharedDirFingerprintsBefore);
+    const afterFp = fingerprintSharedDirs(workspaceRoot, sharedNames);
+    const changedShared = diffSharedFingerprints(sharedDirFingerprintsBefore, afterFp);
+    if (changedShared.length > 0) {
+      isolationBreached = true;
+      const sharedEntries = changedShared.map((name) => `M\t${name}/ (shared provision dir mutated in main checkout)`);
+      if (isolationLeak) {
+        isolationLeak = capChangedFiles([
+          ...(isolationLeak.entries ?? []),
+          ...sharedEntries
+        ]);
+      } else {
+        isolationLeak = capChangedFiles(sharedEntries);
+      }
+      if (!mainTreeSide || mainTreeSide.total === 0) {
+        mainTreeSide = {
+          ...isolationLeak,
+          emptyReason: null
+        };
+      }
+      const leakNote = `Isolation BREACHED: shared provision dir(s) mutated in the main checkout: ${changedShared.join(", ")}`;
+      request.onProgress?.({
+        message: leakNote,
+        phase: "finalizing"
+      });
+      provisionSummary = provisionSummary ?? { provisioned: [], failed: [], notes: [] };
+      provisionSummary.notes.push(leakNote);
     }
   }
 
@@ -4487,6 +4543,9 @@ function buildTaskRequest({
   verifyIgnorePatterns = [],
   noVerifyBaseline = false,
   provisionCopy = undefined,
+  provisionFiles = undefined,
+  provisionLink = undefined,
+  linkDirs = undefined,
   blenderSandbox = false,
   noBlenderSandbox = false,
   exportSmoke = false,
@@ -4533,6 +4592,11 @@ function buildTaskRequest({
     // still fall back to GROK_BUILD_LINK_GODOT_CACHE (and the isolated default
     // of a private cache).
     provisionCopy,
+    // Optional overrides for untracked runtime file copies and per-dir link
+    // policy (provision.files / provision.link / linkDirs in .grok-build.json).
+    provisionFiles,
+    provisionLink,
+    linkDirs,
     // Blender sandbox: explicit opt-in, explicit opt-out, or auto for isolated
     // add-on runs (resolved again in executeTaskRun against the descriptor).
     blenderSandbox,
@@ -4941,6 +5005,9 @@ async function handleTask(argv) {
   // only when the option is absent, so a default of false would silently
   // shadow the environment variable.
   const provisionCopy = settings.provision?.copy;
+  const provisionFiles = settings.provision?.files;
+  const provisionLink = settings.provision?.link;
+  const linkDirs = settings.linkDirs;
   const blenderSandbox = Boolean(options["blender-sandbox"]);
   const noBlenderSandbox = Boolean(options["no-blender-sandbox"]);
   // Merged key by key rather than resolved through resolveRunSettings, whose
@@ -4982,6 +5049,9 @@ async function handleTask(argv) {
         verifyIgnorePatterns,
         noVerifyBaseline,
         provisionCopy,
+        provisionFiles,
+        provisionLink,
+        linkDirs,
         blenderSandbox,
         noBlenderSandbox,
         exportSmoke,
@@ -5018,6 +5088,9 @@ async function handleTask(argv) {
         verifyIgnorePatterns,
         noVerifyBaseline,
         provisionCopy,
+        provisionFiles,
+        provisionLink,
+        linkDirs,
         blenderSandbox,
         noBlenderSandbox,
         exportSmoke,
@@ -5211,6 +5284,9 @@ async function handleNestRun(argv) {
       verifyIgnorePatterns: settings.verifyIgnorePatterns ?? [],
       noVerifyBaseline: Boolean(options["no-verify-baseline"]),
       provisionCopy: settings.provision?.copy,
+      provisionFiles: settings.provision?.files,
+      provisionLink: settings.provision?.link,
+      linkDirs: settings.linkDirs,
       blenderSandbox: Boolean(options["blender-sandbox"]),
       noBlenderSandbox: Boolean(options["no-blender-sandbox"]),
       exportSmoke,

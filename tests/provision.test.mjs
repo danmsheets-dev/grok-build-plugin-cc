@@ -5,14 +5,23 @@ import fs from "node:fs";
 
 import {
   BLENDER_SANDBOX_SCRIPTS_RELATIVE,
+  CARGO_TARGET_DIR_RELATIVE,
   GODOT_CACHE_DIRS,
   GODOT_SHARED_CACHE_NOTE,
+  PROVISION_COPY_FILES,
   PROVISION_COPY_PATHS,
+  PROVISION_DIR_POLICY,
   PROVISION_LINK_DIRS,
+  diffSharedFingerprints,
+  fingerprintDir,
+  fingerprintSharedDirs,
+  hardlinkSeedPathSync,
   injectRuntimePlugin,
   planBlenderScriptSandbox,
   planWorktreeLinks,
   provisionWorktree,
+  resolveDirPolicy,
+  sameVolume,
   shouldAutoBlenderSandbox
 } from "../plugins/grok-build/scripts/lib/provision.mjs";
 import { artifactExcludePathspecs } from "../plugins/grok-build/scripts/lib/worktree.mjs";
@@ -35,8 +44,10 @@ const realFs = {
   readdirSync: fs.readdirSync,
   copyFileSync: fs.copyFileSync,
   symlinkSync: fs.symlinkSync,
+  linkSync: fs.linkSync,
   writeFileSync: fs.writeFileSync,
-  readFileSync: fs.readFileSync
+  readFileSync: fs.readFileSync,
+  rmSync: fs.rmSync
 };
 
 describe("PROVISION_LINK_DIRS", () => {
@@ -70,19 +81,21 @@ describe("planWorktreeLinks", () => {
   });
 
   test("skips non-directory sources", () => {
-    const statSync = mock.method(fs, "statSync", () => ({ isDirectory: () => false }));
+    const statSync = mock.method(fs, "statSync", () => ({ isDirectory: () => false, isFile: () => false }));
+    // existsSync true for every path also makes Cargo.toml look present, so the
+    // cargo-target mkdir may still be planned; the assert is that no real dir
+    // was linked/seeded from a non-directory source.
     const plan = planWorktreeLinks("/repo", "/wt", { platform: "linux", existsSync: () => true, statSync });
     assertModule.ok(plan.notes.some(n => n.includes("not a directory")));
-    assertModule.deepStrictEqual(plan.links, []);
+    assertModule.ok(
+      !plan.links.some((l) => ["junction", "symlink", "hardlink-seed", "copy"].includes(l.kind)),
+      `non-directory sources must not be linked/seeded, got ${JSON.stringify(plan.links)}`
+    );
   });
 
-  test("uses junction on windows, symlink on linux", () => {
-    // Non-Godot dirs only: the isolated default treats .godot as a private
-    // copy, which would make kind assertions false for engine caches.
-    const existsSync = mock.method(fs, "existsSync", (p) => {
-      const s = String(p);
-      return s.endsWith("node_modules") || s.endsWith("target");
-    });
+  test("uses junction on windows, symlink on linux for share-tier dirs only", () => {
+    // vendor is the only default share-tier entry; live-state dirs are private.
+    const existsSync = mock.method(fs, "existsSync", (p) => String(p).endsWith("vendor"));
     const statSync = mock.method(fs, "statSync", () => ({ isDirectory: () => true }));
     const win = planWorktreeLinks("/repo", "/wt", { platform: "win32", existsSync, statSync });
     const lin = planWorktreeLinks("/repo", "/wt", { platform: "linux", existsSync, statSync });
@@ -95,13 +108,36 @@ describe("planWorktreeLinks", () => {
     }
   });
 
-  test("includes PROVISION_LINK_DIRS entries when they exist as directories", () => {
-    const existsSync = mock.method(fs, "existsSync", (p) => p.endsWith("node_modules") || p.endsWith("target"));
+  test("live-state dirs are private (hardlink-seed / env), not shared junctions", () => {
+    const existsSync = mock.method(fs, "existsSync", (p) => {
+      const s = String(p);
+      return s.endsWith("node_modules") || s.endsWith("target") || s.endsWith(".venv");
+    });
     const statSync = mock.method(fs, "statSync", () => ({ isDirectory: () => true }));
     const plan = planWorktreeLinks("/repo", "/wt", { platform: "linux", existsSync, statSync });
-    const names = plan.links.map(l => path.basename(l.from));
+    const nm = plan.links.find((l) => path.basename(l.from) === "node_modules");
+    assertModule.ok(nm, "node_modules must be planned");
+    assertModule.strictEqual(nm.kind, "hardlink-seed");
+    assertModule.ok(!plan.links.some((l) => path.basename(l.from) === ".venv" && (l.kind === "symlink" || l.kind === "junction")));
+    const venv = plan.links.find((l) => path.basename(l.from) === ".venv");
+    assertModule.ok(venv);
+    assertModule.strictEqual(venv.kind, "hardlink-seed");
+    // target uses CARGO_TARGET_DIR, not a link into main target/
+    assertModule.ok(plan.env.CARGO_TARGET_DIR);
+    assertModule.ok(String(plan.env.CARGO_TARGET_DIR).includes(CARGO_TARGET_DIR_RELATIVE.replace(/\//g, path.sep)) ||
+      String(plan.env.CARGO_TARGET_DIR).includes("cargo-target"));
+    assertModule.ok(plan.privateDirs.includes("target"));
+    assertModule.ok(plan.privateDirs.includes("node_modules"));
+    assertModule.ok(!plan.sharedDirs.includes("node_modules"));
+  });
+
+  test("includes PROVISION_LINK_DIRS entries when they exist as directories", () => {
+    const existsSync = mock.method(fs, "existsSync", (p) => p.endsWith("node_modules") || p.endsWith("vendor"));
+    const statSync = mock.method(fs, "statSync", () => ({ isDirectory: () => true }));
+    const plan = planWorktreeLinks("/repo", "/wt", { platform: "linux", existsSync, statSync });
+    const names = plan.links.map((l) => path.basename(l.from === l.to ? l.to : l.from));
     assertModule.ok(names.includes("node_modules"));
-    assertModule.ok(names.includes("target"));
+    assertModule.ok(names.includes("vendor"));
   });
 });
 
@@ -258,7 +294,11 @@ describe("Godot import cache tier", () => {
     assertModule.ok(!plan.links.some((link) => link.kind === "junction"), "no .godot junction");
     assertModule.ok(names.includes("uid_cache.bin"), `expected a seeded uid_cache.bin, got ${names}`);
     for (const link of plan.links) {
-      assertModule.strictEqual(link.kind, "copy");
+      // Private seed uses hardlink-seed (falls back to copy on EXDEV).
+      assertModule.ok(
+        link.kind === "hardlink-seed" || link.kind === "copy",
+        `unexpected kind ${link.kind}`
+      );
     }
     assertModule.ok(
       plan.notes.some((note) => /private to this run|not shared|seeded/i.test(note)),
@@ -522,3 +562,224 @@ describe("PROVISION_LINK_DIRS ecosystem coverage", () => {
     }
   });
 });
+
+describe("PROVISION_DIR_POLICY classification", () => {
+  test("classifies live-state dirs as copy/env and vendor as share", () => {
+    assertModule.strictEqual(PROVISION_DIR_POLICY.node_modules, "copy");
+    assertModule.strictEqual(PROVISION_DIR_POLICY[".venv"], "copy");
+    assertModule.strictEqual(PROVISION_DIR_POLICY.venv, "copy");
+    assertModule.strictEqual(PROVISION_DIR_POLICY.target, "env");
+    assertModule.strictEqual(PROVISION_DIR_POLICY[".godot"], "copy");
+    assertModule.strictEqual(PROVISION_DIR_POLICY[".import"], "copy");
+    assertModule.strictEqual(PROVISION_DIR_POLICY.vendor, "share");
+    for (const name of PROVISION_LINK_DIRS) {
+      assertModule.ok(
+        Object.prototype.hasOwnProperty.call(PROVISION_DIR_POLICY, name),
+        `missing policy for ${name}`
+      );
+    }
+  });
+
+  test("resolveDirPolicy honours overrides and Godot share opt-in", () => {
+    assertModule.strictEqual(resolveDirPolicy("node_modules", { env: {} }), "copy");
+    assertModule.strictEqual(
+      resolveDirPolicy("node_modules", { dirPolicy: { node_modules: "share" }, env: {} }),
+      "share"
+    );
+    assertModule.strictEqual(resolveDirPolicy(".godot", { env: {} }), "copy");
+    assertModule.strictEqual(
+      resolveDirPolicy(".godot", { env: { GROK_BUILD_LINK_GODOT_CACHE: "1" } }),
+      "share"
+    );
+  });
+});
+
+describe("sameVolume and hardlink-seed fallback", () => {
+  test("sameVolume is true for two paths on the same root", () => {
+    const a = path.join(process.cwd(), "a");
+    const b = path.join(process.cwd(), "b");
+    assertModule.equal(sameVolume(a, b, { platform: process.platform, statSync: realFs.statSync }), true);
+  });
+
+  test("sameVolume is false across Windows drive letters", () => {
+    assertModule.equal(
+      sameVolume("C:\\repo\\node_modules", "D:\\wt\\node_modules", { platform: "win32" }),
+      false
+    );
+  });
+
+  test("hardlinkSeedPathSync hardlinks on same volume and isolates writes", () => {
+    const repo = makeTempDir("grok-seed-repo-");
+    const wt = makeTempDir("grok-seed-wt-");
+    const from = path.join(repo, "node_modules");
+    const to = path.join(wt, "node_modules");
+    realFs.mkdirSync(path.join(from, "pkg"), { recursive: true });
+    realFs.writeFileSync(path.join(from, "pkg", "index.js"), "module.exports=1\n");
+
+    const seed = hardlinkSeedPathSync(from, to, realFs);
+    assertModule.ok(seed.mode === "hardlink" || seed.mode === "copy", seed.detail);
+    assertModule.equal(realFs.readFileSync(path.join(to, "pkg", "index.js"), "utf8"), "module.exports=1\n");
+
+    // New file in the worktree must not appear in the main checkout when we
+    // seeded (hardlink shares file content but not directory entries).
+    realFs.writeFileSync(path.join(to, "pkg", "new-from-run.js"), "x\n");
+    assertModule.ok(
+      !realFs.existsSync(path.join(from, "pkg", "new-from-run.js")),
+      "new files in a private seed must not appear in the main tree"
+    );
+  });
+
+  test("hardlinkSeedPathSync falls back to copy when linkSync throws EXDEV", () => {
+    const repo = makeTempDir("grok-exdev-repo-");
+    const wt = makeTempDir("grok-exdev-wt-");
+    const from = path.join(repo, "file.txt");
+    const to = path.join(wt, "file.txt");
+    realFs.writeFileSync(from, "payload\n");
+
+    const result = hardlinkSeedPathSync(from, to, {
+      ...realFs,
+      linkSync: () => {
+        const err = new Error("cross-device link not permitted");
+        /** @type {NodeJS.ErrnoException} */ (err).code = "EXDEV";
+        throw err;
+      }
+    });
+    assertModule.strictEqual(result.mode, "copy");
+    assertModule.match(String(result.detail), /EXDEV|cross-volume|copied/i);
+    assertModule.equal(realFs.readFileSync(to, "utf8"), "payload\n");
+  });
+});
+
+describe("runtime file provisioning", () => {
+  test("PROVISION_COPY_FILES lists dotenv and local settings", () => {
+    for (const name of [".env", ".env.local", ".npmrc", "local_settings.py", "secrets.json"]) {
+      assertModule.ok(PROVISION_COPY_FILES.includes(name), `missing ${name}`);
+    }
+  });
+
+  test("planWorktreeLinks copies runtime files that exist at the repo root", () => {
+    const existsSync = (p) => {
+      const s = String(p).replace(/\\/g, "/");
+      return s.endsWith("/.env") || s.endsWith("/local_settings.py");
+    };
+    const statSync = () => ({ isDirectory: () => false, isFile: () => true });
+    const plan = planWorktreeLinks("/repo", "/wt", {
+      platform: "linux",
+      existsSync,
+      statSync,
+      env: {}
+    });
+    const envLink = plan.links.find((l) => path.basename(l.from) === ".env");
+    assertModule.ok(envLink, `expected .env copy, got ${JSON.stringify(plan.links)}`);
+    assertModule.strictEqual(envLink.kind, "copy");
+    assertModule.ok(plan.notes.some((n) => /Runtime files copied/i.test(n) && n.includes(".env")));
+  });
+
+  test("provisionWorktree materialises a copied .env without linking", () => {
+    const repo = makeTempDir("grok-dotenv-repo-");
+    const wt = makeTempDir("grok-dotenv-wt-");
+    realFs.writeFileSync(path.join(repo, ".env"), "SECRET=do-not-leak\n");
+    realFs.writeFileSync(path.join(repo, ".npmrc"), "//registry.npmjs.org/:_authToken=x\n");
+
+    const plan = planWorktreeLinks(repo, wt, {
+      existsSync: realFs.existsSync,
+      statSync: realFs.statSync,
+      env: {}
+    });
+    const result = provisionWorktree(plan, realFs);
+    assertModule.deepStrictEqual(result.failed, []);
+    assertModule.equal(realFs.readFileSync(path.join(wt, ".env"), "utf8"), "SECRET=do-not-leak\n");
+    assertModule.equal(
+      realFs.readFileSync(path.join(wt, ".npmrc"), "utf8"),
+      "//registry.npmjs.org/:_authToken=x\n"
+    );
+    // Mutating the worktree copy must not touch main.
+    realFs.writeFileSync(path.join(wt, ".env"), "SECRET=mutated\n");
+    assertModule.equal(realFs.readFileSync(path.join(repo, ".env"), "utf8"), "SECRET=do-not-leak\n");
+  });
+
+  test("artifact excludes cover provisioned runtime files", () => {
+    const specs = artifactExcludePathspecs();
+    for (const name of PROVISION_COPY_FILES) {
+      assertModule.ok(
+        specs.some((s) => s.includes(name)),
+        `exclude list missing ${name}: ${specs.filter((s) => s.includes("env") || s.includes("npmrc")).join(",")}`
+      );
+    }
+  });
+});
+
+describe("shared-dir fingerprint post-run assertion", () => {
+  test("fingerprintDir reports entry count and max mtime", () => {
+    const dir = makeTempDir("grok-fp-");
+    realFs.writeFileSync(path.join(dir, "a.txt"), "a");
+    realFs.writeFileSync(path.join(dir, "b.txt"), "b");
+    const fp = fingerprintDir(dir, realFs);
+    assertModule.equal(fp.exists, true);
+    assertModule.equal(fp.entryCount, 2);
+    assertModule.ok(fp.maxMtimeMs > 0);
+  });
+
+  test("diffSharedFingerprints detects mutation of a shared dir", () => {
+    const repo = makeTempDir("grok-fp-repo-");
+    const vendor = path.join(repo, "vendor");
+    realFs.mkdirSync(vendor, { recursive: true });
+    realFs.writeFileSync(path.join(vendor, "pkg.go"), "package pkg\n");
+
+    const before = fingerprintSharedDirs(repo, ["vendor"], realFs);
+    realFs.writeFileSync(path.join(vendor, "new.go"), "package pkg\n");
+    // Ensure mtime advances on filesystems with coarse resolution.
+    const afterStat = realFs.statSync(path.join(vendor, "new.go"));
+    assertModule.ok(afterStat);
+    const after = fingerprintSharedDirs(repo, ["vendor"], realFs);
+    const changed = diffSharedFingerprints(before, after);
+    assertModule.deepStrictEqual(changed, ["vendor"]);
+  });
+
+  test("diffSharedFingerprints is empty when nothing changed", () => {
+    const before = { vendor: { exists: true, entryCount: 1, maxMtimeMs: 100 } };
+    const after = { vendor: { exists: true, entryCount: 1, maxMtimeMs: 100 } };
+    assertModule.deepStrictEqual(diffSharedFingerprints(before, after), []);
+  });
+
+  test("planWorktreeLinks records vendor as shared and notes it", () => {
+    const existsSync = (p) => String(p).endsWith("vendor");
+    const plan = planWorktreeLinks("/repo", "/wt", {
+      platform: "linux",
+      existsSync,
+      statSync: () => ({ isDirectory: () => true }),
+      env: {}
+    });
+    assertModule.deepStrictEqual(plan.sharedDirs, ["vendor"]);
+    assertModule.ok(plan.notes.some((n) => /Shared \(read-mostly\)/i.test(n) && n.includes("vendor")));
+  });
+});
+
+describe("private node_modules does not write through", () => {
+  test("hardlink-seeded node_modules keeps main checkout untouched by new files", () => {
+    const repo = makeTempDir("grok-nm-repo-");
+    const wt = makeTempDir("grok-nm-wt-");
+    realFs.mkdirSync(path.join(repo, "node_modules", "left-pad"), { recursive: true });
+    realFs.writeFileSync(path.join(repo, "node_modules", "left-pad", "index.js"), "module.exports=0\n");
+
+    const plan = planWorktreeLinks(repo, wt, {
+      existsSync: realFs.existsSync,
+      statSync: realFs.statSync,
+      env: {}
+    });
+    const result = provisionWorktree(plan, realFs);
+    assertModule.ok(
+      result.provisioned.some((e) => path.basename(e.to) === "node_modules"),
+      JSON.stringify(result)
+    );
+    assertModule.ok(!result.provisioned.some((e) => e.kind === "junction" || e.kind === "symlink"));
+
+    realFs.mkdirSync(path.join(wt, "node_modules", "evil"), { recursive: true });
+    realFs.writeFileSync(path.join(wt, "node_modules", "evil", "pwn.js"), "owned\n");
+    assertModule.ok(
+      !realFs.existsSync(path.join(repo, "node_modules", "evil")),
+      "install into private node_modules must not create packages in the main checkout"
+    );
+  });
+});
+

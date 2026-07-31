@@ -5,14 +5,15 @@ import { fileURLToPath } from "node:url";
 
 import { detectEcosystems } from "./ecosystem.mjs";
 
-// Heavyweight directories linked from the source repo into a fresh worktree
-// so the first verify command does not fail for lack of dependencies. Covers
-// the five target ecosystems: Godot's import cache (.godot for Godot 4,
-// .import for Godot 3 - without this, a fresh worktree re-imports every
-// asset from scratch on the first headless run), Rust (target), Python
-// (.venv/venv, plus .tox for tox environments and __pypackages__ for PDM),
-// JS/web (node_modules, plus framework build caches that speed up or are
-// required for a working dev/build command), and generic vendor dirs.
+// Heavyweight directories that may be provisioned into a fresh worktree so the
+// first verify command does not fail for lack of dependencies. Covers the five
+// target ecosystems: Godot's import cache (.godot for Godot 4, .import for
+// Godot 3), Rust (target), Python (.venv/venv, .tox, __pypackages__), JS/web
+// (node_modules + framework build caches), and generic vendor dirs.
+//
+// Classification into *share* vs *live-state* is PROVISION_DIR_POLICY below.
+// Live-state dirs are private to the worktree (hardlink-seeded when possible);
+// only read-mostly caches are junctioned/symlinked into the main checkout.
 export const PROVISION_LINK_DIRS = Object.freeze([
   "node_modules",
   ".venv",
@@ -31,10 +32,45 @@ export const PROVISION_LINK_DIRS = Object.freeze([
 ]);
 
 /**
- * Godot's asset import caches, the two entries in PROVISION_LINK_DIRS that are
- * LIVE STATE rather than read-mostly dependencies: an editor open on the user's
- * working copy writes into them while a headless verify run reads through the
- * junction.
+ * Per-directory isolation policy.
+ *
+ * - `share` — read-mostly; junction (win32) / symlink (posix) from main checkout.
+ *   Post-run fingerprint assertion detects mutation of the main tree.
+ * - `copy` — live state; private worktree directory, seeded by hardlink (same
+ *   volume) or file copy (cross-volume / hardlink failure).
+ * - `env` — do not materialise the main tree's dir; set an env var instead
+ *   (CARGO_TARGET_DIR for `target`).
+ * - `none` — skip entirely.
+ *
+ * Godot caches are `copy` by default under isolation; resolveGodotCacheMode can
+ * flip them back to `share` via env / project config.
+ */
+export const PROVISION_DIR_POLICY = Object.freeze({
+  // Live state: installers, build systems, and editable envs mutate these and
+  // embed absolute paths. Junctioning them was observed to corrupt the main
+  // cargo target/ and rewrite the user's real venv (see WP-B2).
+  node_modules: "copy",
+  ".venv": "copy",
+  venv: "copy",
+  target: "env",
+  ".godot": "copy",
+  ".import": "copy",
+  ".tox": "copy",
+  __pypackages__: "copy",
+  ".next": "copy",
+  ".nuxt": "copy",
+  ".svelte-kit": "copy",
+  ".turbo": "copy",
+  ".parcel-cache": "copy",
+  // Read-mostly vendored dependencies (e.g. Go vendor/). Still fingerprinted
+  // after the run so a write-through cannot stay invisible.
+  vendor: "share"
+});
+
+/**
+ * Godot's asset import caches — LIVE STATE. Kept as a named set so the
+ * private/share mode switch (resolveGodotCacheMode) and partial seed paths
+ * (PROVISION_COPY_PATHS) stay explicit.
  */
 export const GODOT_CACHE_DIRS = Object.freeze([".godot", ".import"]);
 
@@ -53,6 +89,31 @@ export const PROVISION_COPY_PATHS = Object.freeze([
   ".godot/extension_list.cfg",
   ".import"
 ]);
+
+/**
+ * Untracked runtime files copied (never linked) into the worktree so verify
+ * can actually run. `git worktree add` only materialises tracked content, so
+ * `.env`, registry auth, and local Django settings are otherwise absent —
+ * producing baseline-red → post-agent-red → false "verified".
+ *
+ * Values are never written into the run record; only the file *names* appear
+ * in provision notes. Each name is also in NEVER_COMMIT_PATTERNS so a commit
+ * cannot pick them up.
+ */
+export const PROVISION_COPY_FILES = Object.freeze([
+  ".env",
+  ".env.local",
+  ".env.development",
+  ".env.test",
+  ".npmrc",
+  ".yarnrc.yml",
+  "local_settings.py",
+  "settings_local.py",
+  "secrets.json"
+]);
+
+/** Relative path of the per-worktree cargo target dir (under WORKTREE_SCRATCH_DIR). */
+export const CARGO_TARGET_DIR_RELATIVE = ".grok-build/cargo-target";
 
 const LINK_GODOT_CACHE_ENV = "GROK_BUILD_LINK_GODOT_CACHE";
 const INJECT_RUNTIME_ENV = "GROK_BUILD_INJECT_RUNTIME";
@@ -125,10 +186,224 @@ export function resolveGodotCacheMode(options = {}, env = process.env) {
   return { private: privateCache, reason, cacheLine };
 }
 
-function godotCacheIsCopied(options, env) {
-  return resolveGodotCacheMode(options, env).private;
+/**
+ * Resolve the effective policy for one provision directory name.
+ *
+ * @param {string} name
+ * @param {{
+ *   copyGodotCache?: boolean,
+ *   dirPolicy?: Record<string, string>,
+ *   env?: NodeJS.ProcessEnv
+ * }} [options]
+ * @returns {"share"|"copy"|"env"|"none"}
+ */
+export function resolveDirPolicy(name, options = {}) {
+  const overrides = options.dirPolicy && typeof options.dirPolicy === "object" ? options.dirPolicy : {};
+  if (Object.prototype.hasOwnProperty.call(overrides, name)) {
+    const raw = String(overrides[name] ?? "")
+      .trim()
+      .toLowerCase();
+    if (raw === "share" || raw === "copy" || raw === "env" || raw === "none") {
+      return raw;
+    }
+  }
+
+  if (GODOT_CACHE_DIRS.includes(name)) {
+    // Godot keeps its private/share switch; the generic table says "copy" but
+    // an explicit shared-cache opt-in must still produce a junction/symlink.
+    return resolveGodotCacheMode(options, options.env ?? process.env).private ? "copy" : "share";
+  }
+
+  const defaultPolicy = PROVISION_DIR_POLICY[name] ?? "share";
+  return defaultPolicy;
 }
 
+/**
+ * True when two absolute paths live on the same volume (hardlink-capable).
+ *
+ * Windows: compare drive roots (`C:\` vs `D:\`). POSIX: compare `stat.st_dev`.
+ * When the check itself fails, return false so callers fall back to copy rather
+ * than attempting a cross-device hardlink that throws EXDEV.
+ *
+ * @param {string} a
+ * @param {string} b
+ * @param {{
+ *   platform?: string,
+ *   statSync?: typeof fs.statSync
+ * }} [options]
+ */
+export function sameVolume(a, b, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const statSync = options.statSync ?? fs.statSync;
+  const left = path.resolve(String(a ?? ""));
+  const right = path.resolve(String(b ?? ""));
+  if (!left || !right) {
+    return false;
+  }
+
+  if (platform === "win32") {
+    const rootA = path.parse(left).root.toLowerCase();
+    const rootB = path.parse(right).root.toLowerCase();
+    return Boolean(rootA) && rootA === rootB;
+  }
+
+  try {
+    const sa = statSync(left);
+    const sb = statSync(right);
+    if (typeof sa.dev === "number" && typeof sb.dev === "number") {
+      return sa.dev === sb.dev;
+    }
+  } catch {
+    return false;
+  }
+  // Parent of `to` may not exist yet; compare against dirname chain of `from`.
+  try {
+    const sa = statSync(left);
+    let probe = path.dirname(right);
+    for (let i = 0; i < 8; i += 1) {
+      try {
+        const sb = statSync(probe);
+        if (typeof sa.dev === "number" && typeof sb.dev === "number") {
+          return sa.dev === sb.dev;
+        }
+      } catch {
+        // walk up
+      }
+      const parent = path.dirname(probe);
+      if (parent === probe) {
+        break;
+      }
+      probe = parent;
+    }
+  } catch {
+    return false;
+  }
+  return false;
+}
+
+/**
+ * Fingerprint a shared (junctioned) directory in the MAIN checkout so a
+ * post-run assertion can detect mutation that git status cannot see
+ * (gitignored build caches).
+ *
+ * Shape: top-level entry count + max mtimeMs of those entries. Cheap, and
+ * enough to catch `npm install` / `cargo build` / editor writes.
+ *
+ * @param {string} dirPath absolute path in the main checkout
+ * @param {{
+ *   existsSync?: typeof fs.existsSync,
+ *   readdirSync?: typeof fs.readdirSync,
+ *   statSync?: typeof fs.statSync
+ * }} [options]
+ * @returns {{ exists: boolean, entryCount: number, maxMtimeMs: number }}
+ */
+export function fingerprintDir(dirPath, options = {}) {
+  const existsSync = options.existsSync ?? fs.existsSync;
+  const readdirSync = options.readdirSync ?? fs.readdirSync;
+  const statSync = options.statSync ?? fs.statSync;
+
+  if (!dirPath || !existsSync(dirPath)) {
+    return { exists: false, entryCount: 0, maxMtimeMs: 0 };
+  }
+
+  let names;
+  try {
+    names = readdirSync(dirPath);
+  } catch {
+    return { exists: true, entryCount: -1, maxMtimeMs: 0 };
+  }
+
+  let maxMtimeMs = 0;
+  try {
+    const self = statSync(dirPath);
+    if (Number.isFinite(self.mtimeMs)) {
+      maxMtimeMs = self.mtimeMs;
+    }
+  } catch {
+    // ignore
+  }
+
+  for (const name of names) {
+    try {
+      const st = statSync(path.join(dirPath, name));
+      if (Number.isFinite(st.mtimeMs) && st.mtimeMs > maxMtimeMs) {
+        maxMtimeMs = st.mtimeMs;
+      }
+    } catch {
+      // skip unreadable entries
+    }
+  }
+
+  return { exists: true, entryCount: names.length, maxMtimeMs };
+}
+
+/**
+ * Snapshot fingerprints for every shared directory name under repoRoot.
+ *
+ * @param {string} repoRoot
+ * @param {string[]} sharedNames basenames (e.g. ["vendor"])
+ * @param {object} [options] passed to fingerprintDir
+ * @returns {Record<string, { exists: boolean, entryCount: number, maxMtimeMs: number }>}
+ */
+export function fingerprintSharedDirs(repoRoot, sharedNames, options = {}) {
+  const root = path.resolve(String(repoRoot ?? ""));
+  const out = {};
+  for (const name of sharedNames ?? []) {
+    if (!name) {
+      continue;
+    }
+    out[name] = fingerprintDir(path.join(root, name), options);
+  }
+  return out;
+}
+
+/**
+ * Compare before/after fingerprints of shared dirs in the main checkout.
+ *
+ * @param {Record<string, { exists: boolean, entryCount: number, maxMtimeMs: number }>} before
+ * @param {Record<string, { exists: boolean, entryCount: number, maxMtimeMs: number }>} after
+ * @returns {string[]} basenames that changed
+ */
+export function diffSharedFingerprints(before, after) {
+  const names = new Set([
+    ...Object.keys(before ?? {}),
+    ...Object.keys(after ?? {})
+  ]);
+  const changed = [];
+  for (const name of names) {
+    const a = before?.[name];
+    const b = after?.[name];
+    if (!a && !b) {
+      continue;
+    }
+    if (!a || !b) {
+      changed.push(name);
+      continue;
+    }
+    if (
+      a.exists !== b.exists ||
+      a.entryCount !== b.entryCount ||
+      a.maxMtimeMs !== b.maxMtimeMs
+    ) {
+      changed.push(name);
+    }
+  }
+  return changed;
+}
+
+/**
+ * Plan provision links/copies/env for an isolated worktree.
+ *
+ * @returns {{
+ *   links: Array<{from: string, to: string, kind: string, name?: string}>,
+ *   notes: string[],
+ *   godotCache: { private: boolean, reason: string, cacheLine: string },
+ *   env: Record<string, string>,
+ *   sharedDirs: string[],
+ *   privateDirs: string[],
+ *   policy: Record<string, string>
+ * }}
+ */
 export function planWorktreeLinks(repoRoot, worktreePath, options = {}) {
   const platform = options.platform ?? process.platform;
   const existsSync = options.existsSync ?? fs.existsSync;
@@ -136,27 +411,82 @@ export function planWorktreeLinks(repoRoot, worktreePath, options = {}) {
   // The sole production caller passes no options at all, so the default has to
   // be the real environment rather than an empty object.
   const env = options.env ?? process.env;
-  const kind = platform === "win32" ? "junction" : "symlink";
+  const shareKind = platform === "win32" ? "junction" : "symlink";
   const cacheMode = resolveGodotCacheMode(options, env);
-  const copyGodotCache = cacheMode.private;
 
   const root = path.resolve(String(repoRoot ?? ""));
   const wt = path.resolve(String(worktreePath ?? ""));
 
   const links = [];
   const notes = [];
+  /** @type {Record<string, string>} */
+  const planEnv = {};
+  const sharedDirs = [];
+  const privateDirs = [];
+  /** @type {Record<string, string>} */
+  const policy = {};
 
   if (!repoRoot || !worktreePath) {
     notes.push("planWorktreeLinks: repoRoot and worktreePath are required");
-    return { links, notes, godotCache: cacheMode };
+    return {
+      links,
+      notes,
+      godotCache: cacheMode,
+      env: planEnv,
+      sharedDirs,
+      privateDirs,
+      policy
+    };
+  }
+
+  // Extra dirs from project config (`linkDirs`) are treated as share-tier
+  // additions when not already in the built-in list.
+  const extraLinkDirs = Array.isArray(options.linkDirs)
+    ? options.linkDirs.map((d) => String(d ?? "").trim()).filter(Boolean)
+    : [];
+  const dirNames = [...PROVISION_LINK_DIRS];
+  for (const name of extraLinkDirs) {
+    if (!dirNames.includes(name)) {
+      dirNames.push(name);
+    }
   }
 
   let linkedGodotCache = false;
   let sawGodotCacheSource = false;
+  let sharedNonGodot = [];
 
-  for (const name of PROVISION_LINK_DIRS) {
+  for (const name of dirNames) {
     const from = path.join(root, name);
     const to = path.join(wt, name);
+    const tier = resolveDirPolicy(name, { ...options, env });
+    policy[name] = tier;
+
+    if (tier === "none") {
+      continue;
+    }
+
+    if (tier === "env" && name === "target") {
+      // Idiomatic cargo isolation: point CARGO_TARGET_DIR at a worktree-private
+      // directory rather than copying multi-GB target/ trees (and rather than
+      // junctioning, which was observed to leave absolute worktree paths in the
+      // main checkout's build-script output after the worktree was deleted).
+      // Only emit when the project looks like Rust (target/ or Cargo.toml), so
+      // non-Rust repos do not get a spurious cargo-target note.
+      const hasCargoToml = existsSync(path.join(root, "Cargo.toml"));
+      if (!existsSync(from) && !hasCargoToml) {
+        continue;
+      }
+      const cargoTarget = path.join(wt, ...CARGO_TARGET_DIR_RELATIVE.split("/"));
+      planEnv.CARGO_TARGET_DIR = cargoTarget;
+      privateDirs.push(name);
+      notes.push(
+        `target: private via CARGO_TARGET_DIR=${CARGO_TARGET_DIR_RELATIVE} (main checkout target/ is not linked)`
+      );
+      // Materialise an empty dir so cargo never has to create the parent alone;
+      // kind "mkdir" is handled by provisionWorktree without reading a source.
+      links.push({ from: cargoTarget, to: cargoTarget, kind: "mkdir", name: "cargo-target" });
+      continue;
+    }
 
     if (!existsSync(from)) {
       continue;
@@ -179,21 +509,30 @@ export function planWorktreeLinks(repoRoot, worktreePath, options = {}) {
       sawGodotCacheSource = true;
     }
 
-    if (copyGodotCache && GODOT_CACHE_DIRS.includes(name)) {
-      // No entry in `links` for the directory itself. A `kind` provisionWorktree
-      // does not recognise lands in its `unknown kind:` failure branch and would
-      // be reported as a provisioning FAILURE, so a deliberate skip has to be
-      // absent from links entirely and explained in notes instead.
+    if (tier === "share") {
+      links.push({ from, to, kind: shareKind, name });
+      sharedDirs.push(name);
+      if (GODOT_CACHE_DIRS.includes(name)) {
+        linkedGodotCache = true;
+      } else {
+        sharedNonGodot.push(name);
+      }
       continue;
     }
 
-    links.push({ from, to, kind });
+    // tier === "copy" (private). Godot keeps its partial seed; everything else
+    // hardlink-seeds the whole tree.
     if (GODOT_CACHE_DIRS.includes(name)) {
-      linkedGodotCache = true;
+      // No entry for the directory itself — partial seed via PROVISION_COPY_PATHS.
+      privateDirs.push(name);
+      continue;
     }
+
+    links.push({ from, to, kind: "hardlink-seed", name });
+    privateDirs.push(name);
   }
 
-  if (copyGodotCache && sawGodotCacheSource) {
+  if (cacheMode.private && sawGodotCacheSource) {
     const copied = [];
     for (const relativePath of PROVISION_COPY_PATHS) {
       const segments = relativePath.split("/");
@@ -202,11 +541,12 @@ export function planWorktreeLinks(repoRoot, worktreePath, options = {}) {
       if (!existsSync(from)) {
         continue;
       }
-      links.push({ from, to, kind: "copy" });
+      // Godot seed: hardlink-seed when same volume, else plain copy. Marked
+      // "hardlink-seed" so provisionWorktree uses the volume-aware path; for
+      // single files EXDEV falls back to copyFileSync automatically.
+      links.push({ from, to, kind: "hardlink-seed", name: path.basename(relativePath) });
       copied.push(relativePath);
     }
-    // Visible, single-line choice. The cold-import warning is part of the same
-    // sentence so wall-clock on the first verify is explained up front.
     notes.push(cacheMode.cacheLine);
     notes.push(
       copied.length > 0
@@ -218,7 +558,58 @@ export function planWorktreeLinks(repoRoot, worktreePath, options = {}) {
     notes.push(GODOT_SHARED_CACHE_NOTE);
   }
 
-  return { links, notes, godotCache: cacheMode };
+  if (sharedNonGodot.length > 0) {
+    notes.push(
+      `Shared (read-mostly) directories — writes reach your working copy: ${sharedNonGodot.join(", ")}`
+    );
+  }
+  if (privateDirs.filter((d) => !GODOT_CACHE_DIRS.includes(d) && d !== "target").length > 0) {
+    const seeded = privateDirs.filter((d) => !GODOT_CACHE_DIRS.includes(d) && d !== "target");
+    notes.push(
+      `Private (live-state) directories — hardlink-seeded into this worktree: ${seeded.join(", ")}`
+    );
+  }
+
+  // Runtime files: copy, never link. When the project supplies provision.files,
+  // that list is authoritative; otherwise use the built-in PROVISION_COPY_FILES.
+  const fileNames = Array.isArray(options.provisionFiles)
+    ? options.provisionFiles.map((f) => String(f ?? "").trim()).filter(Boolean)
+    : [...PROVISION_COPY_FILES];
+
+  const copiedFiles = [];
+  for (const name of fileNames) {
+    const from = path.join(root, name);
+    const to = path.join(wt, name);
+    if (!existsSync(from)) {
+      continue;
+    }
+    let stat;
+    try {
+      stat = statSync(from);
+    } catch {
+      notes.push(`skip file ${name}: cannot stat source`);
+      continue;
+    }
+    if (typeof stat.isFile !== "function" || !stat.isFile()) {
+      notes.push(`skip file ${name}: source is not a file`);
+      continue;
+    }
+    links.push({ from, to, kind: "copy", name });
+    copiedFiles.push(name);
+  }
+  if (copiedFiles.length > 0) {
+    notes.push(`Runtime files copied into worktree (never linked): ${copiedFiles.join(", ")}`);
+  }
+
+  return {
+    links,
+    notes,
+    godotCache: cacheMode,
+    env: planEnv,
+    sharedDirs,
+    privateDirs,
+    policy
+  };
 }
 
 /**
@@ -424,15 +815,146 @@ function copyPathSync(from, to, io) {
   }
 }
 
+/**
+ * Seed `to` from `from` using hardlinks when both paths are on the same volume,
+ * falling back to ordinary copy on EXDEV / cross-volume / link failure.
+ *
+ * Never silent: returns a mode string the caller can put in notes.
+ *
+ * @returns {{ mode: "hardlink"|"copy"|"empty"|"failed", detail?: string }}
+ */
+export function hardlinkSeedPathSync(from, to, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const io = {
+    statSync: options.statSync ?? fs.statSync,
+    readdirSync: options.readdirSync ?? fs.readdirSync,
+    copyFileSync: options.copyFileSync ?? fs.copyFileSync,
+    mkdirSync: options.mkdirSync ?? fs.mkdirSync,
+    linkSync: options.linkSync ?? fs.linkSync,
+    existsSync: options.existsSync ?? fs.existsSync
+  };
+
+  let stat;
+  try {
+    stat = io.statSync(from);
+  } catch (error) {
+    return {
+      mode: "failed",
+      detail: error instanceof Error ? error.message : String(error)
+    };
+  }
+
+  const preferHardlink =
+    options.forceCopy === true
+      ? false
+      : sameVolume(from, path.dirname(to), { platform, statSync: io.statSync }) ||
+        sameVolume(from, to, { platform, statSync: io.statSync });
+
+  if (!stat.isDirectory()) {
+    io.mkdirSync(path.dirname(to), { recursive: true });
+    if (preferHardlink) {
+      try {
+        io.linkSync(from, to);
+        return { mode: "hardlink" };
+      } catch (error) {
+        const code = /** @type {NodeJS.ErrnoException} */ (error).code;
+        // EXDEV = cross-device; EPERM/EACCES often mean the FS disallows hardlinks.
+        // Fall through to copy and report.
+        try {
+          io.copyFileSync(from, to);
+          return {
+            mode: "copy",
+            detail:
+              code === "EXDEV"
+                ? "cross-volume hardlink failed (EXDEV); copied instead"
+                : `hardlink failed (${code ?? (error instanceof Error ? error.message : String(error))}); copied instead`
+          };
+        } catch (copyError) {
+          return {
+            mode: "failed",
+            detail: copyError instanceof Error ? copyError.message : String(copyError)
+          };
+        }
+      }
+    }
+    try {
+      io.copyFileSync(from, to);
+      return {
+        mode: "copy",
+        detail: preferHardlink ? undefined : "cross-volume or hardlink unavailable; copied"
+      };
+    } catch (copyError) {
+      return {
+        mode: "failed",
+        detail: copyError instanceof Error ? copyError.message : String(copyError)
+      };
+    }
+  }
+
+  // Directory: create root, recurse.
+  try {
+    io.mkdirSync(to, { recursive: true });
+  } catch (error) {
+    return {
+      mode: "failed",
+      detail: error instanceof Error ? error.message : String(error)
+    };
+  }
+
+  let names;
+  try {
+    names = io.readdirSync(from);
+  } catch (error) {
+    return {
+      mode: "failed",
+      detail: error instanceof Error ? error.message : String(error)
+    };
+  }
+
+  let usedHardlink = false;
+  let usedCopy = false;
+  let lastDetail;
+
+  for (const name of names) {
+    const child = hardlinkSeedPathSync(path.join(from, name), path.join(to, name), {
+      ...options,
+      forceCopy: !preferHardlink
+    });
+    if (child.mode === "hardlink") {
+      usedHardlink = true;
+    } else if (child.mode === "copy") {
+      usedCopy = true;
+      if (child.detail) {
+        lastDetail = child.detail;
+      }
+    } else if (child.mode === "failed") {
+      return child;
+    }
+  }
+
+  if (usedHardlink && !usedCopy) {
+    return { mode: "hardlink" };
+  }
+  if (usedCopy || usedHardlink) {
+    return { mode: usedHardlink ? "hardlink" : "copy", detail: lastDetail };
+  }
+  // Empty source directory.
+  return { mode: "hardlink" };
+}
+
 export function provisionWorktree(plan, options = {}) {
   const symlinkSync = options.symlinkSync ?? fs.symlinkSync;
   const mkdirSync = options.mkdirSync ?? fs.mkdirSync;
   const existsSync = options.existsSync ?? fs.existsSync;
+  const linkSync = options.linkSync ?? fs.linkSync;
+  const platform = options.platform ?? process.platform;
   const copyIo = {
     statSync: options.statSync ?? fs.statSync,
     readdirSync: options.readdirSync ?? fs.readdirSync,
     copyFileSync: options.copyFileSync ?? fs.copyFileSync,
-    mkdirSync
+    mkdirSync,
+    linkSync,
+    existsSync
   };
 
   const provisioned = [];
@@ -444,6 +966,21 @@ export function provisionWorktree(plan, options = {}) {
   for (const link of links) {
     if (!link.from || !link.to) {
       failed.push({ ...link, reason: "missing from/to" });
+      continue;
+    }
+
+    if (link.kind === "mkdir") {
+      try {
+        mkdirSync(link.to, { recursive: true });
+        provisioned.push({ from: link.from, to: link.to, kind: "mkdir", name: link.name });
+      } catch (error) {
+        failed.push({
+          from: link.from,
+          to: link.to,
+          kind: link.kind,
+          reason: error instanceof Error ? error.message : String(error)
+        });
+      }
       continue;
     }
 
@@ -465,18 +1002,54 @@ export function provisionWorktree(plan, options = {}) {
 
       if (link.kind === "junction") {
         symlinkSync(link.from, link.to, "junction");
+        provisioned.push({ from: link.from, to: link.to, kind: link.kind, name: link.name });
       } else if (link.kind === "symlink") {
         symlinkSync(link.from, link.to, "dir");
+        provisioned.push({ from: link.from, to: link.to, kind: link.kind, name: link.name });
       } else if (link.kind === "copy") {
-        // A copied entry is a private, cold cache: nothing the run writes into
-        // it reaches the user's working copy, which is the entire point of the
-        // opt-out.
+        // A copied entry is a private, cold cache / runtime file: nothing the
+        // run writes into it reaches the user's working copy.
         copyPathSync(link.from, link.to, copyIo);
+        provisioned.push({ from: link.from, to: link.to, kind: link.kind, name: link.name });
+      } else if (link.kind === "hardlink-seed") {
+        const seed = hardlinkSeedPathSync(link.from, link.to, {
+          platform,
+          ...copyIo
+        });
+        if (seed.mode === "failed") {
+          // Never silently degrade: empty dir + loud note so the run header
+          // shows the seed failed and cold-install is expected.
+          try {
+            mkdirSync(link.to, { recursive: true });
+          } catch {
+            // ignore
+          }
+          const label = link.name || path.basename(link.to);
+          notes.push(
+            `Seed FAILED for ${label}: ${seed.detail ?? "unknown error"}; worktree has an empty private directory (cold install expected)`
+          );
+          failed.push({
+            from: link.from,
+            to: link.to,
+            kind: link.kind,
+            reason: seed.detail ?? "seed failed"
+          });
+          continue;
+        }
+        if (seed.mode === "copy" && seed.detail) {
+          notes.push(`Seed for ${link.name || path.basename(link.to)}: ${seed.detail}`);
+        }
+        provisioned.push({
+          from: link.from,
+          to: link.to,
+          kind: seed.mode === "hardlink" ? "hardlink-seed" : "copy",
+          name: link.name,
+          seedMode: seed.mode
+        });
       } else {
         failed.push({ ...link, reason: `unknown kind: ${link.kind}` });
         continue;
       }
-      provisioned.push({ from: link.from, to: link.to, kind: link.kind });
     } catch (error) {
       failed.push({ from: link.from, to: link.to, kind: link.kind, reason: error.message });
     }
@@ -493,7 +1066,10 @@ export function provisionWorktree(plan, options = {}) {
   return {
     provisioned,
     failed,
-    notes: godotLinked ? notes : notes.filter((note) => note !== GODOT_SHARED_CACHE_NOTE)
+    notes: godotLinked ? notes : notes.filter((note) => note !== GODOT_SHARED_CACHE_NOTE),
+    env: plan?.env && typeof plan.env === "object" ? { ...plan.env } : {},
+    sharedDirs: Array.isArray(plan?.sharedDirs) ? [...plan.sharedDirs] : [],
+    privateDirs: Array.isArray(plan?.privateDirs) ? [...plan.privateDirs] : []
   };
 }
 

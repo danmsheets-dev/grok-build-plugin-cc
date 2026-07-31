@@ -150,19 +150,53 @@ function normalizeTools(raw) {
 }
 
 /**
- * `provision` only carries the import-cache tier today.
+ * `provision` controls how heavyweight dirs/files land in an isolated worktree.
  *
  * `copy: true` is the opt-out from sharing Godot's `.godot`/`.import` with the
  * working copy - the same switch as GROK_BUILD_LINK_GODOT_CACHE=0, expressed
- * per project. Deliberately NOT an executable key: it changes which files are
- * copied into a worktree, and executes nothing.
+ * per project.
+ *
+ * `files` is an optional list of untracked runtime file basenames to copy
+ * (never link) into the worktree; when omitted the built-in PROVISION_COPY_FILES
+ * list is used. `link` is an optional per-directory map of
+ * `"share" | "copy" | "env" | "none"` overrides for PROVISION_DIR_POLICY.
+ *
+ * Deliberately NOT an executable key: it changes which files are copied into a
+ * worktree, and executes nothing.
  */
 function normalizeProvision(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
     return undefined;
   }
+  const out = {};
   const copy = normalizeBoolean(raw.copy);
-  return copy === undefined ? undefined : { copy };
+  if (copy !== undefined) {
+    out.copy = copy;
+  }
+  const files = normalizeStringArray(raw.files);
+  if (files !== undefined) {
+    out.files = files;
+  }
+  if (raw.link && typeof raw.link === "object" && !Array.isArray(raw.link)) {
+    /** @type {Record<string, string>} */
+    const link = {};
+    for (const [key, value] of Object.entries(raw.link)) {
+      const name = String(key ?? "").trim();
+      const tier = String(value ?? "")
+        .trim()
+        .toLowerCase();
+      if (!name) {
+        continue;
+      }
+      if (tier === "share" || tier === "copy" || tier === "env" || tier === "none") {
+        link[name] = tier;
+      }
+    }
+    if (Object.keys(link).length > 0) {
+      out.link = link;
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 /**
@@ -186,7 +220,10 @@ const SCHEMA = Object.freeze({
   verifyIgnorePatterns: { normalize: normalizeStringArray, expected: "an array of regex strings" },
   isolate: { normalize: normalizeBoolean, expected: "true or false" },
   linkDirs: { normalize: normalizeStringArray, expected: "an array of directory names" },
-  provision: { normalize: normalizeProvision, expected: "an object with a boolean copy" },
+  provision: {
+    normalize: normalizeProvision,
+    expected: "an object with optional copy (boolean), files (string[]), link (per-dir share|copy|env|none)"
+  },
   // Opt-in Godot headless export smoke when export_presets.cfg exists. Never
   // an executable key: it only adds a default verify command shape, and the
   // bridge still resolves the binary literally.

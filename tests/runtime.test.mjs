@@ -1715,10 +1715,12 @@ test("a project config can trade the shared Godot cache for a private copy", () 
 
   assert.equal(result.status, 0, result.stderr || result.stdout);
   const payload = JSON.parse(result.stdout);
-  const copied = payload.provision.provisioned.filter((entry) => entry.kind === "copy");
+  const seeded = payload.provision.provisioned.filter(
+    (entry) => entry.kind === "copy" || entry.kind === "hardlink-seed"
+  );
   assert.ok(
-    copied.some((entry) => entry.name === "uid_cache.bin"),
-    `expected a copied uid_cache.bin, got ${JSON.stringify(payload.provision)}`
+    seeded.some((entry) => entry.name === "uid_cache.bin"),
+    `expected a seeded uid_cache.bin, got ${JSON.stringify(payload.provision)}`
   );
   assert.ok(
     !payload.provision.provisioned.some((entry) => entry.name === ".godot"),

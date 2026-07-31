@@ -106,7 +106,28 @@ const GENERATED_ARTIFACT_PATTERNS = Object.freeze([
  * `export_presets.cfg` itself is deliberately NOT listed: it is normal,
  * already-tracked project source in the user's repository.
  */
-const NEVER_COMMIT_PATTERNS = Object.freeze(["export_credentials.cfg"]);
+/**
+ * Secrets and untracked runtime files that provision.mjs may copy into a
+ * worktree so verify can run (`.env`, registry auth, local Django settings).
+ * They must never be committed onto a run branch — land would otherwise push
+ * machine-local credentials into the user's real history.
+ *
+ * Keep in sync with PROVISION_COPY_FILES in provision.mjs (the commit gate is
+ * pathspec-based and cannot import that module without a cycle risk through
+ * git helpers, so the names are duplicated deliberately).
+ */
+const NEVER_COMMIT_PATTERNS = Object.freeze([
+  "export_credentials.cfg",
+  ".env",
+  ".env.local",
+  ".env.development",
+  ".env.test",
+  ".npmrc",
+  ".yarnrc.yml",
+  "local_settings.py",
+  "settings_local.py",
+  "secrets.json"
+]);
 
 /**
  * Unaccounted debris the agent left behind — not committed work, not a
@@ -476,10 +497,14 @@ export function createWorktree({
  *
  * Confirmed empirically: `git worktree remove --force` on Windows follows a
  * junction it encounters while deleting the tree and destroys the CONTENTS of
- * whatever it points at. lib/provision.mjs links node_modules/.venv/target etc.
- * straight from the user's real repository, so tearing down a worktree that
- * still contains those links wiped the real directories in a reproduction
- * (empty node_modules/ survived; node_modules/pkg/marker.txt inside it did not).
+ * whatever it points at. lib/provision.mjs still junctions *read-mostly* dirs
+ * (e.g. vendor/) from the user's real repository, and Blender sandbox links
+ * live inside the worktree — so tearing down a worktree that still contains
+ * those links wiped the real directories in a reproduction (empty
+ * node_modules/ survived; node_modules/pkg/marker.txt inside it did not).
+ * Live-state dirs (node_modules, .venv, target, …) are private copies now,
+ * but the unlink-first order remains mandatory for every remaining reparse
+ * point.
  *
  * The only safe order is: unlink every reparse point first, so by the time git
  * (or the fs.rmSync fallback below) walks the tree, there is nothing left to
@@ -690,12 +715,12 @@ function formatGitFailure(operation, result) {
 /**
  * Exclude pathspecs for every symlink/junction sitting at the worktree root.
  *
- * `provisionWorktree` links heavyweight directories straight out of the user's
- * real repository (`PROVISION_LINK_DIRS`), and three of them — `.venv`, `venv`
- * and `vendor` — are deliberately absent from GENERATED_ARTIFACT_PATTERNS,
- * because Go projects commit `vendor/` on purpose and no name-based list can
- * know which is which. Without this, `git add -A -- . <excludes>` stages the
- * user's entire real `.venv` THROUGH the junction on every isolated Python run.
+ * `provisionWorktree` may still junction *read-mostly* directories (e.g.
+ * `vendor/`) out of the user's real repository. Live-state dirs are private
+ * now, but any remaining reparse point at the worktree root must not be
+ * staged: without this, `git add -A -- . <excludes>` stages the user's entire
+ * real tree THROUGH the junction. `vendor/` is deliberately absent from
+ * GENERATED_ARTIFACT_PATTERNS because Go projects commit it on purpose.
  *
  * So do it by observation instead of by name: whatever is a link is not this
  * run's work. Node reports Windows junctions as symbolic links via
