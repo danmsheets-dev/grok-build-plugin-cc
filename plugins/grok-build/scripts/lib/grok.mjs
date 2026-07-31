@@ -1113,8 +1113,21 @@ export function runHeadlessAgent(cwd, options = {}) {
         stopReason: result?.stopReason ?? null,
         // null when the stream never proved it speaks tools - not the same as 0.
         toolCallCount: result?.toolCallCount ?? null,
-        resolvedModel: result?.usage?.resolvedModel ?? null,
+        toolCallCountFloor: result?.toolCallCountFloor ?? null,
+        toolVisibility: result?.toolVisibility ?? null,
+        toolActivity: result?.toolActivity ?? [],
+        resolvedModel: result?.usage?.resolvedModel ?? result?.modelResolved ?? null,
         unknownEventTypes: result?.unknownTypes ?? [],
+        // Stream-channel honesty: error / confine / denials must reach the run
+        // record rather than being dropped after unrecognized-type counting.
+        streamErrors: result?.errors ?? [],
+        confineViolations: result?.confineViolations ?? [],
+        toolDenials: result?.toolDenials ?? [],
+        compaction: result?.compaction ?? [],
+        maxTurnsReached: Boolean(result?.maxTurnsReached),
+        start: result?.start ?? null,
+        streamSchemaVersion: result?.streamSchemaVersion ?? null,
+        filesChangedFromStream: result?.filesChanged ?? null,
         // False only when a streaming run's events were all unrecognized, i.e.
         // when the four text fields above are raw stdout rather than a parsed
         // transcript. The renderer says so out loud rather than passing off

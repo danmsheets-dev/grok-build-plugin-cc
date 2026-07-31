@@ -157,6 +157,67 @@ function formatCompactTokenCount(value) {
 }
 
 /**
+ * Format cost for display. Never print $0.00 for an unknown/partial cost —
+ * Hyper withholds untrustworthy totals and sets costIsPartial / usageIsIncomplete.
+ *
+ * @param {object} usage
+ * @param {{ compact?: boolean }} [options]
+ * @returns {string|null}
+ */
+export function formatCostLabel(usage, options = {}) {
+  if (!usage || typeof usage !== "object") {
+    return null;
+  }
+  const incomplete = Boolean(usage.usageIsIncomplete);
+  const partial = Boolean(usage.costIsPartial);
+  const hasCost = usage.costUsd != null && Number.isFinite(Number(usage.costUsd));
+  if (incomplete || partial) {
+    if (hasCost && partial && !incomplete) {
+      const digits = options.compact ? 2 : 4;
+      return `$${Number(usage.costUsd).toFixed(digits)} (partial)`;
+    }
+    return "cost: unavailable (partial)";
+  }
+  if (!hasCost) {
+    // Tokens present but cost withheld without flags — still not free.
+    if (
+      Number(usage.inputTokens) > 0 ||
+      Number(usage.outputTokens) > 0 ||
+      Number(usage.totalTokens) > 0 ||
+      Number(usage.modelCalls) > 0
+    ) {
+      return "cost: unavailable";
+    }
+    return null;
+  }
+  // Genuine $0.00 is rare but allowed only when a finite number was reported.
+  const digits = options.compact ? 2 : 4;
+  return `$${Number(usage.costUsd).toFixed(digits)}`;
+}
+
+/**
+ * Human label for toolCallCount. Null means the CLI stream carries no tool
+ * events — not "unknown" as a soft synonym for zero.
+ *
+ * @param {number|null|undefined} toolCallCount
+ * @param {{ toolVisibility?: string|null, toolCallCountFloor?: number|null }} [options]
+ */
+export function formatToolCallsLabel(toolCallCount, options = {}) {
+  if (toolCallCount != null && Number.isFinite(Number(toolCallCount))) {
+    return String(Number(toolCallCount));
+  }
+  const visibility = options.toolVisibility ?? "unavailable";
+  if (visibility === "unavailable" || visibility == null) {
+    const floor = options.toolCallCountFloor;
+    if (floor != null && Number.isFinite(Number(floor)) && Number(floor) > 0) {
+      return `not reported by this CLI (≥${Number(floor)} from files changed)`;
+    }
+    return "not reported by this CLI";
+  }
+  return "unknown";
+}
+
+/**
  * @param {object|null|undefined} usage
  * @param {{ model?: string|null, resolvedModel?: string|null, compact?: boolean }} [options]
  */
@@ -170,6 +231,8 @@ export function formatUsageLine(usage, options = {}) {
     ? `${formatCount(usage.inputTokens)} in (${formatCount(cached)} cached)`
     : `${formatCount(usage.inputTokens)} in`;
 
+  const costLabel = formatCostLabel(usage, { compact: Boolean(options.compact) });
+
   // Compact form leads with inference-call count when present (BRIDGE-5): the
   // field that made Luna look cheap on the rate card and expensive per asset.
   const parts = [];
@@ -182,8 +245,8 @@ export function formatUsageLine(usage, options = {}) {
       const turns = Number(usage.numTurns);
       parts.push(`${turns} ${turns === 1 ? "turn" : "turns"}`);
     }
-    if (usage.costUsd != null && Number.isFinite(Number(usage.costUsd))) {
-      parts.push(`$${Number(usage.costUsd).toFixed(2)}`);
+    if (costLabel) {
+      parts.push(costLabel);
     }
     const requested = options.model ?? usage.model ?? null;
     const served = options.resolvedModel ?? usage.resolvedModel ?? null;
@@ -210,8 +273,8 @@ export function formatUsageLine(usage, options = {}) {
     const turns = Number(usage.numTurns);
     parts.push(`${turns} ${turns === 1 ? "turn" : "turns"}`);
   }
-  if (usage.costUsd != null && Number.isFinite(Number(usage.costUsd))) {
-    parts.push(`$${Number(usage.costUsd).toFixed(4)}`);
+  if (costLabel) {
+    parts.push(costLabel);
   }
   const requested = options.model ?? usage.model ?? null;
   const served = options.resolvedModel ?? usage.resolvedModel ?? null;
@@ -297,6 +360,8 @@ export function formatUsageTotals(jobs) {
   let cachedInputTokens = 0;
   let outputTokens = 0;
   let costUsd = 0;
+  let sawCost = false;
+  let costPartial = false;
 
   for (const job of jobs) {
     const usage = job?.usage;
@@ -307,8 +372,12 @@ export function formatUsageTotals(jobs) {
     inputTokens += Number(usage.inputTokens ?? 0) || 0;
     cachedInputTokens += Number(usage.cachedInputTokens ?? 0) || 0;
     outputTokens += Number(usage.outputTokens ?? 0) || 0;
+    if (usage.costIsPartial || usage.usageIsIncomplete) {
+      costPartial = true;
+    }
     if (usage.costUsd != null && Number.isFinite(Number(usage.costUsd))) {
       costUsd += Number(usage.costUsd);
+      sawCost = true;
     }
   }
 
@@ -321,7 +390,18 @@ export function formatUsageTotals(jobs) {
       ? `${formatTokenCount(inputTokens)} in (${formatTokenCount(cachedInputTokens)} cached)`
       : `${formatTokenCount(inputTokens)} in`;
 
-  return `Session totals: ${runs} runs - ${inputPart} / ${formatTokenCount(outputTokens)} out - $${costUsd.toFixed(4)}`;
+  let costPart;
+  if (costPartial && !sawCost) {
+    costPart = "cost: unavailable (partial)";
+  } else if (costPartial && sawCost) {
+    costPart = `$${costUsd.toFixed(4)} (partial)`;
+  } else if (sawCost) {
+    costPart = `$${costUsd.toFixed(4)}`;
+  } else {
+    costPart = "cost: unavailable";
+  }
+
+  return `Session totals: ${runs} runs - ${inputPart} / ${formatTokenCount(outputTokens)} out - ${costPart}`;
 }
 
 /** Alias for session-total callers; same implementation as formatUsageTotals. */
@@ -826,12 +906,18 @@ const VERIFIED_NA_STATUSES = new Set([
   "isolation-breached"
 ]);
 
-function verifiedNaLine(status, stopReason) {
+function verifiedNaLine(status, stopReason, meta = {}) {
   if (status === "completed-noop") {
     return "Verified: n/a - the run changed no files, so verification proves nothing.";
   }
   if (status === "completed-blind") {
-    return "Verified: n/a - the agent completed no successful tool calls; treat this run as blind.";
+    // Genuine zero only (decideCompletionStatus never maps null → blind).
+    // Phrase as a stream observation, not an unsupported claim about the agent
+    // when the CLI simply never put tool events on the wire.
+    if (meta.toolVisibility === "unavailable" || meta.toolCallCount == null) {
+      return "Verified: n/a - tool calls were not reported by this CLI; treat tool activity as unobserved.";
+    }
+    return "Verified: n/a - the stream reported zero tool calls; treat this run as blind.";
   }
   if (status === "completed-truncated") {
     const reason = stopReason && String(stopReason).trim() ? String(stopReason).trim() : "early stop";
@@ -843,10 +929,66 @@ function verifiedNaLine(status, stopReason) {
   return null;
 }
 
+/**
+ * Push stream-channel diagnostics: errors, confine violations, denials,
+ * compaction, unknown event types. These must reach the human trailer and
+ * the run manifest — Hyper emits them for harness honesty.
+ */
+function pushStreamChannelLines(lines, meta = {}) {
+  const streamErrors = Array.isArray(meta.streamErrors)
+    ? meta.streamErrors
+    : Array.isArray(meta.errors)
+      ? meta.errors
+      : [];
+  for (const err of streamErrors) {
+    const message = typeof err === "string" ? err : err?.message;
+    if (message) {
+      lines.push(`Stream error: ${message}`);
+    }
+  }
+
+  const violations = Array.isArray(meta.confineViolations) ? meta.confineViolations : [];
+  if (violations.length > 0) {
+    lines.push(
+      `Confine violation${violations.length === 1 ? "" : "s"}: the agent attempted ${violations.length} path(s) outside the confine root (CLI blocked; treat isolation as breached).`
+    );
+    for (const v of violations.slice(0, 20)) {
+      const tool = v.tool ? `tool=${v.tool}` : "tool=?";
+      const path = v.resolvedPath || v.path || "?";
+      const root = v.root ? ` root=${v.root}` : "";
+      lines.push(`  ${tool} path=${path}${root}`);
+    }
+    if (violations.length > 20) {
+      lines.push(`  … truncated (${violations.length} total)`);
+    }
+  }
+
+  const denials = Array.isArray(meta.toolDenials) ? meta.toolDenials : [];
+  if (denials.length > 0) {
+    lines.push(`Tool denials: ${denials.length}`);
+    for (const d of denials.slice(0, 10)) {
+      const tool = d.tool ?? "?";
+      const reason = d.reason ? ` (${d.reason})` : "";
+      lines.push(`  ${tool}${reason}`);
+    }
+  }
+
+  if (meta.maxTurnsReached) {
+    lines.push("Max turns reached: the CLI stopped the run at the turn budget.");
+  }
+
+  const compaction = Array.isArray(meta.compaction) ? meta.compaction : [];
+  if (compaction.length > 0) {
+    const phases = compaction.map((c) => c.phase || c.type).filter(Boolean);
+    lines.push(`Context compaction: ${phases.join(", ") || compaction.length + " event(s)"}`);
+  }
+}
+
 export function buildTaskStatusLines(meta = {}, rawOutput = "") {
   const lines = [];
 
   pushVerifyPlanLines(lines, meta);
+  pushStreamChannelLines(lines, meta);
 
   // The baseline probe runs for every verify run now, not just isolated write
   // runs, so on a non-isolated run it is a full extra verify pass. Reporting
@@ -900,7 +1042,7 @@ export function buildTaskStatusLines(meta = {}, rawOutput = "") {
   }
 
   const naLine = VERIFIED_NA_STATUSES.has(meta.status)
-    ? verifiedNaLine(meta.status, meta.stopReason)
+    ? verifiedNaLine(meta.status, meta.stopReason, meta)
     : null;
   if (naLine) {
     // Never render Verified: yes for noop/blind/truncated - even when the
@@ -949,8 +1091,10 @@ export function buildTaskStatusLines(meta = {}, rawOutput = "") {
       : Number.isFinite(Number(meta.durationMs))
         ? Math.round(Number(meta.durationMs) / 1000)
         : null;
-    const tools =
-      meta.toolCallCount == null ? "unknown" : String(meta.toolCallCount);
+    const tools = formatToolCallsLabel(meta.toolCallCount, {
+      toolVisibility: meta.toolVisibility,
+      toolCallCountFloor: meta.toolCallCountFloor
+    });
     const secLabel = seconds != null ? `${seconds}s` : "under the floor";
     lines.push(
       `Implausibly short: this write run finished in ${secLabel} having changed nothing and made ${tools} tool calls — treat the result as suspect.`
@@ -973,8 +1117,15 @@ export function buildTaskStatusLines(meta = {}, rawOutput = "") {
     // The status stays terminal and stays loud anyway. A false positive costs
     // one look at the list below; a missed breach costs the thing this whole
     // mechanism exists to prevent. Do not soften it into a warning.
+    //
+    // Confine violations (CLI-blocked escapes) also force isolationBreached —
+    // those are agent attempts, not a dirty-set guess.
+    const fromConfine =
+      Array.isArray(meta.confineViolations) && meta.confineViolations.length > 0;
     lines.push(
-      "Isolation BREACHED: the main checkout changed while this run was in flight, so work may be in the wrong tree and is not verified."
+      fromConfine
+        ? "Isolation BREACHED: the CLI reported confine violation(s) and/or the main checkout changed while this run was in flight; work may be in the wrong tree and is not verified."
+        : "Isolation BREACHED: the main checkout changed while this run was in flight, so work may be in the wrong tree and is not verified."
     );
     const leaked = meta.isolationLeak?.entries ?? meta.isolationLeak?.paths ?? null;
     if (Array.isArray(leaked) && leaked.length > 0) {
@@ -1008,7 +1159,11 @@ export function buildTaskStatusLines(meta = {}, rawOutput = "") {
     }
   }
 
-  if (meta.budgetStopped) {
+  if (meta.budgetStopped === "max-cost-unenforceable") {
+    lines.push(
+      "Budget: --max-cost was set but cost was incomplete/partial, so the cap could not be enforced (unknown spend is not treated as $0)."
+    );
+  } else if (meta.budgetStopped) {
     lines.push(`Budget: run stopped early (${meta.budgetStopped}).`);
   }
 
@@ -1235,7 +1390,14 @@ export function buildBridgeResultBlock(job = {}, storedJob = null) {
         : String(changedFileCount);
 
   const toolCallCount = record.toolCallCount ?? record.result?.toolCallCount ?? null;
-  const toolCallsLabel = toolCallCount == null ? "unknown" : String(toolCallCount);
+  const toolVisibility =
+    record.toolVisibility ?? record.result?.toolVisibility ?? null;
+  const toolCallCountFloor =
+    record.toolCallCountFloor ?? record.result?.toolCallCountFloor ?? null;
+  const toolCallsLabel = formatToolCallsLabel(toolCallCount, {
+    toolVisibility,
+    toolCallCountFloor
+  });
 
   const usage = record.usage ?? record.result?.usage ?? null;
   const usageLine =
@@ -1260,7 +1422,7 @@ export function buildBridgeResultBlock(job = {}, storedJob = null) {
         .join("; ");
     }
   } else if (VERIFIED_NA_STATUSES.has(status)) {
-    verifyLabel = verifiedNaLine(status, stopReason) ?? "n/a";
+    verifyLabel = verifiedNaLine(status, stopReason, record) ?? "n/a";
   }
 
   const logFile = record.logFile ?? null;
@@ -1288,6 +1450,70 @@ function appendBridgeResult(output, job, storedJob) {
   return `${base}\n${buildBridgeResultBlock(job, storedJob)}\n`;
 }
 
+/**
+ * Strip a leading copy of `answer` from a full rendered result so show can
+ * compose report + status trailer without duplicating the answer block.
+ * Falls back to returning the rendered text as-is when no clean strip is possible.
+ */
+export function extractStatusTrailerFromRendered(rendered, answer) {
+  const full = String(rendered ?? "");
+  if (!full.trim()) {
+    return "";
+  }
+  const answerText = String(answer ?? "").trim();
+  if (!answerText) {
+    // No separate answer — whole rendered body is the trailer (minus bridge block if any).
+    return stripBridgeResultBlock(full).trimEnd();
+  }
+  const stripped = stripBridgeResultBlock(full);
+  // Prefer exact prefix strip (renderTaskResult: base + "\n" + statusLines).
+  const normalizedAnswer = answerText.endsWith("\n") ? answerText : `${answerText}\n`;
+  if (stripped.startsWith(normalizedAnswer)) {
+    return stripped.slice(normalizedAnswer.length).replace(/^\n+/, "").trimEnd();
+  }
+  // Final-report case: answer may be only the report body while rendered has it
+  // embedded mid-string. Locate the answer and take the suffix after it.
+  const idx = stripped.indexOf(answerText);
+  if (idx >= 0) {
+    const after = stripped.slice(idx + answerText.length).replace(/^\n+/, "").trimEnd();
+    // Only use the suffix when it looks like status lines (not the whole body again).
+    if (after && after.length < stripped.length) {
+      return after;
+    }
+  }
+  // Last resort: if stored statusLines exist they are preferred by the caller;
+  // returning empty avoids dumping a duplicate answer as "trailer".
+  return "";
+}
+
+function stripBridgeResultBlock(text) {
+  return String(text ?? "").replace(
+    /\n*===BRIDGE-RESULT===[\s\S]*?===END-BRIDGE-RESULT===\n*/g,
+    "\n"
+  );
+}
+
+/**
+ * Resolve the status trailer for `show`: prefer explicitly stored statusLines
+ * (no string surgery), else derive from the stored rendered body.
+ */
+export function resolveStoredStatusTrailer(storedJob, answer) {
+  const fromResult = storedJob?.result?.statusLines;
+  if (Array.isArray(fromResult) && fromResult.length > 0) {
+    return fromResult.join("\n").trimEnd();
+  }
+  if (typeof storedJob?.statusLines === "string" && storedJob.statusLines.trim()) {
+    return storedJob.statusLines.trimEnd();
+  }
+  if (Array.isArray(storedJob?.statusLines) && storedJob.statusLines.length > 0) {
+    return storedJob.statusLines.join("\n").trimEnd();
+  }
+  if (typeof storedJob?.rendered === "string" && storedJob.rendered.trim()) {
+    return extractStatusTrailerFromRendered(storedJob.rendered, answer);
+  }
+  return "";
+}
+
 export function renderStoredJobResult(job, storedJob) {
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
   const resumeCommand = threadId ? `grok -r ${threadId}` : null;
@@ -1299,28 +1525,38 @@ export function renderStoredJobResult(job, storedJob) {
     return appendBridgeResult(withSession, job, storedJob);
   }
 
-  // The delimited report first when the model honoured the contract, because
-  // that is the answer the run was asked for. `lastMessage` is deliberately NOT
-  // in this chain: preferring a bare trailing line over the stored rawOutput
-  // would make /grok-build:show print LESS than it does today. `grok.stdout`
-  // stays last so stored *review* jobs, whose payload has no rawOutput at all,
-  // render exactly as before.
+  // Compose rather than choose, in three parts:
+  //   1. the answer the run was asked for,
+  //   2. the verify-fix history, clearly labelled (FIELD-2), so a fix-turn
+  //      report can never masquerade as the deliverable,
+  //   3. the bridge status trailer foreground runs print (changed files,
+  //      verify markers, isolation, …), so `show` after a background run is
+  //      never strictly poorer than a foreground run.
   //
-  // FIELD-2: task result FIRST, then clearly labelled fix-turn history so a
-  // verify-fix report never masquerades as the deliverable.
-  const rawOutput =
+  // `lastMessage` is deliberately NOT in the answer chain: preferring a bare
+  // trailing line over the stored rawOutput would make /grok-build:show print
+  // LESS than it does today. `grok.stdout` stays last so stored *review* jobs,
+  // whose payload has no rawOutput at all, render exactly as before.
+  const answer =
     (typeof storedJob?.result?.finalReport === "string" && storedJob.result.finalReport) ||
     (typeof storedJob?.result?.rawOutput === "string" && storedJob.result.rawOutput) ||
     (typeof storedJob?.result?.grok?.stdout === "string" && storedJob.result.grok.stdout) ||
     "";
+
   const fixAttempts =
     storedJob?.result?.verify?.fixAttempts ??
     storedJob?.verify?.fixAttempts ??
     null;
-  if (rawOutput || (Array.isArray(fixAttempts) && fixAttempts.length > 0)) {
-    let output = rawOutput ? (rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`) : "";
-    if (Array.isArray(fixAttempts) && fixAttempts.length > 0) {
-      const fixLines = ["", "--- Verify fix history (not the task deliverable) ---"];
+  const hasFixAttempts = Array.isArray(fixAttempts) && fixAttempts.length > 0;
+  const trailer = resolveStoredStatusTrailer(storedJob, answer);
+
+  if (answer || hasFixAttempts || trailer) {
+    const parts = [];
+    if (answer) {
+      parts.push(answer.endsWith("\n") ? answer.trimEnd() : answer);
+    }
+    if (hasFixAttempts) {
+      const fixLines = ["--- Verify fix history (not the task deliverable) ---"];
       for (const entry of fixAttempts) {
         fixLines.push(
           `Fix attempt ${entry.attempt ?? "?"}${entry.command ? ` for \`${entry.command}\`` : ""}:`
@@ -1332,15 +1568,16 @@ export function renderStoredJobResult(job, storedJob) {
         fixLines.push(body.endsWith("\n") ? body.trimEnd() : body);
         fixLines.push("");
       }
-      output = `${output}${fixLines.join("\n")}`;
-      if (!output.endsWith("\n")) {
-        output += "\n";
-      }
+      parts.push(fixLines.join("\n").trimEnd());
     }
-    const withSession = threadId
-      ? `${output}\nGrok session ID: ${threadId}\nResume in Grok: ${resumeCommand}\n`
-      : output;
-    return appendBridgeResult(withSession, job, storedJob);
+    if (trailer) {
+      parts.push(trailer.endsWith("\n") ? trailer.trimEnd() : trailer);
+    }
+    let output = `${parts.join("\n\n")}\n`;
+    if (threadId) {
+      output = `${output}\nGrok session ID: ${threadId}\nResume in Grok: ${resumeCommand}\n`;
+    }
+    return appendBridgeResult(output, job, storedJob);
   }
 
   if (storedJob?.rendered) {
@@ -1425,4 +1662,272 @@ export function renderCancelReport(job) {
   lines.push("- Check `/grok-build:runs` for the updated queue.");
 
   return `${lines.join("\n").trimEnd()}\n`;
+}
+
+/** schemaVersion for the machine-readable run manifest (`show --json`). */
+export const RUN_MANIFEST_SCHEMA_VERSION = 1;
+
+/**
+ * Parse common ## sections out of a delimited final report for the manifest.
+ * Best-effort; missing sections stay empty arrays/null.
+ */
+export function parseReportSections(finalReport) {
+  const text = String(finalReport ?? "").trim();
+  const empty = {
+    result: null,
+    decisions: [],
+    assumptions: [],
+    notDone: [],
+    openQuestions: [],
+    followUps: [],
+    confidence: null
+  };
+  if (!text) {
+    return empty;
+  }
+
+  const sections = {};
+  const parts = text.split(/^##\s+/m);
+  for (const part of parts) {
+    if (!part.trim()) {
+      continue;
+    }
+    const nl = part.indexOf("\n");
+    const title = (nl === -1 ? part : part.slice(0, nl)).trim().toLowerCase();
+    const body = (nl === -1 ? "" : part.slice(nl + 1)).trim();
+    sections[title] = body;
+  }
+
+  const bulletLines = (body) =>
+    String(body ?? "")
+      .split(/\r?\n/)
+      .map((line) => line.replace(/^\s*[-*]\s+/, "").trim())
+      .filter(Boolean);
+
+  const resultBody = sections.result ?? sections.summary ?? null;
+  let confidence = null;
+  const confMatch = text.match(/\bconfidence\s*[:\-]\s*(high|medium|low)\b/i);
+  if (confMatch) {
+    confidence = confMatch[1].toLowerCase();
+  }
+
+  return {
+    result: resultBody,
+    decisions: bulletLines(sections.decisions),
+    assumptions: bulletLines(sections.assumptions),
+    notDone: bulletLines(
+      sections["not done"] ?? sections.notdone ?? sections["deliberately not done"] ?? sections["not-done"]
+    ),
+    openQuestions: bulletLines(
+      sections["open questions"] ?? sections.openquestions ?? sections.questions
+    ),
+    followUps: bulletLines(sections["follow-ups"] ?? sections.followups ?? sections["follow ups"]),
+    confidence
+  };
+}
+
+function usageForManifest(usage) {
+  if (!usage || typeof usage !== "object") {
+    return null;
+  }
+  return {
+    inputTokens: usage.inputTokens ?? null,
+    cachedInputTokens: usage.cachedInputTokens ?? null,
+    outputTokens: usage.outputTokens ?? null,
+    reasoningTokens: usage.reasoningTokens ?? null,
+    totalTokens: usage.totalTokens ?? null,
+    costUsd: usage.costUsd ?? null,
+    costUsdTicks: usage.costUsdTicks ?? null,
+    costIsPartial: Boolean(usage.costIsPartial),
+    usageIsIncomplete: Boolean(usage.usageIsIncomplete),
+    modelCalls: usage.modelCalls ?? null,
+    numTurns: usage.numTurns ?? null,
+    resolvedModel: usage.resolvedModel ?? null,
+    byModel: usage.modelUsage ?? null
+  };
+}
+
+/**
+ * Authoritative machine-readable surface of a finished (or in-progress) run.
+ * Consumed by `show --json` / `wait --json` so callers act without re-reading
+ * the repo. Shape is pinned by plugins/grok-build/schemas/run-manifest.schema.json.
+ *
+ * @param {object} job - index / hydrated job row
+ * @param {object|null} storedJob - jobs/<id>.json contents
+ * @returns {object}
+ */
+export function buildRunManifest(job = {}, storedJob = null) {
+  const record = { ...job, ...(storedJob ?? {}) };
+  const result = storedJob?.result ?? record.result ?? null;
+  const worktree = record.worktree ?? result?.worktree ?? null;
+  const usage = record.usage ?? result?.usage ?? null;
+  const usageBreakdown = result?.usageBreakdown ?? record.usageBreakdown ?? null;
+  const verify = result?.verify ?? record.verify ?? null;
+  const changedFiles = result?.changedFiles ?? record.changedFiles ?? null;
+  const finalReport =
+    (typeof result?.finalReport === "string" && result.finalReport) ||
+    (typeof record.finalReport === "string" && record.finalReport) ||
+    "";
+  const reportSections = parseReportSections(finalReport);
+  const start = result?.start ?? record.start ?? null;
+  const confineViolations = result?.confineViolations ?? record.confineViolations ?? [];
+  const streamErrors = result?.streamErrors ?? result?.errors ?? record.streamErrors ?? [];
+  const toolVisibility =
+    result?.toolVisibility ?? record.toolVisibility ?? (record.toolCallCount == null ? "unavailable" : "observed");
+
+  const isolationBreached = Boolean(
+    record.isolationBreached || worktree?.breached || (Array.isArray(confineViolations) && confineViolations.length > 0)
+  );
+
+  const children = Array.isArray(record.children)
+    ? record.children
+    : Array.isArray(result?.children)
+      ? result.children
+      : [];
+
+  const statusLines = Array.isArray(result?.statusLines)
+    ? result.statusLines
+    : typeof result?.statusLines === "string"
+      ? result.statusLines.split(/\r?\n/)
+      : null;
+
+  return {
+    schemaVersion: RUN_MANIFEST_SCHEMA_VERSION,
+    runId: record.id ?? null,
+    parentRunId: record.parentRunId ?? result?.parentRunId ?? null,
+    nestDepth: record.nestDepth ?? result?.nestDepth ?? 0,
+    status: record.status ?? "unknown",
+    stopReason: record.stopReason ?? result?.stopReason ?? null,
+    terminalReason: record.terminalReason ?? result?.budgetStopped ?? null,
+    write: record.write ?? null,
+    verified: record.verified ?? result?.verified ?? null,
+    timing: {
+      startedAt: record.startedAt ?? record.createdAt ?? null,
+      endedAt: record.completedAt ?? null,
+      durationMs: record.durationMs ?? result?.durationMs ?? null,
+      baselineProbeMs: verify?.baselineProbeMs ?? result?.baselineProbeMs ?? null,
+      backgroundWaitMs: record.backgroundWaitMs ?? null
+    },
+    cli: {
+      binary: start?.binary ?? record.cliBinary ?? null,
+      version: start?.version ?? record.grokVersion ?? null,
+      brand: record.cliBrand ?? null,
+      schemaVersion: start?.schemaVersion ?? result?.streamSchemaVersion ?? null,
+      permissionMode: start?.permissionMode ?? null,
+      sandbox: start?.sandbox ?? null,
+      alwaysApprove: start?.alwaysApprove ?? null,
+      confineRoot: start?.confineRoot ?? null
+    },
+    model: {
+      requested: record.model ?? null,
+      served: record.resolvedModel ?? usage?.resolvedModel ?? start?.servedModel ?? null
+    },
+    isolation: {
+      active: Boolean(worktree?.path),
+      worktree: worktree?.path ?? null,
+      branch: worktree?.branch ?? null,
+      baseSha: worktree?.baseSha ?? worktree?.base_sha ?? null,
+      headSha: worktree?.headSha ?? worktree?.head_sha ?? null,
+      breached: isolationBreached,
+      leakedPaths: record.isolationLeak?.entries ?? record.isolationLeak?.paths ?? result?.isolationLeak?.entries ?? [],
+      confineViolations: Array.isArray(confineViolations) ? confineViolations : []
+    },
+    changes: {
+      git: {
+        worktree: changedFiles?.worktree ?? changedFiles ?? null,
+        mainTree: changedFiles?.mainTree ?? null
+      },
+      agentReported: result?.agentFilesChanged ?? result?.filesChangedFromStream ?? null,
+      debris: result?.debris ?? record.debris ?? { entries: [], total: 0, truncated: false },
+      uidIntegrity: verify?.uidIntegrity ?? null,
+      changedFileCount:
+        record.changedFileCount ??
+        result?.changedFileCount ??
+        changedFiles?.total ??
+        worktree?.changedFileCount ??
+        null
+    },
+    verify: verify
+      ? {
+          plan: verify.plan ?? null,
+          baselineSkipped: Boolean(verify.baselineSkipped),
+          note: verify.note ?? null,
+          results: Array.isArray(verify.results)
+            ? verify.results.map((entry) => ({
+                command: entry.command ?? null,
+                ok: entry.ok ?? null,
+                exitCode: entry.exitCode ?? entry.status ?? null,
+                timeoutMs: entry.timeoutMs ?? null,
+                timeoutSource: entry.timeoutSource ?? null,
+                failureSource: entry.failureSource ?? null,
+                attribution: entry.attribution ?? null,
+                matchedLines: entry.matchedLines ?? [],
+                elidedBytes: entry.elidedBytes ?? null,
+                outputTail: entry.outputTail ?? entry.stderrTail ?? null
+              }))
+            : []
+        }
+      : null,
+    usage: {
+      ...usageForManifest(usage),
+      own: usageForManifest(usageBreakdown?.own),
+      nested: usageForManifest(usageBreakdown?.nested),
+      includingNested: usageForManifest(usageBreakdown?.includingNested)
+    },
+    agent: {
+      toolCallCount: record.toolCallCount ?? result?.toolCallCount ?? null,
+      toolCallCountFloor: result?.toolCallCountFloor ?? record.toolCallCountFloor ?? null,
+      toolVisibility,
+      autoContinued: Boolean(record.autoContinued ?? result?.autoContinued),
+      maxTurnsReached: Boolean(result?.maxTurnsReached),
+      unknownEventTypes: result?.unknownEventTypes ?? [],
+      errors: Array.isArray(streamErrors) ? streamErrors : [],
+      toolDenials: result?.toolDenials ?? [],
+      compaction: result?.compaction ?? [],
+      toolActivity: result?.toolActivity ?? []
+    },
+    report: {
+      prose: finalReport || (typeof result?.rawOutput === "string" ? result.rawOutput : null),
+      contractHonoured: Boolean(finalReport && String(finalReport).trim()),
+      structured: reportSections.result
+        ? {
+            summary: reportSections.result,
+            confidence: reportSections.confidence,
+            decisions: reportSections.decisions,
+            assumptions: reportSections.assumptions,
+            notDone: reportSections.notDone,
+            openQuestions: reportSections.openQuestions,
+            followUps: reportSections.followUps
+          }
+        : null,
+      statusLines
+    },
+    decisions: reportSections.decisions,
+    assumptions: reportSections.assumptions,
+    notDone: reportSections.notDone,
+    openQuestions: reportSections.openQuestions,
+    followUps: reportSections.followUps,
+    confidence: reportSections.confidence,
+    children: children.map((child) => ({
+      runId: child.runId ?? child.id ?? null,
+      status: child.status ?? null,
+      verified: child.verified ?? null,
+      changedFileCount: child.changedFileCount ?? null,
+      cost: child.cost ?? child.usage?.costUsd ?? null,
+      usage: usageForManifest(child.usage),
+      branch: child.branch ?? child.worktree?.branch ?? null,
+      finalReport: typeof child.finalReport === "string" ? child.finalReport : null
+    })),
+    artifacts: {
+      logFile: record.logFile ?? result?.logFile ?? null,
+      eventsFile: record.eventsFile ?? null,
+      transcriptFile: record.transcriptFile ?? null,
+      promptFile: record.promptFile ?? result?.promptFile ?? null
+    },
+    // One minor version of the pre-manifest shape for callers still reading job/storedJob.
+    compat: {
+      job,
+      storedJob
+    }
+  };
 }

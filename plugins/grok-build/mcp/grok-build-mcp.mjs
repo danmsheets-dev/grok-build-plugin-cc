@@ -377,13 +377,40 @@ defineTool(
 /**
  * Normalise show/wait JSON into the contract surface for wait/result.
  *
- * Production `show --json` / `wait --json` emit `{ job, storedJob }` where
- * `job` is an index row (no `result`) and the full terminal payload lives on
- * `storedJob.result` / `storedJob.rendered`. Older flat fixtures still work.
+ * Production `show --json` / `wait --json` emit the run-manifest v1 object
+ * (`schemaVersion: 1`) with `compat: { job, storedJob }` for one minor version.
+ * Older flat `{ job, storedJob }` fixtures still work.
  */
 export function shapeDelegateResult(parsed, runId) {
-  const job = parsed?.job ?? parsed ?? {};
-  const stored = parsed?.storedJob ?? null;
+  // Prefer the versioned manifest when present (WP-B4).
+  if (parsed && typeof parsed === "object" && Number(parsed.schemaVersion) >= 1 && parsed.runId != null) {
+    const usage = parsed.usage ?? null;
+    const reportProse =
+      parsed.report?.prose ??
+      parsed.report?.structured?.summary ??
+      null;
+    return {
+      runId: parsed.runId ?? runId,
+      status: parsed.status ?? "unknown",
+      stopReason: parsed.stopReason ?? null,
+      verified: parsed.verified ?? null,
+      changedFiles: parsed.changes?.git?.worktree ?? null,
+      changedFileCount: parsed.changes?.changedFileCount ?? null,
+      usage,
+      cost: usage?.costUsd ?? null,
+      worktree: parsed.isolation?.worktree ?? null,
+      branch: parsed.isolation?.branch ?? null,
+      finalReport: reportProse,
+      logFile: parsed.artifacts?.logFile ?? null,
+      schemaVersion: parsed.schemaVersion,
+      toolVisibility: parsed.agent?.toolVisibility ?? null,
+      costIsPartial: Boolean(usage?.costIsPartial),
+      usageIsIncomplete: Boolean(usage?.usageIsIncomplete)
+    };
+  }
+
+  const job = parsed?.job ?? parsed?.compat?.job ?? parsed ?? {};
+  const stored = parsed?.storedJob ?? parsed?.compat?.storedJob ?? null;
   const result = stored?.result ?? job.result ?? parsed?.result ?? {};
   const worktree = job.worktree ?? stored?.worktree ?? result.worktree ?? null;
   const usage = job.usage ?? stored?.usage ?? result.usage ?? null;

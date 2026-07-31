@@ -170,7 +170,9 @@ import {
   removeWorktree
 } from "./lib/worktree.mjs";
 import {
+  buildRunManifest,
   buildSessionTotalsByModel,
+  buildTaskStatusLines,
   formatUsageLine,
   renderCancelReport,
   renderJobStatusReport,
@@ -3696,6 +3698,8 @@ async function executeTaskRun(request) {
   // running total across every call this run has made so far, not just the
   // latest one — otherwise N calls each individually under budget could
   // together spend well past maxCostUsd without ever tripping the stop.
+  // Unknown/partial cost is never treated as $0: if a cap was requested but
+  // cost is unmeasurable, record that the budget could not be enforced.
   let budgetStopped = null;
   if (
     !timedOut &&
@@ -3705,6 +3709,18 @@ async function executeTaskRun(request) {
     Number(cumulativeUsage.costUsd) > maxCostUsd
   ) {
     budgetStopped = "max-cost";
+  } else if (
+    !timedOut &&
+    maxCostUsd != null &&
+    cumulativeUsage &&
+    (cumulativeUsage.usageIsIncomplete ||
+      cumulativeUsage.costIsPartial ||
+      (cumulativeUsage.costUsd == null &&
+        (Number(cumulativeUsage.inputTokens) > 0 ||
+          Number(cumulativeUsage.outputTokens) > 0 ||
+          Number(cumulativeUsage.modelCalls) > 0)))
+  ) {
+    budgetStopped = "max-cost-unenforceable";
   }
 
   let verified = null;
@@ -4016,6 +4032,20 @@ async function executeTaskRun(request) {
   /** @type {{entries: string[], total: number, truncated: boolean}|null} */
   let debris = null;
 
+  // Early collect: needed for isolation before the full stream aggregate below.
+  const earlyConfineViolations = agentResults.flatMap((entry) =>
+    Array.isArray(entry?.confineViolations) ? entry.confineViolations : []
+  );
+  // Hyper already caught escape attempts on the wire — honour them even when
+  // the dirty-set diff cannot (blocked writes never dirty the main tree).
+  if (earlyConfineViolations.length > 0) {
+    isolationBreached = true;
+    request.onProgress?.({
+      message: `Isolation BREACHED: ${earlyConfineViolations.length} confine violation(s) reported by the CLI.`,
+      phase: "finalizing"
+    });
+  }
+
   // Breach detection: any path newly dirty in the MAIN checkout after an
   // isolated run means the agent wrote outside the worktree. artifact excludes
   // are applied by porcelainChangeEntries. Separately, shared (junctioned)
@@ -4253,6 +4283,31 @@ async function executeTaskRun(request) {
   const unknownEventTypes = [
     ...new Set(agentResults.flatMap((entry) => entry?.unknownEventTypes ?? []))
   ].sort();
+  // Stream-channel aggregates — error / confine_violation / denials must not
+  // die in the parser. Flatten across main + auto-continue + verify-fix turns.
+  const streamErrors = agentResults.flatMap((entry) =>
+    Array.isArray(entry?.streamErrors) ? entry.streamErrors : []
+  );
+  const confineViolations = agentResults.flatMap((entry) =>
+    Array.isArray(entry?.confineViolations) ? entry.confineViolations : []
+  );
+  const toolDenials = agentResults.flatMap((entry) =>
+    Array.isArray(entry?.toolDenials) ? entry.toolDenials : []
+  );
+  const compaction = agentResults.flatMap((entry) =>
+    Array.isArray(entry?.compaction) ? entry.compaction : []
+  );
+  const toolActivity = agentResults.flatMap((entry) =>
+    Array.isArray(entry?.toolActivity) ? entry.toolActivity : []
+  );
+  const maxTurnsReached = agentResults.some((entry) => entry?.maxTurnsReached);
+  const streamStart = agentResults.map((entry) => entry?.start).find(Boolean) ?? null;
+  const streamSchemaVersion =
+    agentResults.map((entry) => entry?.streamSchemaVersion).find((v) => v != null) ??
+    streamStart?.schemaVersion ??
+    null;
+  const agentFilesChanged =
+    agentResults.map((entry) => entry?.filesChangedFromStream).filter(Boolean).at(-1) ?? null;
   // Sum tool calls across turns when every turn reported a number; if any turn
   // left the count unknown (null), the aggregate is unknown rather than a
   // partial sum that under-counts.
@@ -4268,6 +4323,23 @@ async function executeTaskRun(request) {
     );
   } else {
     toolCallCount = agentResults.reduce((sum, entry) => sum + Number(entry.toolCallCount), 0);
+  }
+  // Visibility: unavailable when no turn reported a count and none saw tool events.
+  let toolVisibility = "unavailable";
+  if (agentResults.some((entry) => entry?.toolVisibility === "explicit")) {
+    toolVisibility = "explicit";
+  } else if (agentResults.some((entry) => entry?.toolVisibility === "observed" || entry?.toolCallCount != null)) {
+    toolVisibility = "observed";
+  }
+  let toolCallCountFloor = null;
+  for (const entry of agentResults) {
+    const floor = entry?.toolCallCountFloor;
+    if (floor != null && Number.isFinite(Number(floor))) {
+      toolCallCountFloor = Math.max(toolCallCountFloor ?? 0, Number(floor));
+    }
+  }
+  if (toolCallCountFloor == null && agentFilesChanged?.count != null && Number(agentFilesChanged.count) > 0) {
+    toolCallCountFloor = Number(agentFilesChanged.count);
   }
   const stopReason = timedOut ? "max-duration" : (result.stopReason ?? null);
   const resolvedModel =
@@ -4376,8 +4448,73 @@ async function executeTaskRun(request) {
 
   const usageBreakdown = aggregateUsageOwnVsNested(cumulativeUsage, children);
 
+  const statusMeta = {
+    title: taskMetadata.title,
+    jobId: request.jobId ?? null,
+    logFile,
+    streamParsed,
+    unknownEventTypes,
+    streamErrors,
+    errors: streamErrors,
+    confineViolations,
+    toolDenials,
+    compaction,
+    maxTurnsReached,
+    changedFiles,
+    debris,
+    write,
+    verified: isolationBreached ? false : verified,
+    verifyNote: isolationBreached
+      ? "isolation breached — work is in the main checkout, not the worktree"
+      : verifyNote,
+    status: terminalStatus,
+    stopReason,
+    usage: cumulativeUsage ?? null,
+    model: request.model ?? null,
+    resolvedModel,
+    isolationBreached,
+    isolationLeak,
+    implausiblyShort,
+    durationMs,
+    durationSeconds: durationMs / 1000,
+    toolCallCount,
+    toolCallCountFloor,
+    toolVisibility,
+    autoContinued,
+    // Which command(s) tripped an exit-0 output-failure marker, and what
+    // matched - the only evidence available without reading --json for
+    // a command whose exit code alone says it passed. Computed here
+    // rather than filtered inside buildTaskStatusLines so a render-only
+    // caller (e.g. a stored job re-rendered later) sees the same list a
+    // live run would have.
+    verifyMatchedLines: verifyResults
+      .filter((entry) => Array.isArray(entry.matchedLines) && entry.matchedLines.length > 0)
+      .map((entry) => ({ command: entry.command, matchedLines: entry.matchedLines })),
+    // The visibility half of the item-4 trust story: a run that verifies
+    // commands the user never typed has to say which commands, and where
+    // they came from, in the same block that reports the verdict.
+    verifyCommands,
+    verifyPlan,
+    verifyTrustCommand: TRUST_CONFIG_COMMAND,
+    baselineProbeMs,
+    baselineProbeCommands: baselines.length,
+    blenderVersion: blenderVersionNote,
+    runtimePlugin: runtimePluginPacks ? { packs: runtimePluginPacks } : null,
+    worktree,
+    provision: provisionSummary,
+    budgetStopped,
+    children,
+    usageBreakdown
+  };
+  // Persist status lines separately so `show` can re-emit the trailer without
+  // string-surgery on the full rendered body (and without losing it when the
+  // answer is preferred over rendered).
+  const statusLines = buildTaskStatusLines(statusMeta, rawOutput);
+
   const rendered = timedOut
-    ? `${failureMessage}\n${rawOutput ? `\n${rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`}` : ""}`
+    ? `${failureMessage}\n${rawOutput ? `\n${rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`}` : ""}${
+        statusLines.length ? `\n${statusLines.join("\n")}\n` : ""
+      }`
     : renderTaskResult(
         {
           rawOutput,
@@ -4387,56 +4524,7 @@ async function executeTaskRun(request) {
           // explanation on the channel that used to be dropped.
           stderr: result.stderr ?? ""
         },
-        {
-          title: taskMetadata.title,
-          jobId: request.jobId ?? null,
-          logFile,
-          streamParsed,
-          unknownEventTypes,
-          changedFiles,
-          debris,
-          write,
-          verified: isolationBreached ? false : verified,
-          verifyNote: isolationBreached
-            ? "isolation breached — work is in the main checkout, not the worktree"
-            : verifyNote,
-          status: terminalStatus,
-          stopReason,
-          usage: cumulativeUsage ?? null,
-          model: request.model ?? null,
-          resolvedModel,
-          isolationBreached,
-          isolationLeak,
-          implausiblyShort,
-          durationMs,
-          durationSeconds: durationMs / 1000,
-          toolCallCount,
-          autoContinued,
-          // Which command(s) tripped an exit-0 output-failure marker, and what
-          // matched - the only evidence available without reading --json for
-          // a command whose exit code alone says it passed. Computed here
-          // rather than filtered inside buildTaskStatusLines so a render-only
-          // caller (e.g. a stored job re-rendered later) sees the same list a
-          // live run would have.
-          verifyMatchedLines: verifyResults
-            .filter((entry) => Array.isArray(entry.matchedLines) && entry.matchedLines.length > 0)
-            .map((entry) => ({ command: entry.command, matchedLines: entry.matchedLines })),
-          // The visibility half of the item-4 trust story: a run that verifies
-          // commands the user never typed has to say which commands, and where
-          // they came from, in the same block that reports the verdict.
-          verifyCommands,
-          verifyPlan,
-          verifyTrustCommand: TRUST_CONFIG_COMMAND,
-          baselineProbeMs,
-          baselineProbeCommands: baselines.length,
-          blenderVersion: blenderVersionNote,
-          runtimePlugin: runtimePluginPacks ? { packs: runtimePluginPacks } : null,
-          worktree,
-          provision: provisionSummary,
-          budgetStopped,
-          children,
-          usageBreakdown
-        }
+        statusMeta
       );
 
   const verify = {
@@ -4509,6 +4597,9 @@ async function executeTaskRun(request) {
     nestDepth: request.nestDepth ?? 0,
     stopReason,
     toolCallCount,
+    toolCallCountFloor,
+    toolVisibility,
+    toolActivity,
     changedFileCount: effectiveChangedFileCount,
     model: request.model ?? null,
     resolvedModel,
@@ -4522,6 +4613,8 @@ async function executeTaskRun(request) {
     // redactSecretsDeep on every terminal claim.
     finalReport,
     lastMessage,
+    // Status trailer facts as an array so show re-emits without string surgery.
+    statusLines,
     // Kept even on a zero exit. "Exited 0, said nothing, warned on stderr" is
     // the exact shape of a truncated response, and dropping the warning left
     // the run inexplicable.
@@ -4531,6 +4624,14 @@ async function executeTaskRun(request) {
     // release that renames an event type degraded output silently.
     streamParsed,
     unknownEventTypes,
+    streamErrors,
+    confineViolations,
+    toolDenials,
+    compaction,
+    maxTurnsReached,
+    start: streamStart,
+    streamSchemaVersion,
+    agentFilesChanged,
     // Where the durable copy of this run's rendered result lives.
     logFile,
     // What the run changed on disk - the deliverable itself for an engine
@@ -6436,12 +6537,18 @@ function handleResult(argv) {
   // Hydrate index gaps from the job file so show never prints null for usage
   // that was only stored on jobs/<id>.json.
   const hydrated = hydrateJobFromStored(workspaceRoot, job);
-  const payload = {
-    job: hydrated,
-    storedJob
-  };
-
-  outputCommandResult(payload, renderStoredJobResult(hydrated, storedJob), options.json);
+  // Human form: answer + status trailer + BRIDGE-RESULT.
+  // JSON form: versioned run manifest (schema under plugins/grok-build/schemas/).
+  // compat.job / compat.storedJob preserve the pre-manifest shape for one minor.
+  if (options.json) {
+    outputResult(buildRunManifest(hydrated, storedJob), true);
+    return;
+  }
+  outputCommandResult(
+    { job: hydrated, storedJob },
+    renderStoredJobResult(hydrated, storedJob),
+    false
+  );
 }
 
 function handleTaskResumeCandidate(argv) {
@@ -6731,16 +6838,26 @@ async function handleWait(argv) {
     return;
   }
 
-  // Terminal: print the same shape as show.
+  // Terminal: print the same shape as show (manifest when --json).
   const storedJob = readStoredJob(snapshot.workspaceRoot, snapshot.job.id);
   const hydrated = hydrateJobFromStored(snapshot.workspaceRoot, snapshot.job);
-  const payload = {
-    job: hydrated,
-    storedJob,
-    waitTimedOut: false,
-    timeoutMs: snapshot.timeoutMs
-  };
-  outputCommandResult(payload, renderStoredJobResult(hydrated, storedJob), options.json);
+  if (options.json) {
+    const manifest = buildRunManifest(hydrated, storedJob);
+    manifest.waitTimedOut = false;
+    manifest.timeoutMs = snapshot.timeoutMs ?? null;
+    outputResult(manifest, true);
+    return;
+  }
+  outputCommandResult(
+    {
+      job: hydrated,
+      storedJob,
+      waitTimedOut: false,
+      timeoutMs: snapshot.timeoutMs
+    },
+    renderStoredJobResult(hydrated, storedJob),
+    false
+  );
 }
 
 function handleModels(argv) {

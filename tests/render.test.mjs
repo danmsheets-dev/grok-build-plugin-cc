@@ -2,10 +2,17 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  buildBridgeResultBlock,
+  buildRunManifest,
   buildTaskStatusLines,
+  formatToolCallsLabel,
+  formatUsageLine,
+  formatUsageTotals,
+  renderJobStatusReport,
   renderReviewResult,
   renderStoredJobResult,
-  renderTaskResult
+  renderTaskResult,
+  RUN_MANIFEST_SCHEMA_VERSION
 } from "../plugins/grok-build/scripts/lib/render.mjs";
 
 test("renderReviewResult degrades gracefully when JSON is missing required review fields", () => {
@@ -65,8 +72,6 @@ test("renderStoredJobResult prefers rendered output for structured review jobs",
   assert.match(output, /===END-BRIDGE-RESULT===/);
 });
 
-import { formatUsageLine, formatUsageTotals, renderJobStatusReport } from "../plugins/grok-build/scripts/lib/render.mjs";
-
 test("formatUsageLine renders tokens, turns and cost", () => {
   assert.equal(
     formatUsageLine({
@@ -82,7 +87,9 @@ test("formatUsageLine renders tokens, turns and cost", () => {
   );
 });
 
-test("formatUsageLine omits cost and turns when absent", () => {
+test("formatUsageLine omits turns when absent and never invents \$0.00 for null cost", () => {
+  // Tokens without a cost (or flags) used to print nothing for cost; after WP-B4
+  // we surface "unavailable" so absence is not read as free.
   assert.equal(
     formatUsageLine({
       inputTokens: 100,
@@ -93,7 +100,17 @@ test("formatUsageLine omits cost and turns when absent", () => {
       costUsd: null,
       numTurns: null
     }),
-    "Tokens: 100 in / 5 out"
+    "Tokens: 100 in / 5 out · cost: unavailable"
+  );
+  assert.equal(
+    formatUsageLine({
+      inputTokens: 0,
+      cachedInputTokens: 0,
+      outputTokens: 0,
+      costUsd: null,
+      numTurns: null
+    }),
+    "Tokens: 0 in / 0 out"
   );
 });
 
@@ -752,4 +769,155 @@ test("renderStoredJobResult still falls back to rawOutput, then to a review's st
     { result: { grok: { stdout: "Reviewed uncommitted changes." } } }
   );
   assert.match(review, /Reviewed uncommitted changes\./);
+});
+
+test("renderStoredJobResult composes answer with stored status trailer", () => {
+  const output = renderStoredJobResult(
+    { id: "run-trailer", status: "completed-unverified", title: "Grok Build Delegate" },
+    {
+      result: {
+        finalReport: "## Result\nFixed the scene.",
+        statusLines: [
+          "Verified: no - verification did not pass within the attempt budget.",
+          "  Output matched a known failure marker in `godot --headless`: SCRIPT ERROR",
+          "Changed files: 2",
+          "Isolation BREACHED: the main checkout changed while this run was in flight."
+        ],
+        toolCallCount: null,
+        toolVisibility: "unavailable"
+      },
+      status: "completed-unverified",
+      verified: false
+    }
+  );
+
+  assert.match(output, /Fixed the scene/);
+  assert.match(output, /Verified: no/);
+  assert.match(output, /SCRIPT ERROR/);
+  assert.match(output, /Isolation BREACHED/);
+  assert.match(output, /===BRIDGE-RESULT===/);
+});
+
+test("buildTaskStatusLines surfaces stream errors and confine violations", () => {
+  const lines = buildTaskStatusLines({
+    streamErrors: [{ message: "Connection closed unexpectedly" }],
+    confineViolations: [
+      { tool: "Write", path: "x", resolvedPath: "/repo/x", root: "/tmp/wt" }
+    ],
+    isolationBreached: true,
+    status: "isolation-breached"
+  });
+  const text = lines.join("\n");
+  assert.match(text, /Stream error: Connection closed unexpectedly/);
+  assert.match(text, /Confine violation/);
+  assert.match(text, /tool=Write/);
+  assert.match(text, /Isolation BREACHED/);
+});
+
+test("formatUsageLine prints unavailable for partial cost, never \$0.00", () => {
+  const partial = formatUsageLine(
+    {
+      inputTokens: 100,
+      cachedInputTokens: 0,
+      outputTokens: 5,
+      costUsd: null,
+      costIsPartial: true,
+      usageIsIncomplete: true,
+      numTurns: 2
+    },
+    { compact: true }
+  );
+  assert.match(partial, /cost: unavailable \(partial\)/);
+  assert.doesNotMatch(partial, /\$0\.00/);
+
+  const zeroFromBug = formatUsageLine(
+    {
+      inputTokens: 100,
+      outputTokens: 5,
+      costUsd: 0,
+      usageIsIncomplete: true,
+      numTurns: 1
+    },
+    { compact: true }
+  );
+  assert.match(zeroFromBug, /unavailable/);
+  assert.doesNotMatch(zeroFromBug, /\$0\.00/);
+});
+
+test("buildBridgeResultBlock says tool calls not reported by this CLI when null", () => {
+  const block = buildBridgeResultBlock(
+    {
+      id: "run-null-tools",
+      status: "completed",
+      toolCallCount: null,
+      toolVisibility: "unavailable",
+      usage: { inputTokens: 10, outputTokens: 2, costUsd: null, usageIsIncomplete: true }
+    },
+    null
+  );
+  assert.match(block, /tool calls: not reported by this CLI/);
+  assert.doesNotMatch(block, /tool calls: unknown/);
+});
+
+test("formatToolCallsLabel distinguishes unavailable from zero", () => {
+  assert.equal(formatToolCallsLabel(0), "0");
+  assert.equal(formatToolCallsLabel(null), "not reported by this CLI");
+  assert.match(formatToolCallsLabel(null, { toolCallCountFloor: 4 }), /≥4/);
+});
+
+test("buildRunManifest emits schemaVersion and stream channel fields", () => {
+  const manifest = buildRunManifest(
+    {
+      id: "run-m1",
+      status: "completed",
+      model: "grok-4.5",
+      resolvedModel: "grok-4.5-build",
+      toolCallCount: null,
+      verified: true
+    },
+    {
+      result: {
+        finalReport: "## Result\nDone.\n\n## Assumptions\n- assumed X\n\n## Follow-ups\n- do Y",
+        statusLines: ["Verified: yes"],
+        streamErrors: [{ message: "rate limited" }],
+        confineViolations: [{ tool: "Write", resolvedPath: "/x", root: "/wt" }],
+        unknownEventTypes: ["widget_ping"],
+        toolVisibility: "unavailable",
+        usage: {
+          inputTokens: 100,
+          outputTokens: 10,
+          costUsd: null,
+          costIsPartial: true,
+          usageIsIncomplete: true
+        },
+        verify: {
+          plan: { source: "cli" },
+          results: [{ command: "npm test", ok: true, exitCode: 0, matchedLines: [] }]
+        },
+        children: [{ id: "child-1", status: "completed", usage: { costUsd: 0.1 } }]
+      },
+      usage: {
+        inputTokens: 100,
+        outputTokens: 10,
+        costUsd: null,
+        costIsPartial: true,
+        usageIsIncomplete: true
+      }
+    }
+  );
+
+  assert.equal(manifest.schemaVersion, RUN_MANIFEST_SCHEMA_VERSION);
+  assert.equal(manifest.runId, "run-m1");
+  assert.equal(manifest.agent.toolVisibility, "unavailable");
+  assert.equal(manifest.usage.costIsPartial, true);
+  assert.equal(manifest.usage.costUsd, null);
+  assert.equal(manifest.agent.errors[0].message, "rate limited");
+  assert.equal(manifest.isolation.confineViolations.length, 1);
+  assert.ok(manifest.isolation.breached);
+  assert.ok(manifest.report.contractHonoured);
+  assert.ok(manifest.assumptions.some((a) => /assumed X/.test(a)));
+  assert.ok(manifest.followUps.some((f) => /do Y/.test(f)));
+  assert.equal(manifest.children.length, 1);
+  assert.ok(manifest.compat.job);
+  assert.ok(manifest.compat.storedJob);
 });

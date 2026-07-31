@@ -248,8 +248,13 @@ test("completed-noop/blind/truncated never render Verified: yes", () => {
     /Verified: n\/a - the run changed no files/
   );
   assert.match(
-    buildTaskStatusLines({ status: "completed-blind", verified: true }).join("\n"),
-    /Verified: n\/a - the agent completed no successful tool calls/
+    buildTaskStatusLines({
+      status: "completed-blind",
+      verified: true,
+      toolCallCount: 0,
+      toolVisibility: "explicit"
+    }).join("\n"),
+    /Verified: n\/a - the stream reported zero tool calls/
   );
   assert.match(
     buildTaskStatusLines({ status: "completed-truncated", stopReason: "Cancelled", verified: true }).join(

@@ -201,17 +201,20 @@ export function remainingDurationSeconds(parentMaxDurationSeconds, parentStarted
 /**
  * Cap minus spend so far. Null parent cap → null (no ceiling). Negative
  * remaining collapses to 0 so a spent-out parent cannot hand a child money.
+ *
+ * When parentSpentCostUsd is null (cost unmeasurable / partial), fail closed:
+ * remaining is 0 rather than the full cap. Absence of measured spend must not
+ * look like free headroom for nested children.
  */
 export function remainingCostBudget(parentMaxCostUsd, parentSpentCostUsd) {
   if (parentMaxCostUsd == null || !Number.isFinite(Number(parentMaxCostUsd))) {
     return null;
   }
   const cap = Number(parentMaxCostUsd);
-  const spent =
-    parentSpentCostUsd == null || !Number.isFinite(Number(parentSpentCostUsd))
-      ? 0
-      : Number(parentSpentCostUsd);
-  return Math.max(0, cap - spent);
+  if (parentSpentCostUsd == null || !Number.isFinite(Number(parentSpentCostUsd))) {
+    return 0;
+  }
+  return Math.max(0, cap - Number(parentSpentCostUsd));
 }
 
 function clampCeiling(requested, ceiling) {
@@ -254,7 +257,9 @@ export function deriveSiblingWorktreePath(parentWorktreePath, childRunId) {
 }
 
 /**
- * Sum usage objects without mutating inputs. Missing sides treated as zero.
+ * Sum usage objects without mutating inputs. Missing sides treated as zero for
+ * tokens; cost null stays null (unknown is not free). Partial/incomplete flags
+ * OR across sides so a parent cannot report a confident total over partial kids.
  */
 export function addUsage(a, b) {
   if (!a && !b) {
@@ -270,9 +275,31 @@ export function addUsage(a, b) {
   const leftCost = left.costUsd != null && Number.isFinite(Number(left.costUsd)) ? Number(left.costUsd) : null;
   const rightCost =
     right.costUsd != null && Number.isFinite(Number(right.costUsd)) ? Number(right.costUsd) : null;
-  if (leftCost != null || rightCost != null) {
+  if (leftCost != null && rightCost != null) {
+    sum.costUsd = leftCost + rightCost;
+  } else if (leftCost != null || rightCost != null) {
     sum.costUsd = (leftCost ?? 0) + (rightCost ?? 0);
+    sum.costIsPartial = true;
   }
+  // else both null — leave costUsd absent (unknown, not $0)
+
+  const leftTicks =
+    left.costUsdTicks != null && Number.isFinite(Number(left.costUsdTicks)) ? Number(left.costUsdTicks) : null;
+  const rightTicks =
+    right.costUsdTicks != null && Number.isFinite(Number(right.costUsdTicks))
+      ? Number(right.costUsdTicks)
+      : null;
+  if (leftTicks != null || rightTicks != null) {
+    sum.costUsdTicks = (leftTicks ?? 0) + (rightTicks ?? 0);
+  }
+
+  if (left.usageIsIncomplete || right.usageIsIncomplete) {
+    sum.usageIsIncomplete = true;
+  }
+  if (left.costIsPartial || right.costIsPartial || sum.costIsPartial) {
+    sum.costIsPartial = true;
+  }
+
   const leftTurns = left.numTurns != null && Number.isFinite(Number(left.numTurns)) ? Number(left.numTurns) : null;
   const rightTurns =
     right.numTurns != null && Number.isFinite(Number(right.numTurns)) ? Number(right.numTurns) : null;
@@ -314,14 +341,35 @@ export function aggregateUsageOwnVsNested(ownUsage, children = []) {
  *   the full remaining cap)
  *
  * Used as the "spend so far" input to inheritBudget for the next child.
+ *
+ * When own (or any child's) cost is incomplete/partial, returns null so the
+ * caller refuses to hand out budget headroom it could not measure. Treating
+ * unmeasured spend as 0 would let a nested child inherit the parent's full cap.
  */
 export function parentSpentCostUsd(parentJob = {}) {
-  let spent = 0;
   const own = parentJob?.usage;
+  if (own?.usageIsIncomplete || own?.costIsPartial) {
+    return null;
+  }
+  // Presence of usage with no finite costUsd (and no tickets) after a run means
+  // cost was withheld — do not treat as free.
+  if (
+    own &&
+    typeof own === "object" &&
+    (own.costUsd == null || !Number.isFinite(Number(own.costUsd))) &&
+    (own.inputTokens > 0 || own.outputTokens > 0 || own.totalTokens > 0 || own.modelCalls > 0)
+  ) {
+    return null;
+  }
+
+  let spent = 0;
   if (own?.costUsd != null && Number.isFinite(Number(own.costUsd))) {
     spent += Number(own.costUsd);
   }
   for (const child of Array.isArray(parentJob?.children) ? parentJob.children : []) {
+    if (child?.usage?.usageIsIncomplete || child?.usage?.costIsPartial) {
+      return null;
+    }
     const usageCost =
       child?.usage?.costUsd != null && Number.isFinite(Number(child.usage.costUsd))
         ? Number(child.usage.costUsd)

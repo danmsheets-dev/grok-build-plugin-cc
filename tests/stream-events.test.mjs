@@ -38,11 +38,13 @@ test("parseStreamEvent returns objects and rejects everything else", () => {
 });
 
 import {
+  addUsage,
   createStreamTranscript,
   extractFinalReport,
   FINAL_REPORT_CLOSE,
   FINAL_REPORT_OPEN,
-  MESSAGE_SEPARATOR
+  MESSAGE_SEPARATOR,
+  normalizeUsage
 } from "../plugins/grok-build/scripts/lib/stream-events.mjs";
 
 function feed(transcript, events) {
@@ -325,3 +327,132 @@ test("a mixed stream counts the events it knows and names the ones it does not",
   assert.equal(result.toolCallCount, 1);
   assert.deepEqual(result.messages, ["Working."]);
 });
+
+test("Hyper start/error/confine_violation events are recognized and recorded", () => {
+  const transcript = createStreamTranscript();
+  feed(transcript, [
+    {
+      type: "start",
+      schemaVersion: 1,
+      confineRoot: "/tmp/wt",
+      servedModel: "grok-4.5-build",
+      permissionMode: "default",
+      sandbox: "workspace-write",
+      alwaysApprove: true,
+      binary: "hyper",
+      version: "0.2.120"
+    },
+    { type: "text", data: "working" },
+    {
+      type: "error",
+      message: "Connection closed unexpectedly"
+    },
+    {
+      type: "confine_violation",
+      tool: "Write",
+      path: "../escape.txt",
+      resolvedPath: "/repo/escape.txt",
+      root: "/tmp/wt"
+    },
+    {
+      type: "tool_denied",
+      tool: "Bash",
+      reason: "not allowed"
+    },
+    { type: "max_turns_reached" },
+    { type: "auto_compact_started" },
+    { type: "auto_compact_completed" },
+    { type: "model_resolved", servedModel: "grok-4.5-build" },
+    {
+      type: "end",
+      stopReason: "EndTurn",
+      filesChanged: { count: 3, paths: ["a.ts", "b.ts", "c.ts"] },
+      usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 },
+      total_cost_usd: 0.01,
+      num_turns: 1
+    }
+  ]);
+  const result = transcript.finish();
+
+  assert.ok(result.recognizedEvents >= 10);
+  assert.deepEqual(result.unknownTypes, []);
+  assert.equal(result.start.confineRoot, "/tmp/wt");
+  assert.equal(result.start.schemaVersion, 1);
+  assert.equal(result.errors.length, 1);
+  assert.match(result.errors[0].message, /Connection closed/);
+  assert.equal(result.confineViolations.length, 1);
+  assert.equal(result.confineViolations[0].tool, "Write");
+  assert.equal(result.confineViolations[0].resolvedPath, "/repo/escape.txt");
+  assert.equal(result.toolDenials.length, 1);
+  assert.equal(result.maxTurnsReached, true);
+  assert.equal(result.compaction.length, 2);
+  assert.equal(result.filesChanged.count, 3);
+  assert.equal(result.toolVisibility, "unavailable");
+  assert.equal(result.toolCallCount, null);
+  assert.equal(result.toolCallCountFloor, 3);
+});
+
+test("unknown event types are still surfaced after known Hyper vocabulary", () => {
+  const transcript = createStreamTranscript();
+  feed(transcript, [
+    { type: "start", schemaVersion: 1 },
+    { type: "future_widget_v2", payload: 1 },
+    { type: "text", data: "hi" },
+    { type: "end", stopReason: "EndTurn" }
+  ]);
+  const result = transcript.finish();
+  assert.deepEqual(result.unknownTypes, ["future_widget_v2"]);
+  assert.ok(result.recognizedEvents >= 3);
+});
+
+test("normalizeUsage carries usage_is_incomplete and cost_is_partial; hides cost", () => {
+  const usage = normalizeUsage({
+    usage: {
+      input_tokens: 100,
+      output_tokens: 10,
+      total_tokens: 110,
+      usage_is_incomplete: true
+    },
+    cost_is_partial: true,
+    total_cost_usd: 1.23,
+    total_cost_usd_ticks: 1_230_000,
+    num_turns: 1
+  });
+  assert.equal(usage.usageIsIncomplete, true);
+  assert.equal(usage.costIsPartial, true);
+  assert.equal(usage.costUsd, null, "partial/incomplete must not surface a dollar figure");
+  assert.equal(usage.costUsdTicks, 1_230_000);
+  assert.equal(usage.inputTokens, 100);
+});
+
+test("addUsage keeps null cost across turns (null + null ≠ 0)", () => {
+  const a = normalizeUsage({
+    usage: { input_tokens: 50, output_tokens: 5, total_tokens: 55, usage_is_incomplete: true },
+    num_turns: 1
+  });
+  const b = normalizeUsage({
+    usage: { input_tokens: 40, output_tokens: 4, total_tokens: 44, usage_is_incomplete: true },
+    num_turns: 1
+  });
+  const sum = addUsage(a, b);
+  assert.equal(sum.costUsd, null);
+  assert.equal(sum.usageIsIncomplete, true);
+  assert.equal(sum.inputTokens, 90);
+  assert.equal(sum.numTurns, 2);
+});
+
+test("addUsage ORs costIsPartial when only one turn reports cost", () => {
+  const a = normalizeUsage({
+    usage: { input_tokens: 10, output_tokens: 1, total_tokens: 11 },
+    total_cost_usd: 0.5,
+    num_turns: 1
+  });
+  const b = normalizeUsage({
+    usage: { input_tokens: 10, output_tokens: 1, total_tokens: 11, cost_is_partial: true },
+    num_turns: 1
+  });
+  const sum = addUsage(a, b);
+  assert.equal(sum.costIsPartial, true);
+  assert.ok(sum.costUsd == null || sum.costIsPartial);
+});
+

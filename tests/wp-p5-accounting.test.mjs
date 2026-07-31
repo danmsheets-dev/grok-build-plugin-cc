@@ -134,6 +134,22 @@ test("formatUsageLine compact form leads with call count", () => {
   assert.match(line, /model grok-4\.5 -> grok-4\.5-build/);
 });
 
+test("addUsage null costs stay null across multi-turn (WP-B4 cost integrity)", () => {
+  const turn1 = normalizeUsage({
+    usage: { input_tokens: 50, output_tokens: 5, total_tokens: 55, usage_is_incomplete: true },
+    num_turns: 1
+  });
+  const turn2 = normalizeUsage({
+    usage: { input_tokens: 40, output_tokens: 4, total_tokens: 44, usage_is_incomplete: true },
+    num_turns: 1
+  });
+  const sum = addUsage(turn1, turn2);
+  assert.equal(sum.costUsd, null);
+  assert.equal(sum.usageIsIncomplete, true);
+  // Must not become 0 — that would print as $0.00 and break --max-cost.
+  assert.notEqual(sum.costUsd, 0);
+});
+
 test("formatRunLogHeader names session id and join fields", () => {
   const header = formatRunLogHeader({
     runId: "run-abc",

@@ -1,0 +1,245 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://x.ai/schemas/grok-build/run-manifest.schema.json",
+  "title": "Grok Build run manifest",
+  "description": "Authoritative machine-readable surface of a Grok Build run. Emitted by show --json / wait --json. Pin on schemaVersion; detect drift when it changes.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schemaVersion",
+    "runId",
+    "status",
+    "timing",
+    "cli",
+    "model",
+    "isolation",
+    "changes",
+    "usage",
+    "agent",
+    "report",
+    "children",
+    "artifacts"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "type": "integer",
+      "const": 1,
+      "description": "Manifest format version. Bump when required fields or semantics change."
+    },
+    "runId": {
+      "type": ["string", "null"]
+    },
+    "parentRunId": {
+      "type": ["string", "null"]
+    },
+    "nestDepth": {
+      "type": ["integer", "null"],
+      "minimum": 0
+    },
+    "status": {
+      "type": "string"
+    },
+    "stopReason": {
+      "type": ["string", "null"]
+    },
+    "terminalReason": {
+      "type": ["string", "null"]
+    },
+    "write": {
+      "type": ["boolean", "null"]
+    },
+    "verified": {
+      "type": ["boolean", "null"]
+    },
+    "timing": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "startedAt": { "type": ["string", "null"] },
+        "endedAt": { "type": ["string", "null"] },
+        "durationMs": { "type": ["number", "null"] },
+        "baselineProbeMs": { "type": ["number", "null"] },
+        "backgroundWaitMs": { "type": ["number", "null"] }
+      }
+    },
+    "cli": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "binary": { "type": ["string", "null"] },
+        "version": { "type": ["string", "null"] },
+        "brand": { "type": ["string", "null"] },
+        "schemaVersion": {},
+        "permissionMode": { "type": ["string", "null"] },
+        "sandbox": { "type": ["string", "null"] },
+        "alwaysApprove": { "type": ["boolean", "null"] },
+        "confineRoot": { "type": ["string", "null"] }
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "requested": { "type": ["string", "null"] },
+        "served": { "type": ["string", "null"] }
+      }
+    },
+    "isolation": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["active", "breached"],
+      "properties": {
+        "active": { "type": "boolean" },
+        "worktree": { "type": ["string", "null"] },
+        "branch": { "type": ["string", "null"] },
+        "baseSha": { "type": ["string", "null"] },
+        "headSha": { "type": ["string", "null"] },
+        "breached": { "type": "boolean" },
+        "leakedPaths": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "confineViolations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "tool": { "type": ["string", "null"] },
+              "path": { "type": ["string", "null"] },
+              "resolvedPath": { "type": ["string", "null"] },
+              "root": { "type": ["string", "null"] }
+            }
+          }
+        }
+      }
+    },
+    "changes": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "git": { "type": ["object", "null"] },
+        "agentReported": { "type": ["object", "null"] },
+        "debris": { "type": ["object", "null"] },
+        "uidIntegrity": { "type": ["object", "null"] },
+        "changedFileCount": { "type": ["number", "null"] }
+      }
+    },
+    "verify": {
+      "type": ["object", "null"],
+      "additionalProperties": true
+    },
+    "usage": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "inputTokens": { "type": ["number", "null"] },
+        "cachedInputTokens": { "type": ["number", "null"] },
+        "outputTokens": { "type": ["number", "null"] },
+        "reasoningTokens": { "type": ["number", "null"] },
+        "totalTokens": { "type": ["number", "null"] },
+        "costUsd": { "type": ["number", "null"] },
+        "costUsdTicks": { "type": ["number", "null"] },
+        "costIsPartial": { "type": "boolean" },
+        "usageIsIncomplete": { "type": "boolean" },
+        "modelCalls": { "type": ["number", "null"] },
+        "numTurns": { "type": ["number", "null"] },
+        "byModel": { "type": ["object", "null"] },
+        "own": { "type": ["object", "null"] },
+        "nested": { "type": ["object", "null"] },
+        "includingNested": { "type": ["object", "null"] }
+      }
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "toolCallCount": { "type": ["number", "null"] },
+        "toolCallCountFloor": { "type": ["number", "null"] },
+        "toolVisibility": {
+          "type": "string",
+          "enum": ["observed", "explicit", "unavailable", "unknown"]
+        },
+        "autoContinued": { "type": "boolean" },
+        "maxTurnsReached": { "type": "boolean" },
+        "unknownEventTypes": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "errors": { "type": "array" },
+        "toolDenials": { "type": "array" },
+        "compaction": { "type": "array" },
+        "toolActivity": { "type": "array" }
+      }
+    },
+    "report": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "prose": { "type": ["string", "null"] },
+        "contractHonoured": { "type": "boolean" },
+        "structured": { "type": ["object", "null"] },
+        "statusLines": {
+          "type": ["array", "null"],
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "decisions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "assumptions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "notDone": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "openQuestions": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "followUps": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "confidence": {
+      "type": ["string", "null"],
+      "enum": ["high", "medium", "low", null]
+    },
+    "children": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "runId": { "type": ["string", "null"] },
+          "status": { "type": ["string", "null"] },
+          "verified": { "type": ["boolean", "null"] },
+          "changedFileCount": { "type": ["number", "null"] },
+          "cost": { "type": ["number", "null"] },
+          "usage": { "type": ["object", "null"] },
+          "branch": { "type": ["string", "null"] },
+          "finalReport": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "logFile": { "type": ["string", "null"] },
+        "eventsFile": { "type": ["string", "null"] },
+        "transcriptFile": { "type": ["string", "null"] },
+        "promptFile": { "type": ["string", "null"] }
+      }
+    },
+    "compat": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Legacy {job, storedJob} shape retained for one minor version."
+    }
+  }
+}
