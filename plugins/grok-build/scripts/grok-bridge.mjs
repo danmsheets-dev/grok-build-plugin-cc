@@ -239,8 +239,6 @@ const DIFF_STAT_MAX_BYTES = 1024 * 1024;
 // not less. completed-truncated / completed-blind may also hold partial work.
 // completed-noop is included so an empty isolated worktree is still cleaned
 // only by explicit land --discard / prune --include-unlanded, not by accident.
-// failed/cancelled/abandoned are deliberately excluded: those represent a
-// run that did not produce work worth preserving by default.
 const AWAITING_LAND_STATUSES = new Set([
   "completed",
   "completed-unverified",
@@ -248,6 +246,18 @@ const AWAITING_LAND_STATUSES = new Set([
   "completed-noop",
   "completed-blind",
   "timed-out"
+]);
+
+// Broader set used by prune/doctor: cancelled/failed/isolation-breached runs
+// routinely hold uncommitted or committed work (stop mid-run, isolation
+// leak after a successful commit). Content checks (dirty worktree, unmerged
+// commits, unknown git) are the primary gate; these statuses stop doctor
+// from recommending prune --apply as the "stale worktree" fix.
+const PROTECTED_WORKTREE_STATUSES = new Set([
+  ...AWAITING_LAND_STATUSES,
+  "cancelled",
+  "failed",
+  "isolation-breached"
 ]);
 
 function printUsage() {
@@ -1984,7 +1994,9 @@ function buildDoctorReport(cwd, options = {}) {
   });
 
   // Prefer reading the full job file for worktree when the index is sparse.
-  // Completed runs with unlanded commits are "awaiting land", not prunable staleness.
+  // Runs with unlanded commits, uncommitted dirt, or protected terminal
+  // statuses are "awaiting land", not prunable staleness — doctor must not
+  // recommend prune --apply for them.
   const staleWithPaths = [];
   const awaitingLand = [];
   for (const job of jobs) {
@@ -1996,13 +2008,24 @@ function buildDoctorReport(cwd, options = {}) {
       continue;
     }
     const status = stored.status ?? job.status;
+    const worktreePath = stored.worktree.path;
     const unmerged = countUnmergedCommits(
       workspaceRoot,
       stored.worktree.baseSha,
       stored.worktree.branch
     );
-    if (unmerged > 0 && AWAITING_LAND_STATUSES.has(status)) {
-      awaitingLand.push({ ...job, worktree: stored.worktree, unmergedCommits: unmerged });
+    const hasUncommitted = worktreeHasUncommittedWork(worktreePath);
+    const protect =
+      hasUncommitted ||
+      unmerged === null ||
+      (typeof unmerged === "number" && unmerged > 0 && PROTECTED_WORKTREE_STATUSES.has(status));
+    if (protect) {
+      awaitingLand.push({
+        ...job,
+        worktree: stored.worktree,
+        unmergedCommits: unmerged ?? 0,
+        hasUncommitted
+      });
     } else {
       staleWithPaths.push({ ...job, worktree: stored.worktree });
     }
@@ -2043,17 +2066,52 @@ function buildDoctorReport(cwd, options = {}) {
   };
 }
 
-/** Commits on branch that are not reachable from baseSha (unlanded work). */
+/**
+ * Commits on branch that are not reachable from baseSha (unlanded work).
+ * Returns null when git fails so callers treat unknown as protected rather
+ * than "zero commits, safe to delete".
+ */
 function countUnmergedCommits(repoRoot, baseSha, branchName) {
   if (!baseSha || !branchName) {
     return 0;
   }
   const result = git(repoRoot, ["rev-list", "--count", `${baseSha}..${branchName}`]);
   if (result.status !== 0) {
-    return 0;
+    return null;
   }
   const count = Number(String(result.stdout ?? "").trim());
-  return Number.isFinite(count) && count > 0 ? count : 0;
+  if (!Number.isFinite(count)) {
+    return null;
+  }
+  return count > 0 ? count : 0;
+}
+
+/**
+ * True when the worktree working tree has non-artifact dirt.
+ * On git failure, returns true (safe direction: protect).
+ */
+function worktreeHasUncommittedWork(worktreePath) {
+  if (!worktreePath || typeof worktreePath !== "string") {
+    return false;
+  }
+  if (!fs.existsSync(worktreePath)) {
+    return false;
+  }
+  let status = git(worktreePath, [
+    "status",
+    "--porcelain",
+    "--untracked-files=all",
+    "--",
+    ".",
+    ...artifactExcludePathspecs()
+  ]);
+  if (status.status !== 0) {
+    status = git(worktreePath, ["status", "--porcelain", "--untracked-files=all"]);
+  }
+  if (status.status !== 0) {
+    return true;
+  }
+  return Boolean(String(status.stdout ?? "").trim());
 }
 
 async function handleDoctor(argv) {
@@ -2272,17 +2330,40 @@ function collectPrunePlan(cwd, options = {}) {
     const worktreePath = worktree.path;
     const branchName = worktree.branch ?? null;
     const unmerged = countUnmergedCommits(workspaceRoot, worktree.baseSha, branchName);
+    const hasUncommitted = worktreeHasUncommittedWork(worktreePath);
 
-    // Successful completed runs with commits still on the branch are awaiting
-    // land — never delete that branch unless the user opts in explicitly.
-    if (unmerged > 0 && AWAITING_LAND_STATUSES.has(status) && !includeUnlanded) {
-      awaitingLand.push({
-        jobId,
-        branch: branchName,
-        unmergedCommits: unmerged,
-        detail: `Run ${jobId} has unlanded work (${unmerged} commit(s) on ${branchName ?? "branch"}); use /grok-build:land or pass --include-unlanded to prune.`
-      });
-      continue;
+    // Prefer quarantine over deletion: anything that still holds work (commits,
+    // dirty working tree, or unknown git state) stays until the user opts in
+    // with --include-unlanded. Status alone is not enough — a cancelled run can
+    // hold 30 uncommitted assets, and isolation-breached can hold real commits.
+    if (!includeUnlanded) {
+      if (hasUncommitted) {
+        awaitingLand.push({
+          jobId,
+          branch: branchName,
+          unmergedCommits: typeof unmerged === "number" ? unmerged : 0,
+          detail: `Run ${jobId} has uncommitted work in worktree at ${worktreePath}; use /grok-build:land or pass --include-unlanded to prune.`
+        });
+        continue;
+      }
+      if (unmerged === null) {
+        awaitingLand.push({
+          jobId,
+          branch: branchName,
+          unmergedCommits: 0,
+          detail: `Run ${jobId} worktree could not be inspected for unlanded commits; refusing to prune without --include-unlanded.`
+        });
+        continue;
+      }
+      if (unmerged > 0 && PROTECTED_WORKTREE_STATUSES.has(status)) {
+        awaitingLand.push({
+          jobId,
+          branch: branchName,
+          unmergedCommits: unmerged,
+          detail: `Run ${jobId} has unlanded work (${unmerged} commit(s) on ${branchName ?? "branch"}, status=${status}); use /grok-build:land or pass --include-unlanded to prune.`
+        });
+        continue;
+      }
     }
 
     actions.push({
@@ -4176,36 +4257,52 @@ async function executeTaskRun(request) {
       };
     }
 
-    // Uncommitted debris left in the worktree after the commit (BRIDGE-12).
+    // Uncommitted residue left in the worktree after the commit attempt
+    // (BRIDGE-12). Debris is tracked separately; real work that never made it
+    // into a commit (failed commit, mid-run stop) becomes the measured
+    // worktreeSide so we never claim "nothing written" for files still on disk.
     const residual = porcelainChangeEntries(created.worktreePath);
     if (residual) {
       const residualEntries = [];
       for (const [filePath, letter] of residual) {
         residualEntries.push(`${letter}\t${filePath}`);
       }
-      const { debris: residualDebris } = partitionWorkAndDebris(residualEntries);
+      const { work: residualWork, debris: residualDebris } =
+        partitionWorkAndDebris(residualEntries);
       if (residualDebris.length > 0) {
         const capped = capChangedFiles(residualDebris);
         debris = debris
           ? capChangedFiles([...(debris.entries ?? []), ...capped.entries])
           : capped;
       }
+      if (worktreeSide == null && residualWork.length > 0) {
+        worktreeSide = { ...capChangedFiles(residualWork), emptyReason: null };
+      }
     }
 
     // Dual accounting (BRIDGE-3): never conflate worktree and main-tree counts.
     // Status uses the SUM so a main-only write is never completed-noop.
-    const worktreeTotal = worktreeSide?.total ?? 0;
-    const mainTotal = mainTreeSide?.total ?? 0;
+    //
+    // CRITICAL: never substitute 0 for an unknown side. When commit fails,
+    // worktreeSide stays null; mainTreeSide is often a measured empty map from
+    // breach detection. Summing (null→0) + 0 produced total:0 and completed-noop
+    // / "nothing-written" while real work sat uncommitted in the worktree.
+    // Unknown worktree side ⇒ unknown combined total (null), never a sum.
     const combinedTotal =
-      worktreeSide == null && mainTreeSide == null ? null : worktreeTotal + mainTotal;
+      worktreeSide == null
+        ? null
+        : mainTreeSide == null
+          ? Number(worktreeSide.total ?? 0)
+          : Number(worktreeSide.total ?? 0) + Number(mainTreeSide.total ?? 0);
     changedFiles = {
       source: "dual",
       worktree: worktreeSide,
       mainTree: mainTreeSide,
       // Legacy flat fields for older consumers / decideCompletionStatus.
       entries: worktreeSide?.entries ?? [],
-      total: combinedTotal ?? 0,
+      total: combinedTotal,
       truncated: Boolean(worktreeSide?.truncated || mainTreeSide?.truncated),
+      commitError: committed.error ?? null,
       emptyReason:
         combinedTotal === 0
           ? worktreeSide?.emptyReason ?? mainTreeSide?.emptyReason ?? "nothing-written"
@@ -6228,6 +6325,26 @@ async function handleLand(argv) {
   }
 
   if (options.discard) {
+    // Surface what is about to be destroyed so discard is never a silent wipe.
+    let discardDirty = [];
+    try {
+      let status = git(worktreePath, [
+        "status",
+        "--porcelain",
+        "--untracked-files=all",
+        "--",
+        ".",
+        ...artifactExcludePathspecs()
+      ]);
+      if (status.status !== 0) {
+        status = git(worktreePath, ["status", "--porcelain", "--untracked-files=all"]);
+      }
+      if (status.status === 0) {
+        discardDirty = porcelainDirtyPaths(status.stdout);
+      }
+    } catch {
+      // Best-effort listing; discard still proceeds (user asked explicitly).
+    }
     removeWorktree({
       repoRoot,
       worktreePath,
@@ -6239,9 +6356,14 @@ async function handleLand(argv) {
       jobId: job.id,
       action: "discard",
       worktree,
-      diffStat: null
+      diffStat: null,
+      discardedUncommitted: discardDirty
     };
-    const rendered = `Discarded ${job.id}: worktree and branch removed.\n`;
+    const dirtyNote =
+      discardDirty.length > 0
+        ? ` Discarded uncommitted paths: ${discardDirty.slice(0, 8).join(", ")}${discardDirty.length > 8 ? ", …" : ""}.`
+        : "";
+    const rendered = `Discarded ${job.id}: worktree and branch removed.${dirtyNote}\n`;
     outputCommandResult(payload, rendered, options.json);
     return;
   }
@@ -6367,6 +6489,60 @@ async function handleLand(argv) {
       `Refusing to land: ${named} has uncommitted changes and land may have to hard-reset ` +
         `to recover from a merge conflict. Commit or stash it first.`
     );
+  }
+
+  // Empty branch range: git merge --squash exits 0 with "Already up to date"
+  // and stages nothing. If we then force-delete the worktree, any uncommitted
+  // files that were the run's only copy are destroyed under a success message.
+  if (!diffStat) {
+    let wtStatus = git(worktreePath, [
+      "status",
+      "--porcelain",
+      "--untracked-files=all",
+      "--",
+      ".",
+      ...artifactExcludePathspecs()
+    ]);
+    if (wtStatus.status !== 0) {
+      wtStatus = git(worktreePath, ["status", "--porcelain", "--untracked-files=all"]);
+    }
+    if (wtStatus.status !== 0) {
+      throw new Error(
+        `Refusing to land ${job.id}: branch has no commits beyond base, and the worktree could not be inspected (${(wtStatus.stderr || wtStatus.stdout || "").trim() || "git status failed"}). Resolve the worktree or use land --discard to drop it explicitly.`
+      );
+    }
+    const wtDirty = porcelainDirtyPaths(wtStatus.stdout);
+    if (wtDirty.length > 0) {
+      const named = wtDirty.slice(0, 8).join(", ");
+      throw new Error(
+        `Refusing to land ${job.id}: branch ${branchName} has no commits beyond base, but the worktree has uncommitted work (${named}${wtDirty.length > 8 ? ", …" : ""}). ` +
+          `Commit inside the worktree first, or use land --discard to drop it explicitly.`
+      );
+    }
+    // Empty branch + clean worktree: nothing to stage. Remove the empty
+    // worktree but do not claim a successful land of staged changes.
+    removeWorktree({
+      repoRoot,
+      worktreePath,
+      branchName,
+      deleteBranch: true
+    });
+    markJobLanded(workspaceRoot, job.id, storedJob, "apply-empty");
+    const currentBranch = getCurrentBranch(repoRoot);
+    const payload = {
+      jobId: job.id,
+      action: "apply-empty",
+      landed: false,
+      worktree,
+      diffStat: "",
+      totalBinaryFiles: 0,
+      ignoredDirtyArtifacts
+    };
+    const text =
+      `Nothing to land: ${branchName} has no commits beyond base (and the worktree is clean). ` +
+      `Removed empty worktree for ${job.id}. Current branch: ${currentBranch}.\n`;
+    outputCommandResult(payload, text, options.json);
+    return;
   }
 
   // Unchecked on purpose: gitChecked would throw with git's raw stderr and

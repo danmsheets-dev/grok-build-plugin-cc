@@ -793,10 +793,26 @@ function linkExcludePathspecs(worktreePath) {
  * @returns {{committed: boolean, sha: string, error?: string}}
  */
 export function commitWorktreeChanges(worktreePath, message = "grok agent changes") {
-  const headSha = () => gitChecked(worktreePath, ["rev-parse", "HEAD"]).stdout.trim();
+  // Unchecked: a throw here would discard an otherwise complete run and
+  // contradict the no-throw contract above. A failed rev-parse yields sha:null.
+  const headSha = () => {
+    const result = git(worktreePath, ["rev-parse", "HEAD"]);
+    if (result.status !== 0 || result.error) {
+      return null;
+    }
+    const sha = String(result.stdout ?? "").trim();
+    return sha || null;
+  };
 
   const status = git(worktreePath, ["status", "--porcelain"]);
-  if (status.status !== 0 || !status.stdout.trim()) {
+  // A non-zero status is NOT a clean tree. Conflating the two made a locked
+  // index (or any status failure) look like "nothing to commit", which the
+  // bridge then recorded as completed-noop / nothing-written while real work
+  // sat uncommitted in the worktree.
+  if (status.status !== 0 || status.error) {
+    return { committed: false, sha: headSha(), error: formatGitFailure("status", status) };
+  }
+  if (!status.stdout.trim()) {
     return { committed: false, sha: headSha() };
   }
 

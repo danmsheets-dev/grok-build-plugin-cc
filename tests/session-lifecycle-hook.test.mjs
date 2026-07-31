@@ -124,3 +124,62 @@ test("SessionEnd is a no-op when no jobs belong to the ending session", () => {
   assert.equal(outcome.result.status, 0, outcome.result.stderr);
   assert.equal(outcome.otherJobExists, true);
 });
+
+test("SessionEnd retains completed write runs whose worktree still holds unlanded work", () => {
+  // Regression: cleanupSessionJobs filtered every job of the ending session
+  // by sessionId alone, then saveState reclaimed the job file and log. The
+  // worktree directory survived on disk but became permanently invisible to
+  // land / prune / runs / doctor.
+  const workspaceRoot = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const worktreePath = path.join(workspaceRoot, "wt-unlanded");
+  fs.mkdirSync(worktreePath, { recursive: true });
+  fs.writeFileSync(path.join(worktreePath, "REAL-WORK.txt"), "keep me\n", "utf8");
+
+  const outcome = withPluginData(pluginDataDir, () => {
+    const jobId = generateJobId("run");
+    const record = {
+      id: jobId,
+      sessionId: "session-ending",
+      status: "completed",
+      kind: "task",
+      jobClass: "task",
+      write: true,
+      worktree: {
+        path: worktreePath,
+        branch: `grok-build/${jobId}`,
+        baseSha: "abc123"
+      }
+    };
+    writeJobFile(workspaceRoot, jobId, record);
+    upsertJob(workspaceRoot, record);
+    fs.writeFileSync(resolveJobLogFile(workspaceRoot, jobId), "log\n", "utf8");
+
+    const result = runSessionEnd(workspaceRoot, pluginDataDir, "session-ending");
+    const jobs = listJobs(workspaceRoot);
+    const jobFile = resolveJobFile(workspaceRoot, jobId);
+    const logFile = resolveJobLogFile(workspaceRoot, jobId);
+    return {
+      result,
+      stillIndexed: jobs.some((job) => job.id === jobId),
+      indexed: jobs.find((job) => job.id === jobId) ?? null,
+      jobFileExists: fs.existsSync(jobFile),
+      logFileExists: fs.existsSync(logFile),
+      worktreeExists: fs.existsSync(worktreePath),
+      realWorkExists: fs.existsSync(path.join(worktreePath, "REAL-WORK.txt"))
+    };
+  });
+
+  assert.equal(outcome.result.status, 0, outcome.result.stderr);
+  assert.equal(outcome.stillIndexed, true, "completed unlanded run must stay in the index");
+  assert.equal(outcome.jobFileExists, true, "job file must survive SessionEnd");
+  assert.equal(outcome.logFileExists, true, "log file must survive SessionEnd");
+  assert.equal(outcome.worktreeExists, true);
+  assert.equal(outcome.realWorkExists, true);
+  assert.equal(
+    outcome.indexed?.sessionId,
+    null,
+    "retained run is re-keyed off the ended session so a later SessionEnd does not re-process it"
+  );
+  assert.equal(outcome.indexed?.sessionEnded, true);
+});

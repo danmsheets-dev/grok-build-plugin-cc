@@ -1,3 +1,4 @@
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -545,4 +546,76 @@ test("terminateProcessTree still reports a genuine survivor", () => {
 
   assert.equal(outcome.delivered, false);
   assert.deepEqual(outcome.survivors, [4243]);
+});
+
+test("terminateProcessTree real liveness probe reports survivor when kill is a no-op", () => {
+  // Regression: on Windows every liveness probe returned "dead" because
+  // isZombieProcess gated on POSIX-only `ps` and treated ENOENT/status≠0 as
+  // zombie. terminateProcessTree then short-circuited with delivered:true after
+  // taskkill, so the escalation ladder and survivors list were unreachable.
+  // This test uses the REAL processIsAlive (no isAliveImpl) against a live
+  // child with a no-op runCommandImpl — the repro inverted.
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], {
+    stdio: "ignore",
+    windowsHide: true,
+    detached: false
+  });
+  assert.ok(Number.isFinite(child.pid) && child.pid > 0, "child must have a pid");
+
+  try {
+    // Prove the process is alive via Node's own signal-0 probe.
+    assert.doesNotThrow(() => process.kill(child.pid, 0));
+
+    const outcome = terminateProcessTree(child.pid, {
+      platform: process.platform,
+      settleMs: 0,
+      confirmTimeoutMs: 80,
+      confirmStepMs: 10,
+      // Pretend every kill tool succeeded without actually killing.
+      runCommandImpl: () => ({
+        status: 0,
+        stdout: "",
+        stderr: "",
+        error: null
+      }),
+      // Do not inject isAliveImpl — that is the whole point of this test.
+      killImpl: (pid, signal) => {
+        if (signal === 0) {
+          return process.kill(pid, 0);
+        }
+        // Swallow real kill signals so the child stays up for the verdict.
+        return true;
+      }
+    });
+
+    assert.equal(outcome.attempted, true, "must attempt a kill");
+    assert.equal(
+      outcome.delivered,
+      false,
+      "a still-alive child must not be reported delivered (probe must observe live)"
+    );
+    assert.ok(Array.isArray(outcome.survivors), "survivors must be listed");
+    assert.equal(outcome.survivors.length, 1);
+    assert.equal(outcome.survivors[0], child.pid);
+  } finally {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // already gone
+    }
+    try {
+      process.kill(child.pid, 0);
+      // Still alive — force via taskkill/SIGKILL path the OS understands.
+      if (process.platform === "win32") {
+        spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], {
+          windowsHide: true,
+          stdio: "ignore"
+        });
+      } else {
+        process.kill(child.pid, "SIGKILL");
+      }
+    } catch {
+      // already dead
+    }
+  }
 });

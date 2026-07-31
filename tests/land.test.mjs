@@ -488,7 +488,7 @@ test("an uncommitted edit to a TRACKED file under an artifact path blocks land",
 
     // NUL bytes are what make git treat it as binary; binary conflicts are the
     // deterministic route into recoverFromFailedLandMerge.
-    const asset = (marker) => Buffer.from(`${marker}  payload\n`, "binary");
+    const asset = (marker) => Buffer.from(`${marker} payload\n`, "binary");
     fs.writeFileSync(path.join(repo, "asset.bin"), asset("BASE"));
     run("git", ["add", "-A"], { cwd: repo });
     run("git", ["commit", "-m", "add tracked artifact-path file and binary asset"], { cwd: repo });
@@ -830,3 +830,48 @@ test("land bounds the preview diff and never materializes it on the apply path",
     }
   }
 });
+
+
+test("land refuses empty squash-merge when worktree has uncommitted work", () => {
+  // Regression: git merge --squash exits 0 with "Already up to date" when the
+  // branch has no commits beyond base. Land then force-deleted the worktree
+  // that held the run's only uncommitted copy, under a success message.
+  const binDir = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const repo = makeTempDir();
+  installFakeGrok(binDir);
+  seedRepo(repo);
+
+  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
+  try {
+    const jobId = generateJobId("run");
+    const created = createWorktree({ cwd: repo, runId: jobId, dataDir: pluginDataDir });
+    fs.writeFileSync(path.join(created.worktreePath, "UNCOMMITTED.txt"), "only copy\n");
+    seedFinishedJob(repo, pluginDataDir, {
+      id: jobId,
+      worktree: {
+        path: created.worktreePath,
+        branch: created.branchName,
+        baseSha: created.baseSha
+      }
+    });
+
+    const result = run("node", [SCRIPT, "land", jobId], {
+      cwd: repo,
+      env: pluginDataEnv(pluginDataDir, binDir)
+    });
+    assert.notEqual(result.status, 0, "land must refuse, not report success");
+    assert.match(result.stderr + result.stdout, /uncommitted|Refusing to land/i);
+    assert.equal(fs.existsSync(created.worktreePath), true, "worktree must survive");
+    assert.equal(
+      fs.existsSync(path.join(created.worktreePath, "UNCOMMITTED.txt")),
+      true,
+      "uncommitted files must not be force-deleted"
+    );
+    const branchList = run("git", ["branch", "--list", created.branchName], { cwd: repo });
+    assert.match(branchList.stdout, /grok-build\//);
+  } finally {
+    delete process.env.CLAUDE_PLUGIN_DATA;
+  }
+});
+

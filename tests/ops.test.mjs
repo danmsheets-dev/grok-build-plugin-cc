@@ -882,6 +882,125 @@ test("doctor reports completed-unverified unlanded work as awaiting land, not pr
   assert.doesNotMatch(awaiting.fix ?? "", /prune/i, "must not recommend the destructive prune remedy");
 });
 
+function seedTerminalWorktree(repo, pluginDataDir, status, { commitWork = false, dirty = false } = {}) {
+  fs.writeFileSync(path.join(repo, "README.md"), "# seed\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const jobId = generateJobId("run");
+  const created = createWorktree({
+    cwd: repo,
+    runId: jobId,
+    dataDir: pluginDataDir
+  });
+  if (commitWork) {
+    fs.writeFileSync(path.join(created.worktreePath, "committed.txt"), "on branch\n");
+    run("git", ["add", "committed.txt"], { cwd: created.worktreePath });
+    run("git", ["commit", "-m", "agent work"], { cwd: created.worktreePath });
+  }
+  if (dirty) {
+    fs.writeFileSync(path.join(created.worktreePath, "DIRTY.txt"), "uncommitted assets\n");
+  }
+
+  withPluginData(pluginDataDir, () => {
+    const job = {
+      id: jobId,
+      status,
+      phase: "done",
+      kind: "task",
+      kindLabel: "delegate",
+      title: `Seeded ${status}`,
+      jobClass: "task",
+      summary: status,
+      worktree: {
+        path: created.worktreePath,
+        branch: created.branchName,
+        baseSha: created.baseSha
+      },
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+    writeJobFile(repo, jobId, job);
+    upsertJob(repo, job);
+  });
+
+  return { jobId, created };
+}
+
+test("prune protects a cancelled job with a dirty worktree from --apply", () => {
+  const binDir = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const repo = makeTempDir();
+  installFakeGrok(binDir);
+  initGitRepo(repo);
+
+  const { jobId, created } = withPluginData(pluginDataDir, () =>
+    seedTerminalWorktree(repo, pluginDataDir, "cancelled", { dirty: true })
+  );
+
+  const dryRun = run("node", [SCRIPT, "prune", "--json"], {
+    cwd: repo,
+    env: pluginDataEnv(pluginDataDir, binDir)
+  });
+  assert.equal(dryRun.status, 0, dryRun.stderr);
+  const dryPayload = JSON.parse(dryRun.stdout);
+  assert.ok(
+    dryPayload.awaitingLand.some((item) => item.jobId === jobId),
+    "cancelled dirty worktree must appear under awaitingLand"
+  );
+  assert.equal(
+    dryPayload.items.some((item) => item.jobId === jobId && item.type === "worktree"),
+    false,
+    "default prune plan must not schedule removal of dirty cancelled worktree"
+  );
+
+  const applied = run("node", [SCRIPT, "prune", "--apply", "--json"], {
+    cwd: repo,
+    env: pluginDataEnv(pluginDataDir, binDir)
+  });
+  assert.equal(applied.status, 0, applied.stderr);
+  assert.equal(fs.existsSync(created.worktreePath), true, "dirty cancelled worktree must survive --apply");
+  assert.equal(
+    fs.existsSync(path.join(created.worktreePath, "DIRTY.txt")),
+    true,
+    "uncommitted work must not be force-deleted"
+  );
+  const branchList = run("git", ["branch", "--list", created.branchName], { cwd: repo });
+  assert.match(branchList.stdout, /grok-build\//, "branch must survive");
+});
+
+test("prune protects an isolation-breached job with commits from --apply", () => {
+  const binDir = makeTempDir();
+  const pluginDataDir = makeTempDir();
+  const repo = makeTempDir();
+  installFakeGrok(binDir);
+  initGitRepo(repo);
+
+  const { jobId, created } = withPluginData(pluginDataDir, () =>
+    seedTerminalWorktree(repo, pluginDataDir, "isolation-breached", { commitWork: true })
+  );
+
+  const dryRun = run("node", [SCRIPT, "prune", "--json"], {
+    cwd: repo,
+    env: pluginDataEnv(pluginDataDir, binDir)
+  });
+  assert.equal(dryRun.status, 0, dryRun.stderr);
+  const dryPayload = JSON.parse(dryRun.stdout);
+  assert.ok(
+    dryPayload.awaitingLand.some((item) => item.jobId === jobId && item.unmergedCommits > 0),
+    "isolation-breached with commits must appear under awaitingLand"
+  );
+
+  const applied = run("node", [SCRIPT, "prune", "--apply", "--json"], {
+    cwd: repo,
+    env: pluginDataEnv(pluginDataDir, binDir)
+  });
+  assert.equal(applied.status, 0, applied.stderr);
+  assert.equal(fs.existsSync(created.worktreePath), true, "isolation-breached worktree must survive");
+  const branchList = run("git", ["branch", "--list", created.branchName], { cwd: repo });
+  assert.match(branchList.stdout, /grok-build\//, "isolation-breached branch must survive");
+});
+
 test("a trusted project config drives verification end to end", () => {
   const binDir = makeTempDir();
   const pluginDataDir = makeTempDir();

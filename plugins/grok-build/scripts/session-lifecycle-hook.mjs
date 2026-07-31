@@ -4,7 +4,14 @@ import fs from "node:fs";
 import process from "node:process";
 
 import { terminateProcessTree } from "./lib/process.mjs";
-import { claimJobTerminal, loadState, resolveStateFile, updateState } from "./lib/state.mjs";
+import {
+  claimJobTerminal,
+  jobHasLiveWorktree,
+  loadState,
+  resolveStateFile,
+  updateState,
+  writeJobFile
+} from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
 import { resolveJobTreeKillTargets, SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
@@ -126,8 +133,37 @@ function cleanupSessionJobs(cwd, sessionId) {
   // that job as "dropped" relative to the stale snapshot and deleted its files
   // from disk. Confirmed directly: a job from an unrelated session, created in
   // that exact window, had its job file deleted by this cleanup.
+  //
+  // Never drop a job whose worktree still exists on disk. Filtering by
+  // sessionId alone deleted the index entry, jobs/<id>.json and log of every
+  // completed write run for the ending session — the worktree and branch
+  // survived on disk but became permanently undiscoverable to land/prune/runs.
+  // Retain those records (re-key sessionId so a future SessionEnd does not
+  // re-process them) and let /prune be the single place that reclaims.
   updateState(workspaceRoot, (state) => {
-    state.jobs = state.jobs.filter((job) => job.sessionId !== sessionId);
+    const nextJobs = [];
+    for (const job of state.jobs) {
+      if (job.sessionId !== sessionId) {
+        nextJobs.push(job);
+        continue;
+      }
+      if (jobHasLiveWorktree(job)) {
+        const retained = {
+          ...job,
+          sessionId: null,
+          sessionEnded: true
+        };
+        nextJobs.push(retained);
+        try {
+          writeJobFile(workspaceRoot, job.id, retained);
+        } catch {
+          // Index retention is the critical half; job-file best-effort.
+        }
+        continue;
+      }
+      // Safely reclaimable: no live worktree for this session's job.
+    }
+    state.jobs = nextJobs;
   });
 }
 

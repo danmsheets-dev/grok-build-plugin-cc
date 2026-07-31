@@ -526,18 +526,34 @@ function listWin32DescendantPidsLeafFirst(rootPid, runCommandImpl, options = {})
   }
 }
 
-function isZombieProcess(pid) {
+/**
+ * POSIX-only: a process in state Z is a zombie (dead but not reaped).
+ *
+ * On win32 the zombie concept does not exist and `ps -p -o` is either missing
+ * (ENOENT from PowerShell-launched node) or rejects those flags (Git's ps.exe).
+ * Calling it and treating every failure as "zombie" made processIsAlive always
+ * return false on Windows, so terminateProcessTree short-circuited with
+ * delivered:true after a no-op taskkill and never escalated.
+ *
+ * Missing/failing `ps` is "unknown": fall back to not-zombie (alive is the
+ * safe direction — a false "dead" is what manufactured delivered:true).
+ */
+function isZombieProcess(pid, platform = process.platform) {
+  if (platform === "win32") {
+    return false;
+  }
   try {
     const result = spawnSync("ps", ["-p", String(pid), "-o", "stat="], {
       encoding: "utf8",
       windowsHide: true
     });
+    // Unknown: do not invent a zombie. Only a printed Z state is evidence.
     if (result.error || result.status !== 0) {
-      return true;
+      return false;
     }
     const stat = String(result.stdout ?? "").trim();
     if (!stat) {
-      return true;
+      return false;
     }
     return /\bZ\b|^Z/i.test(stat) || stat.toUpperCase().includes("Z");
   } catch {
@@ -545,7 +561,13 @@ function isZombieProcess(pid) {
   }
 }
 
-function processIsAlive(pid, killImpl) {
+/**
+ * True when the pid still exists (and is not a POSIX zombie).
+ *
+ * `delivered` for terminateProcessTree means observed-dead, not attempted.
+ * On win32 a successful kill(pid, 0) is conclusive — never call ps.
+ */
+function processIsAlive(pid, killImpl, platform = process.platform) {
   try {
     killImpl(pid, 0);
   } catch (error) {
@@ -553,11 +575,19 @@ function processIsAlive(pid, killImpl) {
       return false;
     }
     if (error?.code === "EPERM" || error?.code === "EACCES") {
-      return !isZombieProcess(pid);
+      // Exists but we cannot signal it. On win32 that is still "alive".
+      if (platform === "win32") {
+        return true;
+      }
+      return !isZombieProcess(pid, platform);
     }
     throw error;
   }
-  return !isZombieProcess(pid);
+  // kill(pid, 0) succeeded: the process table has this pid.
+  if (platform === "win32") {
+    return true;
+  }
+  return !isZombieProcess(pid, platform);
 }
 
 function tryKill(killImpl, pid, signal) {
@@ -603,7 +633,8 @@ export function terminateProcessTree(pid, options = {}) {
   const runCommandImpl = options.runCommandImpl ?? runCommand;
   const killImpl = options.killImpl ?? process.kill.bind(process);
   const isAliveImpl =
-    options.isAliveImpl ?? ((candidatePid) => processIsAlive(candidatePid, killImpl));
+    options.isAliveImpl ??
+    ((candidatePid) => processIsAlive(candidatePid, killImpl, platform));
   const graceMs = options.graceMs ?? 200;
   // Short settle between win32 escalation steps. Injected so tests do not sleep.
   const settleMs = options.settleMs ?? 250;

@@ -498,7 +498,14 @@ export function loadState(cwd) {
 // exactly like any other finished job. MAX_JOBS therefore caps the ordinary,
 // already-cleaned-up case; it was never meant to be the thing deciding
 // whether a live worktree's bookkeeping survives.
-function jobHasLiveWorktree(job) {
+/**
+ * True when the job's recorded worktree directory still exists on disk.
+ *
+ * Used by MAX_JOBS eviction and SessionEnd cleanup so a finished write run
+ * with unlanded work is never dropped from the index (which would make the
+ * worktree permanently invisible to land/prune/runs/doctor).
+ */
+export function jobHasLiveWorktree(job) {
   const worktreePath = job?.worktree?.path;
   if (!worktreePath || typeof worktreePath !== "string") {
     return false;

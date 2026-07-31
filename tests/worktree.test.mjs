@@ -403,6 +403,63 @@ test("commitWorktreeChanges returns committed:false when the worktree is clean",
   });
 });
 
+test("commitWorktreeChanges reports error when git status fails instead of clean no-op", () => {
+  // Regression: status.status !== 0 was conflated with an empty tree, so a
+  // locked index looked like "nothing to commit" and the bridge recorded
+  // completed-noop / nothing-written while real work sat uncommitted.
+  const cwd = makeTempDir("grok-wt-statusfail-");
+  const dataDir = makeTempDir("grok-wt-statusfail-data-");
+  const binDir = makeTempDir("grok-wt-statusfail-bin-");
+  seedRepo(cwd);
+
+  const created = createWorktree({ cwd, runId: "statusfail-1", dataDir });
+  fs.writeFileSync(path.join(created.worktreePath, "agent-work.txt"), "real work\n", "utf8");
+
+  // Shim git so `status --porcelain` fails while rev-parse still works.
+  fs.mkdirSync(binDir, { recursive: true });
+  writeExecutable(
+    path.join(binDir, "git"),
+    `#!/usr/bin/env node
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+const argv = process.argv.slice(2);
+const shimDir = ${JSON.stringify(binDir)};
+if (argv[0] === "status") {
+  process.stderr.write("fatal: Unable to create '.git/index.lock': File exists.\\n");
+  process.exit(128);
+}
+const env = {};
+for (const [key, value] of Object.entries(process.env)) {
+  if (key.toUpperCase() !== "PATH") env[key] = value;
+}
+env.PATH = String(process.env.PATH ?? "")
+  .split(path.delimiter)
+  .filter((entry) => entry && path.resolve(entry) !== path.resolve(shimDir))
+  .join(path.delimiter);
+const result = spawnSync("git", argv, { env, stdio: "inherit", windowsHide: true });
+process.exit(result.status ?? 1);
+`
+  );
+
+  let result;
+  withPathPrefix(binDir, () => {
+    assert.doesNotThrow(() => {
+      result = commitWorktreeChanges(created.worktreePath, "should not claim clean");
+    });
+  });
+
+  assert.equal(result.committed, false);
+  assert.equal(typeof result.error, "string");
+  assert.match(result.error, /git status failed/);
+  assert.ok(result.sha === null || typeof result.sha === "string");
+
+  removeWorktree({
+    repoRoot: created.repoRoot,
+    worktreePath: created.worktreePath,
+    branchName: created.branchName
+  });
+});
+
 test("commitWorktreeChanges excludes build artifacts in a linked worktree", () => {
   // CRITICAL: must use a real linked worktree created by createWorktree.
   // git reads excludes from the common git dir; a plain-repo test would pass
