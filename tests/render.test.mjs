@@ -5,9 +5,11 @@ import {
   buildBridgeResultBlock,
   buildRunManifest,
   buildTaskStatusLines,
+  countChangedFilesForHonesty,
   formatToolCallsLabel,
   formatUsageLine,
   formatUsageTotals,
+  formatVerifyRatioLine,
   renderJobStatusReport,
   renderReviewResult,
   renderStoredJobResult,
@@ -204,11 +206,12 @@ test("renderTaskResult surfaces a passing verification", () => {
   // Regression: verified/worktree/budget were all computed by executeTaskRun
   // and then never appended to the rendered output at all - a run's actual
   // terminal text said nothing about whether verification passed.
+  // R7-4: prefer `verify passed` / ratio over boolean Verified: yes.
   const output = renderTaskResult(
     { rawOutput: "Fixed the bug." },
     { title: "Grok Build Delegate", verified: true }
   );
-  assert.match(output, /Verified: yes/);
+  assert.match(output, /verify passed|Verified: yes/);
 });
 
 test("renderTaskResult surfaces a failing verification with its note", () => {
@@ -522,7 +525,8 @@ test("renderTaskResult can surface all three at once", () => {
       budgetStopped: null
     }
   );
-  assert.match(output, /Verified: yes \(failures unchanged from baseline\)/);
+  // R7-4: honesty line carries the note; boolean Verified: yes is no longer required.
+  assert.match(output, /verify passed \(failures unchanged from baseline\)|Verified: yes \(failures unchanged from baseline\)/);
   assert.match(output, /Worktree: \/tmp\/wt/);
   assert.doesNotMatch(output, /Budget:/, "no budget line when budgetStopped is null");
 });
@@ -966,4 +970,88 @@ test("buildRunManifest sets breached only from isolation flags, not confineViola
   assert.equal(breached.isolation.breached, true);
   assert.equal(breached.isolation.confineViolations.length, 1);
   assert.deepEqual(breached.isolation.leakedPaths, ["A\tleaked.txt"]);
+});
+
+// --- R7-4: report honesty at the top ---
+
+test("R7-4 honesty header: files changed first, zero-write flagged, verify ratio", () => {
+  const lines = buildTaskStatusLines({
+    write: true,
+    changedFileCount: 0,
+    verified: true,
+    status: "completed-noop",
+    verifyResults: [
+      { command: "npm test", ok: true },
+      { command: "lint", ok: true },
+      { command: "typecheck", ok: false }
+    ],
+    baselines: [
+      { command: "npm test", ok: true },
+      { command: "lint", ok: true },
+      { command: "typecheck", ok: true }
+    ]
+  });
+  // files changed is the first honesty line
+  assert.equal(lines[0], "files changed: 0  ⚠ --write run changed nothing");
+  // completed-noop suppresses verify ratio (verified n/a) — files still first
+  assert.match(lines.join("\n"), /Verified: n\/a - the run changed no files/);
+});
+
+test("R7-4 verify ratio replaces boolean Verified: yes when results exist", () => {
+  const lines = buildTaskStatusLines({
+    write: true,
+    changedFileCount: 3,
+    verified: true,
+    status: "completed",
+    verifyResults: [
+      { command: "a", ok: true },
+      { command: "b", ok: true },
+      { command: "c", ok: false }
+    ],
+    baselines: [
+      { command: "a", ok: true },
+      { command: "b", ok: true },
+      { command: "c", ok: true }
+    ],
+    verifyNote: "failures unchanged from baseline"
+  });
+  assert.equal(lines[0], "files changed: 3");
+  assert.equal(lines[1], "verify 2/3 (baseline 3/3)");
+  // Boolean Verified: yes must not appear when ratio is present
+  assert.doesNotMatch(lines.join("\n"), /^Verified: yes/m);
+  assert.match(lines.join("\n"), /Verify note: failures unchanged from baseline/);
+});
+
+test("formatVerifyRatioLine and countChangedFilesForHonesty helpers", () => {
+  assert.equal(
+    formatVerifyRatioLine({
+      status: "completed",
+      verifyResults: [{ ok: true }, { ok: true }],
+      baselines: [{ ok: true }, { ok: false }]
+    }),
+    "verify 2/2 (baseline 1/2)"
+  );
+  assert.equal(
+    countChangedFilesForHonesty({
+      changedFiles: {
+        worktree: { total: 2, entries: ["a", "b"] },
+        mainTree: { total: 1, entries: ["c"] }
+      }
+    }),
+    3
+  );
+});
+
+test("stream channel lines surface question_suppressed and subagent rollup", () => {
+  const lines = buildTaskStatusLines({
+    questionsSuppressed: [{ reason: "headless" }],
+    streamWarnings: [{ code: "folder_trust_untrusted", message: "dropped MCP" }],
+    subagentsRollup: { spawned: 2, completed: 1, failed: 1, cancelled: 0 },
+    confineViolations: [{ tool: "write", resolvedPath: "/x", root: "/wt" }]
+  });
+  const text = lines.join("\n");
+  assert.match(text, /Question suppressed: 1/);
+  assert.match(text, /Stream warning: folder_trust_untrusted: dropped MCP/);
+  assert.match(text, /Subagents: 2 spawned/);
+  assert.match(text, /1 confine attempt.*blocked by the CLI \(isolation held\)/);
 });

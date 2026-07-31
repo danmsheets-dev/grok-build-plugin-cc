@@ -4897,6 +4897,19 @@ async function executeTaskRun(request) {
 
   const usageBreakdown = aggregateUsageOwnVsNested(cumulativeUsage, children);
 
+  // Aggregate stream-only fields from agent turns (WP-B8 schemaVersion 2).
+  const streamWarnings = agentResults.flatMap((entry) =>
+    Array.isArray(entry?.streamWarnings) ? entry.streamWarnings : []
+  );
+  const questionsSuppressed = agentResults.flatMap((entry) =>
+    Array.isArray(entry?.questionsSuppressed) ? entry.questionsSuppressed : []
+  );
+  const subagentsFromStream = agentResults.flatMap((entry) =>
+    Array.isArray(entry?.subagents) ? entry.subagents : []
+  );
+  const subagentsRollup =
+    agentResults.map((entry) => entry?.subagentsRollup).filter(Boolean).at(-1) ?? null;
+
   const statusMeta = {
     title: taskMetadata.title,
     jobId: request.jobId ?? null,
@@ -4907,9 +4920,15 @@ async function executeTaskRun(request) {
     errors: streamErrors,
     confineViolations,
     toolDenials,
+    streamWarnings,
+    questionsSuppressed,
+    subagents: subagentsFromStream,
+    subagentsRollup,
     compaction,
     maxTurnsReached,
     changedFiles,
+    // Scalar for R7-4 honesty header (files changed: N).
+    changedFileCount: effectiveChangedFileCount,
     debris,
     write,
     verified: isolationBreached ? false : verified,
@@ -4939,6 +4958,10 @@ async function executeTaskRun(request) {
     verifyMatchedLines: verifyResults
       .filter((entry) => Array.isArray(entry.matchedLines) && entry.matchedLines.length > 0)
       .map((entry) => ({ command: entry.command, matchedLines: entry.matchedLines })),
+    // R7-4: per-command results + baselines so the status line can say
+    // `verify 2/3 (baseline 2/3)` instead of a boolean Verified: yes.
+    verifyResults,
+    baselines,
     // The visibility half of the item-4 trust story: a run that verifies
     // commands the user never typed has to say which commands, and where
     // they came from, in the same block that reports the verdict.
@@ -5076,6 +5099,10 @@ async function executeTaskRun(request) {
     streamErrors,
     confineViolations,
     toolDenials,
+    streamWarnings,
+    questionsSuppressed,
+    subagents: subagentsFromStream,
+    subagentsRollup,
     compaction,
     maxTurnsReached,
     start: streamStart,

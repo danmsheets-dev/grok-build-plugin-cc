@@ -552,6 +552,10 @@ export function patchJobIfActive(cwd, jobId, patch = {}) {
     };
 
     writeJobFileUnlocked(cwd, jobId, nextJob);
+    // R7-5: mirror usage/resolvedModel onto the index for ACTIVE runs too.
+    // Finished runs already get these via claimJobTerminal; without this,
+    // runs --json showed null cost/tokens mid-run even when the job file
+    // had live usage from stream progress events.
     upsertJobInState(state, {
       id: jobId,
       status: nextJob.status,
@@ -563,7 +567,10 @@ export function patchJobIfActive(cwd, jobId, patch = {}) {
       agentPid: nextJob.agentPid,
       bridgePid: nextJob.bridgePid,
       logFile: nextJob.logFile,
-      errorMessage: nextJob.errorMessage
+      errorMessage: nextJob.errorMessage,
+      ...(nextJob.usage !== undefined ? { usage: nextJob.usage } : {}),
+      ...(nextJob.resolvedModel !== undefined ? { resolvedModel: nextJob.resolvedModel } : {}),
+      ...(nextJob.toolCallCount !== undefined ? { toolCallCount: nextJob.toolCallCount } : {})
     });
     saveStateUnlocked(cwd, state);
     return { patched: true, status: nextJob.status, job: nextJob, reason: "patched" };

@@ -423,6 +423,10 @@ export function createJobProgressUpdater(workspaceRoot, jobId, options = {}) {
 
     if (normalized.usage) {
       patch.usage = normalized.usage;
+      // R7-5: surface served model mid-run when usage carries it.
+      if (normalized.usage.resolvedModel) {
+        patch.resolvedModel = normalized.usage.resolvedModel;
+      }
       changed = true;
     }
 

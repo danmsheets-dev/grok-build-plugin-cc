@@ -977,6 +977,36 @@ function pushStreamChannelLines(lines, meta = {}) {
     }
   }
 
+  const questions = Array.isArray(meta.questionsSuppressed) ? meta.questionsSuppressed : [];
+  if (questions.length > 0) {
+    lines.push(
+      `Question suppressed: ${questions.length} headless ask_user_question refusal${questions.length === 1 ? "" : "s"}.`
+    );
+  }
+
+  const warnings = Array.isArray(meta.streamWarnings)
+    ? meta.streamWarnings
+    : Array.isArray(meta.warnings)
+      ? meta.warnings
+      : [];
+  for (const warning of warnings.slice(0, 10)) {
+    const code = warning?.code ? `${warning.code}: ` : "";
+    const message = warning?.message ?? (typeof warning === "string" ? warning : null);
+    if (message) {
+      lines.push(`Stream warning: ${code}${message}`);
+    }
+  }
+
+  const subagentsRollup = meta.subagentsRollup;
+  if (subagentsRollup && typeof subagentsRollup === "object") {
+    const spawned = Number(subagentsRollup.spawned ?? 0);
+    if (spawned > 0) {
+      lines.push(
+        `Subagents: ${spawned} spawned (${subagentsRollup.completed ?? 0} completed, ${subagentsRollup.failed ?? 0} failed, ${subagentsRollup.cancelled ?? 0} cancelled)`
+      );
+    }
+  }
+
   if (meta.maxTurnsReached) {
     lines.push("Max turns reached: the CLI stopped the run at the turn budget.");
   }
@@ -988,8 +1018,113 @@ function pushStreamChannelLines(lines, meta = {}) {
   }
 }
 
+/**
+ * Count files the run changed for the honesty header (R7-4).
+ * Prefer dual-tree total when present; fall back to flat manifests / scalars.
+ *
+ * @param {object} meta
+ * @returns {number|null}
+ */
+export function countChangedFilesForHonesty(meta = {}) {
+  if (meta.changedFileCount != null && Number.isFinite(Number(meta.changedFileCount))) {
+    return Number(meta.changedFileCount);
+  }
+  const changed = meta.changedFiles;
+  if (!changed || typeof changed !== "object") {
+    return null;
+  }
+  if (changed.worktree || changed.mainTree) {
+    const wt = Number(changed.worktree?.total ?? changed.worktree?.entries?.length ?? 0) || 0;
+    const main = Number(changed.mainTree?.total ?? changed.mainTree?.entries?.length ?? 0) || 0;
+    return wt + main;
+  }
+  if (Number.isFinite(Number(changed.total))) {
+    return Number(changed.total);
+  }
+  if (Array.isArray(changed.entries)) {
+    return changed.entries.length;
+  }
+  return null;
+}
+
+/**
+ * Verify ratio for the honesty header: `verify 2/3 (baseline 2/3)`.
+ * A boolean "Verified: yes" reads stronger than it means; the ratio is the truth.
+ *
+ * @param {object} meta
+ * @returns {string|null}
+ */
+export function formatVerifyRatioLine(meta = {}) {
+  if (meta.verifyNote && /skipped \(read-only run\)/i.test(String(meta.verifyNote))) {
+    return "verify n/a (read-only run)";
+  }
+  if (VERIFIED_NA_STATUSES.has(meta.status)) {
+    return null;
+  }
+
+  const results = Array.isArray(meta.verifyResults)
+    ? meta.verifyResults
+    : Array.isArray(meta.verify?.results)
+      ? meta.verify.results
+      : null;
+  const baselines = Array.isArray(meta.baselines)
+    ? meta.baselines
+    : Array.isArray(meta.verify?.baselines)
+      ? meta.verify.baselines
+      : null;
+
+  if (!results || results.length === 0) {
+    // No per-command breakdown — fall back only when we know verification ran.
+    if (meta.verified === true) {
+      return meta.verifyNote ? `verify passed (${meta.verifyNote})` : "verify passed";
+    }
+    if (meta.verified === false) {
+      return meta.verifyNote ? `verify failed (${meta.verifyNote})` : "verify failed";
+    }
+    return null;
+  }
+
+  const total = results.length;
+  const passed = results.filter((entry) => entry && entry.ok === true).length;
+  let line = `verify ${passed}/${total}`;
+  if (baselines && baselines.length > 0) {
+    const baselineTotal = baselines.length;
+    const baselinePassed = baselines.filter((entry) => entry && entry.ok === true).length;
+    line += ` (baseline ${baselinePassed}/${baselineTotal})`;
+  }
+  return line;
+}
+
+/**
+ * R7-4 — report honesty at the TOP of the status trailer.
+ * Operating rule: judge every run by the filesystem, never by its status line.
+ * Put the filesystem count and the verify ratio first so the status line is
+ * worth trusting.
+ *
+ * @param {string[]} lines
+ * @param {object} meta
+ */
+function pushHonestyHeader(lines, meta = {}) {
+  const n = countChangedFilesForHonesty(meta);
+  if (n != null) {
+    if (meta.write === true && n === 0) {
+      lines.push(`files changed: 0  ⚠ --write run changed nothing`);
+    } else {
+      lines.push(`files changed: ${n}`);
+    }
+  }
+
+  const verifyRatio = formatVerifyRatioLine(meta);
+  if (verifyRatio) {
+    lines.push(verifyRatio);
+  }
+}
+
 export function buildTaskStatusLines(meta = {}, rawOutput = "") {
   const lines = [];
+
+  // R7-4: filesystem + verify ratio first — before plan notes and usage.
+  pushHonestyHeader(lines, meta);
 
   pushVerifyPlanLines(lines, meta);
   pushStreamChannelLines(lines, meta);
@@ -1048,14 +1183,40 @@ export function buildTaskStatusLines(meta = {}, rawOutput = "") {
   const naLine = VERIFIED_NA_STATUSES.has(meta.status)
     ? verifiedNaLine(meta.status, meta.stopReason, meta)
     : null;
+  // R7-4: when the honesty header already has `verify X/Y`, do not also print
+  // a boolean "Verified: yes" that oversells a baseline-passing zero-change run.
+  const hasVerifyResults =
+    (Array.isArray(meta.verifyResults) && meta.verifyResults.length > 0) ||
+    (Array.isArray(meta.verify?.results) && meta.verify.results.length > 0);
   if (naLine) {
     // Never render Verified: yes for noop/blind/truncated - even when the
     // verify loop happened to return true, it proved nothing about the work.
     lines.push(naLine);
   } else if (meta.verifyNote && /skipped \(read-only run\)/i.test(String(meta.verifyNote))) {
-    lines.push("Verified: n/a - skipped (read-only run)");
+    // Already covered by honesty header "verify n/a (read-only run)" when present.
+    if (!lines.some((line) => /^verify n\/a \(read-only run\)/.test(line))) {
+      lines.push("Verified: n/a - skipped (read-only run)");
+    }
+  } else if (hasVerifyResults) {
+    // Ratio already at top; only add failure detail / markers below.
+    if (meta.verified === false) {
+      if (meta.verifyNote) {
+        lines.push(`Verify note: ${meta.verifyNote}`);
+      }
+      for (const entry of meta.verifyMatchedLines ?? []) {
+        for (const line of entry.matchedLines ?? []) {
+          lines.push(`  Output matched a known failure marker in \`${entry.command}\`: ${line}`);
+        }
+      }
+    } else if (meta.verifyNote) {
+      lines.push(`Verify note: ${meta.verifyNote}`);
+    }
   } else if (meta.verified === true) {
-    lines.push(`Verified: yes${meta.verifyNote ? ` (${meta.verifyNote})` : ""}`);
+    // No per-command breakdown — keep a soft line (honesty header may already
+    // say "verify passed").
+    if (!lines.some((line) => /^verify passed/.test(line))) {
+      lines.push(`Verified: yes${meta.verifyNote ? ` (${meta.verifyNote})` : ""}`);
+    }
   } else if (meta.verified === false) {
     // The note used to be dropped entirely on this branch, so a run that
     // failed verification for an infrastructure reason - a timed-out or
@@ -1850,7 +2011,10 @@ export function buildRunManifest(job = {}, storedJob = null) {
       permissionMode: start?.permissionMode ?? null,
       sandbox: start?.sandbox ?? null,
       alwaysApprove: start?.alwaysApprove ?? null,
-      confineRoot: start?.confineRoot ?? null
+      confineRoot: start?.confineRoot ?? null,
+      sessionCwd: start?.sessionCwd ?? null,
+      originalCwd: start?.originalCwd ?? null,
+      folderTrust: start?.folderTrust ?? null
     },
     model: {
       requested: record.model ?? null,
@@ -1926,6 +2090,10 @@ export function buildRunManifest(job = {}, storedJob = null) {
       unknownEventTypes: result?.unknownEventTypes ?? [],
       errors: Array.isArray(streamErrors) ? streamErrors : [],
       toolDenials: result?.toolDenials ?? [],
+      warnings: result?.streamWarnings ?? result?.warnings ?? [],
+      questionsSuppressed: result?.questionsSuppressed ?? [],
+      subagents: result?.subagents ?? [],
+      subagentsRollup: result?.subagentsRollup ?? null,
       compaction: result?.compaction ?? [],
       toolActivity: result?.toolActivity ?? []
     },

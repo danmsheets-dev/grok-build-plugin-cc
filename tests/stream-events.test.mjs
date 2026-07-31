@@ -129,7 +129,8 @@ test("the end event supplies session id, usage and cost", () => {
 test("tool events are counted and do not land in unknownTypes", () => {
   const transcript = createStreamTranscript();
   transcript.accept({ type: "text", data: "a" });
-  assert.equal(transcript.accept({ type: "tool_use", name: "write" }).phase, null);
+  // WP-B8: tool invocations surface as progress phases (tool name / target).
+  assert.equal(transcript.accept({ type: "tool_use", name: "write" }).phase, "write");
   transcript.accept({ type: "tool_result", content: "ok" });
   transcript.accept({ type: "text", data: "b" });
   const result = transcript.finish();
@@ -454,5 +455,249 @@ test("addUsage ORs costIsPartial when only one turn reports cost", () => {
   const sum = addUsage(a, b);
   assert.equal(sum.costIsPartial, true);
   assert.ok(sum.costUsd == null || sum.costIsPartial);
+});
+
+// --- WP-B8: schemaVersion 2 vocabulary ---
+
+import { describeToolProgress, HYPER_STREAM_EVENT_TYPES } from "../plugins/grok-build/scripts/lib/stream-events.mjs";
+
+test("schemaVersion 2 start captures sessionCwd, originalCwd, folderTrust", () => {
+  const transcript = createStreamTranscript();
+  feed(transcript, [
+    {
+      type: "start",
+      schemaVersion: 2,
+      sessionId: "sess-v2",
+      cwd: "/launch",
+      sessionCwd: "/session",
+      originalCwd: "/origin",
+      confineRoot: "/wt",
+      binary: "hyper",
+      version: "0.2.114-r6",
+      alwaysApprove: true,
+      rulesApplied: true,
+      folderTrust: {
+        trusted: false,
+        key: "k",
+        reason: "untrusted-headless",
+        droppedMcpServers: ["blender"]
+      },
+      servedModel: "grok-4.5-build",
+      requestedModel: "grok-4.5"
+    },
+    { type: "end", schemaVersion: 2, stopReason: "EndTurn", toolCalls: 0, usage: null, filesChanged: { count: 0, paths: [], truncated: false }, subagents: { spawned: 0, completed: 0, failed: 0, cancelled: 0 } }
+  ]);
+  const result = transcript.finish();
+  assert.equal(result.streamSchemaVersion, 2);
+  assert.equal(result.start.sessionCwd, "/session");
+  assert.equal(result.start.originalCwd, "/origin");
+  assert.equal(result.start.folderTrust.reason, "untrusted-headless");
+  assert.equal(result.start.requestedModel, "grok-4.5");
+  assert.equal(result.toolCallCount, 0, "end.toolCalls:0 is a genuine zero on schemaVersion 2");
+  assert.equal(result.toolVisibility, "explicit");
+});
+
+test("schemaVersion 2 tool_call sets phase to tool+target (not thinking)", () => {
+  const transcript = createStreamTranscript();
+  const call = transcript.accept({
+    type: "tool_call",
+    schemaVersion: 2,
+    toolCallId: "call_1",
+    name: "bash",
+    kind: "execute",
+    status: "in_progress",
+    title: "Bash: cargo test",
+    rawInput: { command: "cargo test" }
+  });
+  assert.equal(call.phase, "Bash: cargo test");
+  assert.equal(call.toolProgress, "Bash: cargo test");
+
+  // A thought while the tool is in flight must NOT replace the tool phase.
+  const thought = transcript.accept({ type: "thought", data: "waiting on tests" });
+  assert.equal(thought.phase, "Bash: cargo test");
+
+  const update = transcript.accept({
+    type: "tool_call_update",
+    schemaVersion: 2,
+    toolCallId: "call_1",
+    status: "in_progress",
+    title: "Bash: cargo test",
+    elapsedMs: 120000
+  });
+  assert.equal(update.phase, "Bash: cargo test");
+
+  const done = transcript.accept({
+    type: "tool_result",
+    schemaVersion: 2,
+    toolCallId: "call_1",
+    status: "completed",
+    elapsedMs: 34000
+  });
+  assert.equal(done.phase, null, "no remaining active tool");
+
+  transcript.accept({
+    type: "end",
+    schemaVersion: 2,
+    stopReason: "EndTurn",
+    toolCalls: 1,
+    usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 },
+    filesChanged: { count: 0, paths: [], truncated: false },
+    subagents: { spawned: 0, completed: 0, failed: 0, cancelled: 0 }
+  });
+  const result = transcript.finish();
+  assert.equal(result.toolCallCount, 1);
+  assert.equal(result.toolVisibility, "explicit");
+  assert.equal(result.toolActivity.length, 1);
+  assert.equal(result.toolActivity[0].progress, "Bash: cargo test");
+});
+
+test("describeToolProgress prefers title then path/command", () => {
+  assert.equal(describeToolProgress({ title: "Read: src/main.rs" }), "Read: src/main.rs");
+  assert.equal(
+    describeToolProgress({ name: "read_file", locations: [{ path: "lib/foo.mjs" }] }),
+    "read_file: lib/foo.mjs"
+  );
+  assert.equal(
+    describeToolProgress({ name: "bash", rawInput: { command: "cargo test -p bridge" } }),
+    "bash: cargo test -p bridge"
+  );
+});
+
+test("error and confine_violation are recognized and keep blocked≠breach shape", () => {
+  const transcript = createStreamTranscript();
+  feed(transcript, [
+    { type: "start", schemaVersion: 2, sessionCwd: "/wt", binary: "hyper", version: "x", alwaysApprove: true, rulesApplied: true, folderTrust: { trusted: true, key: "k", reason: "store" } },
+    {
+      type: "error",
+      message: "auth failed",
+      usage: { input_tokens: 5, output_tokens: 0, total_tokens: 5 }
+    },
+    {
+      type: "confine_violation",
+      tool: "write",
+      path: "../escape.txt",
+      resolvedPath: "/repo/escape.txt",
+      root: "/wt",
+      schemaVersion: 1
+    }
+  ]);
+  const result = transcript.finish();
+  assert.equal(result.errors.length, 1);
+  assert.match(result.errors[0].message, /auth failed/);
+  assert.equal(result.usage.inputTokens, 5);
+  assert.equal(result.confineViolations.length, 1);
+  assert.equal(result.confineViolations[0].resolvedPath, "/repo/escape.txt");
+  // Presence of confine_violation does not invent isolationBreached — that is
+  // a bridge-level main-checkout dirty-set verdict, not a stream field.
+  assert.equal(result.confineViolations[0].tool, "write");
+});
+
+test("question_suppressed, warning, and subagent lifecycle are recognized", () => {
+  const transcript = createStreamTranscript();
+  feed(transcript, [
+    { type: "start", schemaVersion: 2, binary: "hyper", version: "x", alwaysApprove: true, rulesApplied: true, folderTrust: { trusted: true, key: "k", reason: "store" }, sessionCwd: "/w" },
+    {
+      type: "question_suppressed",
+      schemaVersion: 2,
+      toolCallId: "q1",
+      reason: "headless: ask_user_question is disabled; no interactive user"
+    },
+    {
+      type: "warning",
+      schemaVersion: 2,
+      code: "folder_trust_untrusted",
+      message: "dropped project MCP"
+    },
+    {
+      type: "subagent_spawned",
+      schemaVersion: 2,
+      subagentId: "sa1",
+      subagentType: "explore",
+      description: "scan for callers"
+    },
+    {
+      type: "subagent_finished",
+      schemaVersion: 2,
+      subagentId: "sa1",
+      status: "completed",
+      toolCalls: 4,
+      durationMs: 1200
+    },
+    {
+      type: "end",
+      schemaVersion: 2,
+      stopReason: "EndTurn",
+      toolCalls: 0,
+      usage: null,
+      filesChanged: { count: 0, paths: [], truncated: false },
+      subagents: { spawned: 1, completed: 1, failed: 0, cancelled: 0 }
+    }
+  ]);
+  const result = transcript.finish();
+  assert.deepEqual(result.unknownTypes, []);
+  assert.equal(result.questionsSuppressed.length, 1);
+  assert.match(result.questionsSuppressed[0].reason, /headless/);
+  assert.equal(result.warnings.length, 1);
+  assert.equal(result.warnings[0].code, "folder_trust_untrusted");
+  assert.equal(result.subagents.length, 1);
+  assert.equal(result.subagents[0].status, "completed");
+  assert.deepEqual(result.subagentsRollup, {
+    spawned: 1,
+    completed: 1,
+    failed: 0,
+    cancelled: 0
+  });
+});
+
+test("unknown event type is counted and does not fail the run", () => {
+  const transcript = createStreamTranscript();
+  feed(transcript, [
+    { type: "start", schemaVersion: 2, binary: "hyper", version: "x", alwaysApprove: true, rulesApplied: true, folderTrust: { trusted: true, key: "k", reason: "store" }, sessionCwd: "/w" },
+    { type: "future_event_v9", payload: { x: 1 } },
+    { type: "text", data: "still ok" },
+    {
+      type: "end",
+      schemaVersion: 2,
+      stopReason: "EndTurn",
+      toolCalls: 0,
+      usage: null,
+      filesChanged: { count: 0, paths: [], truncated: false },
+      subagents: { spawned: 0, completed: 0, failed: 0, cancelled: 0 }
+    }
+  ]);
+  const result = transcript.finish();
+  assert.deepEqual(result.unknownTypes, ["future_event_v9"]);
+  assert.ok(result.recognizedEvents >= 3);
+  assert.deepEqual(result.messages, ["still ok"]);
+});
+
+test("older binary with no tool events keeps toolCallCount null (not zero)", () => {
+  // Pre-tool-event CLI: thought/text/end only. Must NOT report 0 (completed-blind).
+  const transcript = createStreamTranscript();
+  feed(transcript, [
+    { type: "thought", data: "planning" },
+    { type: "text", data: "I read the files and the answer is 42." },
+    { type: "end", stopReason: "EndTurn", usage: { input_tokens: 100, output_tokens: 20, total_tokens: 120 } }
+  ]);
+  const result = transcript.finish();
+  assert.equal(result.toolCallCount, null);
+  assert.equal(result.toolVisibility, "unavailable");
+  assert.equal(result.streamSchemaVersion, null);
+});
+
+test("HYPER_STREAM_EVENT_TYPES includes schemaVersion 2 tool and subagent names", () => {
+  for (const type of [
+    "tool_call",
+    "tool_call_update",
+    "tool_result",
+    "subagent_spawned",
+    "subagent_finished",
+    "question_suppressed",
+    "warning",
+    "error",
+    "confine_violation"
+  ]) {
+    assert.ok(HYPER_STREAM_EVENT_TYPES.includes(type), type);
+  }
 });
 

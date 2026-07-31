@@ -73,7 +73,10 @@
         "permissionMode": { "type": ["string", "null"] },
         "sandbox": { "type": ["string", "null"] },
         "alwaysApprove": { "type": ["boolean", "null"] },
-        "confineRoot": { "type": ["string", "null"] }
+        "confineRoot": { "type": ["string", "null"] },
+        "sessionCwd": { "type": ["string", "null"] },
+        "originalCwd": { "type": ["string", "null"] },
+        "folderTrust": { "type": ["object", "null"] }
       }
     },
     "model": {
@@ -172,6 +175,10 @@
         },
         "errors": { "type": "array" },
         "toolDenials": { "type": "array" },
+        "warnings": { "type": "array" },
+        "questionsSuppressed": { "type": "array" },
+        "subagents": { "type": "array" },
+        "subagentsRollup": { "type": ["object", "null"] },
         "compaction": { "type": "array" },
         "toolActivity": { "type": "array" }
       }

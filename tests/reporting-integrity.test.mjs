@@ -16,7 +16,14 @@ import {
   buildTaskStatusLines,
   formatUsageLine
 } from "../plugins/grok-build/scripts/lib/render.mjs";
-import { claimJobTerminal, isTerminalJobStatus, listJobs, upsertJob, writeJobFile } from "../plugins/grok-build/scripts/lib/state.mjs";
+import {
+  claimJobTerminal,
+  isTerminalJobStatus,
+  listJobs,
+  patchJobIfActive,
+  upsertJob,
+  writeJobFile
+} from "../plugins/grok-build/scripts/lib/state.mjs";
 import { decideCompletionStatus } from "../plugins/grok-build/scripts/lib/tracked-jobs.mjs";
 import {
   commitWorktreeChanges,
@@ -514,4 +521,43 @@ test("an agent that commits inside the worktree is not reported as a no-op", () 
     }),
     "completed"
   );
+});
+
+// --- R7-5: mid-run usage on active jobs ---
+
+test("R7-5 patchJobIfActive mirrors usage onto the index for active runs", () => {
+  withPluginData(() => {
+    const workspace = makeTempDir();
+    const jobId = "run-active-usage";
+    const running = {
+      id: jobId,
+      status: "running",
+      phase: "thinking",
+      title: "Active usage",
+      bridgePid: process.pid
+    };
+    writeJobFile(workspace, jobId, running);
+    upsertJob(workspace, running);
+
+    const usage = {
+      inputTokens: 1200,
+      outputTokens: 40,
+      costUsd: 0.02,
+      numTurns: 1,
+      resolvedModel: "grok-4.5-build"
+    };
+    const patched = patchJobIfActive(workspace, jobId, {
+      phase: "Bash: cargo test",
+      usage,
+      resolvedModel: "grok-4.5-build"
+    });
+    assert.equal(patched.patched, true);
+
+    // Job file has usage
+    const stored = listJobs(workspace).find((job) => job.id === jobId);
+    assert.ok(stored);
+    assert.deepEqual(stored.usage, usage);
+    assert.equal(stored.resolvedModel, "grok-4.5-build");
+    assert.equal(stored.phase, "Bash: cargo test");
+  });
 });

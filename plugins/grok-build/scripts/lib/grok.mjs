@@ -1080,14 +1080,28 @@ export function runHeadlessAgent(cwd, options = {}) {
       }
       if (outcome.phase && outcome.phase !== lastPhase) {
         lastPhase = outcome.phase;
-        emitProgress(options.onProgress, `Grok is ${outcome.phase}.`, outcome.phase, {
+        // Tool progress phases already name the tool+target ("Bash: cargo test");
+        // wrap only the generic thinking/writing labels so the operator sees
+        // what the agent is doing instead of "Grok is thinking" for 34 minutes.
+        const phaseMessage =
+          outcome.phase === "thinking" || outcome.phase === "writing" || outcome.phase === "starting"
+            ? `Grok is ${outcome.phase}.`
+            : outcome.phase === "error"
+              ? "Grok reported an error."
+              : outcome.phase === "confine_violation"
+                ? "Confine blocked a write outside the worktree."
+                : outcome.phase === "question_suppressed"
+                  ? "Headless question suppressed."
+                  : `Grok: ${outcome.phase}`;
+        emitProgress(options.onProgress, phaseMessage, outcome.phase, {
           threadId: sessionId,
           agentPid,
-          ...(outcome.usage ? { usage: outcome.usage } : {})
+          ...(outcome.usage ? { usage: outcome.usage } : {}),
+          ...(outcome.toolProgress ? { toolProgress: outcome.toolProgress } : {})
         });
       } else if (outcome.usage) {
-        // Turn-end usage without a phase change still patches the live job so
-        // nest-run budget inheritance can see parent spend mid-run.
+        // Turn-end / mid-run usage without a phase change still patches the live
+        // job so runs --json and nest-run budget inheritance can see spend.
         emitProgress(options.onProgress, "Usage updated.", lastPhase ?? "running", {
           threadId: sessionId,
           agentPid,
@@ -1187,6 +1201,10 @@ export function runHeadlessAgent(cwd, options = {}) {
         streamErrors: result?.errors ?? [],
         confineViolations: result?.confineViolations ?? [],
         toolDenials: result?.toolDenials ?? [],
+        streamWarnings: result?.warnings ?? [],
+        questionsSuppressed: result?.questionsSuppressed ?? [],
+        subagents: result?.subagents ?? [],
+        subagentsRollup: result?.subagentsRollup ?? null,
         compaction: result?.compaction ?? [],
         maxTurnsReached: Boolean(result?.maxTurnsReached),
         start: result?.start ?? null,

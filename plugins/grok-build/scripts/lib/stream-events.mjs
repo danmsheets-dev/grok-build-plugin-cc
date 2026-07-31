@@ -477,14 +477,22 @@ export function normalizeUsage(event) {
 
 /**
  * Hyper streaming-json event types the bridge explicitly understands.
- * Anything else is counted in unknownTypes so vocabulary drift is visible.
- * Source: Hyper headless emitter + confine_violation from tools/resources.
+ * schemaVersion 2 vocabulary (docs/streaming-json-schema.md). Anything else is
+ * counted in unknownTypes so vocabulary drift is visible — never silently dropped.
  */
 export const HYPER_STREAM_EVENT_TYPES = Object.freeze([
   "start",
   "text",
   "thought",
+  "tool_call",
+  "tool_call_update",
+  "tool_result",
   "tool_denied",
+  "tool_use",
+  "subagent_spawned",
+  "subagent_finished",
+  "question_suppressed",
+  "warning",
   "auto_continue",
   "model_resolved",
   "end",
@@ -500,6 +508,51 @@ export const HYPER_STREAM_EVENT_TYPES = Object.freeze([
 ]);
 
 const HYPER_STREAM_EVENT_SET = new Set(HYPER_STREAM_EVENT_TYPES);
+
+/**
+ * Shorten a path/command for the phase line so a 200-char cargo invocation does
+ * not blow up the runs table.
+ */
+function shortenToolTarget(value, max = 80) {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!text) {
+    return "";
+  }
+  if (text.length <= max) {
+    return text;
+  }
+  return `${text.slice(0, Math.max(1, max - 1))}…`;
+}
+
+/**
+ * Human-facing phase for an in-flight tool call — the highest-value mid-run
+ * signal (what the agent is actually doing instead of "thinking" for 34 min).
+ *
+ * Prefers Hyper's `title` ("Bash: cargo test"), then name + path/command target.
+ */
+export function describeToolProgress(event = {}) {
+  const title = typeof event.title === "string" && event.title.trim() ? event.title.trim() : null;
+  if (title) {
+    return shortenToolTarget(title, 100);
+  }
+  const name = String(event.name ?? event.tool ?? event.toolName ?? event.kind ?? "tool").trim() || "tool";
+  const locations = Array.isArray(event.locations) ? event.locations : [];
+  const locPath =
+    locations
+      .map((entry) => (entry && typeof entry === "object" ? entry.path : null))
+      .find((path) => typeof path === "string" && path.trim()) ?? null;
+  const raw = event.rawInput && typeof event.rawInput === "object" ? event.rawInput : null;
+  const target =
+    locPath ||
+    event.path ||
+    event.resolvedPath ||
+    (raw && (raw.path ?? raw.file_path ?? raw.filePath ?? raw.command ?? raw.cmd ?? raw.pattern ?? raw.query)) ||
+    null;
+  if (target != null && String(target).trim()) {
+    return shortenToolTarget(`${name}: ${String(target).trim()}`, 100);
+  }
+  return shortenToolTarget(name, 100);
+}
 
 /**
  * Whether a stream type is part of the Hyper vocabulary or a known tool signal.
@@ -520,14 +573,18 @@ export function isKnownStreamEventType(type) {
 /**
  * How the bridge learned about tool calls for this run.
  * - observed: per-call tool events were on the stream
- * - explicit: end event carried toolCallCount / toolCalls
- * - unavailable: stream carries no tool vocabulary (Hyper today) — not the same as 0
+ * - explicit: end event carried toolCallCount / toolCalls (schemaVersion 2)
+ * - unavailable: stream carries no tool vocabulary (older binary) — not the same as 0
+ *
+ * Never conflate "no tool visibility" with "zero tool calls". Negotiate on
+ * schemaVersion: v2 end always carries `toolCalls`, so a genuine 0 is explicit;
+ * an older binary without tool events stays unavailable (null), not completed-blind.
  */
 export function describeToolVisibility(toolCallCount, options = {}) {
-  if (options.toolVocabularySeen || options.explicitToolCallCount != null) {
-    if (options.explicitToolCallCount != null) {
-      return "explicit";
-    }
+  if (options.explicitToolCallCount != null) {
+    return "explicit";
+  }
+  if (options.toolVocabularySeen) {
     return "observed";
   }
   if (toolCallCount == null) {
@@ -551,6 +608,11 @@ export function createStreamTranscript() {
   const toolDenials = [];
   const compaction = [];
   const toolActivity = [];
+  const warnings = [];
+  const questionsSuppressed = [];
+  const subagents = [];
+  // toolCallId → progress label for in-flight tools (phase line).
+  const activeTools = new Map();
   let current = "";
   let lastType = null;
   // How many events this parser actually understood. The ONLY safe signal for
@@ -571,6 +633,7 @@ export function createStreamTranscript() {
   let startMeta = null;
   let modelResolved = null;
   let filesChanged = null;
+  let subagentsRollup = null;
   let autoContinueCount = 0;
   let streamSchemaVersion = null;
 
@@ -588,20 +651,56 @@ export function createStreamTranscript() {
     recognizedEvents += 1;
   }
 
+  function toolKey(event) {
+    const id = event.toolCallId ?? event.id ?? event.tool_call_id ?? null;
+    return id != null && String(id).trim() ? String(id) : null;
+  }
+
+  function activeToolPhase() {
+    if (activeTools.size === 0) {
+      return null;
+    }
+    // Most recent tool wins for the phase line.
+    let last = null;
+    for (const label of activeTools.values()) {
+      last = label;
+    }
+    return last;
+  }
+
   function acceptStart(event, result) {
     markRecognized();
+    const folderTrust =
+      event.folderTrust && typeof event.folderTrust === "object"
+        ? event.folderTrust
+        : event.folder_trust && typeof event.folder_trust === "object"
+          ? event.folder_trust
+          : null;
     startMeta = {
       schemaVersion: event.schemaVersion ?? event.schema_version ?? null,
+      sessionId: typeof event.sessionId === "string" ? event.sessionId : null,
+      cwd: event.cwd ?? null,
+      sessionCwd: event.sessionCwd ?? event.session_cwd ?? null,
+      originalCwd: event.originalCwd ?? event.original_cwd ?? null,
       confineRoot: event.confineRoot ?? event.confine_root ?? null,
+      confineInherited: event.confineInherited ?? event.confine_inherited ?? null,
+      confineShellEnforcement:
+        event.confineShellEnforcement ?? event.confine_shell_enforcement ?? null,
+      requestedModel: event.requestedModel ?? event.requested_model ?? null,
       servedModel: event.servedModel ?? event.served_model ?? event.model ?? null,
       permissionMode: event.permissionMode ?? event.permission_mode ?? null,
       sandbox: event.sandbox ?? null,
       alwaysApprove: event.alwaysApprove ?? event.always_approve ?? null,
+      rulesApplied: event.rulesApplied ?? event.rules_applied ?? null,
       binary: event.binary ?? null,
-      version: event.version ?? null
+      version: event.version ?? null,
+      folderTrust
     };
     if (startMeta.schemaVersion != null) {
       streamSchemaVersion = startMeta.schemaVersion;
+    }
+    if (startMeta.sessionId) {
+      sessionId = startMeta.sessionId;
     }
     if (startMeta.servedModel) {
       modelResolved = startMeta.servedModel;
@@ -625,7 +724,7 @@ export function createStreamTranscript() {
     if (explicit != null) {
       // An explicit end-event count is the only way a run with no tool
       // events in the stream can still report a genuine 0 rather than
-      // null - Hyper/Grok may start shipping this without per-call events.
+      // null - schemaVersion 2 always carries toolCalls on end.
       toolVocabularySeen = true;
       explicitToolCallCount = explicit;
     }
@@ -645,9 +744,21 @@ export function createStreamTranscript() {
       };
       result.filesChanged = filesChanged;
     }
+    // end.subagents rollup (schemaVersion 2).
+    const sa = event.subagents;
+    if (sa && typeof sa === "object" && !Array.isArray(sa)) {
+      subagentsRollup = {
+        spawned: finiteOrNull(sa.spawned) ?? 0,
+        completed: finiteOrNull(sa.completed) ?? 0,
+        failed: finiteOrNull(sa.failed) ?? 0,
+        cancelled: finiteOrNull(sa.cancelled) ?? 0
+      };
+      result.subagents = subagentsRollup;
+    }
+    activeTools.clear();
   }
 
-  function acceptError(event) {
+  function acceptError(event, result) {
     markRecognized();
     const message =
       typeof event.message === "string"
@@ -661,16 +772,29 @@ export function createStreamTranscript() {
       message: String(message ?? "unknown error"),
       code: event.code ?? event.errorCode ?? null
     });
+    // Terminal error events carry usage (or null) per the Hyper contract.
+    const errorUsage = normalizeUsage(event);
+    if (errorUsage) {
+      usage = errorUsage;
+      result.usage = errorUsage;
+    } else if (event.usage === null) {
+      // Explicit null ledger — do not invent tokens; leave prior usage if any.
+    }
+    result.phase = "error";
   }
 
-  function acceptConfineViolation(event) {
+  function acceptConfineViolation(event, result) {
     markRecognized();
+    // Blocked attempt ≠ breach. The CLI refused the write; the bridge keeps
+    // that distinction (isolation held unless main-checkout dirty-set moves).
     confineViolations.push({
       tool: event.tool ?? event.toolName ?? null,
       path: event.path ?? null,
       resolvedPath: event.resolvedPath ?? event.resolved_path ?? null,
-      root: event.root ?? event.confineRoot ?? null
+      root: event.root ?? event.confineRoot ?? null,
+      schemaVersion: event.schemaVersion ?? event.schema_version ?? null
     });
+    result.phase = "confine_violation";
   }
 
   function acceptToolDenied(event) {
@@ -694,19 +818,153 @@ export function createStreamTranscript() {
     });
   }
 
-  function acceptToolInvocation(event, type) {
+  function acceptWarning(event) {
     markRecognized();
-    toolVocabularySeen = true;
-    if (isToolInvocationType(type)) {
-      toolInvocationCount += 1;
-      toolActivity.push({
-        id: event.id ?? event.toolCallId ?? null,
-        name: event.name ?? event.tool ?? event.title ?? null,
-        kind: event.kind ?? null,
-        title: event.title ?? null,
-        type
+    warnings.push({
+      code: event.code ?? null,
+      message: typeof event.message === "string" ? event.message : null
+    });
+  }
+
+  function acceptQuestionSuppressed(event, result) {
+    markRecognized();
+    questionsSuppressed.push({
+      toolCallId: event.toolCallId ?? event.tool_call_id ?? null,
+      reason: event.reason ?? event.message ?? null
+    });
+    result.phase = "question_suppressed";
+  }
+
+  function acceptSubagentSpawned(event, result) {
+    markRecognized();
+    const entry = {
+      id: event.subagentId ?? event.subagent_id ?? null,
+      childSessionId: event.childSessionId ?? event.child_session_id ?? null,
+      subagentType: event.subagentType ?? event.subagent_type ?? null,
+      description: event.description ?? null,
+      model: event.model ?? null,
+      capabilityMode: event.capabilityMode ?? event.capability_mode ?? null,
+      status: "spawned"
+    };
+    subagents.push(entry);
+    const label = entry.description
+      ? `subagent: ${shortenToolTarget(entry.description, 80)}`
+      : entry.subagentType
+        ? `subagent: ${entry.subagentType}`
+        : "subagent";
+    result.phase = label;
+  }
+
+  function acceptSubagentFinished(event, result) {
+    markRecognized();
+    const id = event.subagentId ?? event.subagent_id ?? null;
+    const status = event.status ?? "completed";
+    const existing = id != null ? subagents.find((s) => s.id === id) : null;
+    if (existing) {
+      existing.status = status;
+      existing.error = event.error ?? null;
+      existing.terminationReason = event.terminationReason ?? event.termination_reason ?? null;
+      existing.toolCalls = finiteOrNull(event.toolCalls ?? event.tool_calls);
+      existing.durationMs = finiteOrNull(event.durationMs ?? event.duration_ms);
+    } else {
+      subagents.push({
+        id,
+        childSessionId: event.childSessionId ?? event.child_session_id ?? null,
+        status,
+        error: event.error ?? null,
+        terminationReason: event.terminationReason ?? event.termination_reason ?? null,
+        toolCalls: finiteOrNull(event.toolCalls ?? event.tool_calls),
+        durationMs: finiteOrNull(event.durationMs ?? event.duration_ms)
       });
     }
+    result.phase = status === "failed" ? "subagent failed" : "subagent done";
+  }
+
+  /**
+   * tool_call / tool_use / function_call — first observation of an invocation.
+   * Sets phase to the tool+target so the operator sees activity, not "thinking".
+   */
+  function acceptToolCall(event, type, result) {
+    markRecognized();
+    toolVocabularySeen = true;
+    toolInvocationCount += 1;
+    const progress = describeToolProgress(event);
+    const id = toolKey(event);
+    const activity = {
+      id,
+      name: event.name ?? event.tool ?? null,
+      kind: event.kind ?? null,
+      title: event.title ?? null,
+      status: event.status ?? "in_progress",
+      type,
+      progress
+    };
+    toolActivity.push(activity);
+    if (id) {
+      activeTools.set(id, progress);
+    } else {
+      activeTools.set(`anon-${toolInvocationCount}`, progress);
+    }
+    result.phase = progress;
+    result.toolProgress = progress;
+    result.toolActivity = activity;
+  }
+
+  /**
+   * tool_call_update — non-terminal status/I/O while a tool is still running.
+   * Keep the phase on this tool so a long cargo test is not shown as thinking.
+   */
+  function acceptToolCallUpdate(event, result) {
+    markRecognized();
+    toolVocabularySeen = true;
+    const id = toolKey(event);
+    const progress = describeToolProgress(event);
+    if (id) {
+      activeTools.set(id, progress);
+    }
+    const status = typeof event.status === "string" ? event.status.toLowerCase() : "";
+    if (status === "completed" || status === "failed") {
+      if (id) {
+        activeTools.delete(id);
+      }
+    }
+    result.phase = activeToolPhase() ?? progress;
+    result.toolProgress = result.phase;
+  }
+
+  /**
+   * tool_result — terminal Completed/Failed for a tool call.
+   */
+  function acceptToolResult(event, result) {
+    markRecognized();
+    toolVocabularySeen = true;
+    const id = toolKey(event);
+    if (id) {
+      activeTools.delete(id);
+    } else if (activeTools.size === 1) {
+      // No id on result: drop the sole in-flight tool as best-effort pairing.
+      activeTools.clear();
+    }
+    const remaining = activeToolPhase();
+    result.phase = remaining;
+    result.toolProgress = remaining;
+    if (typeof event.status === "string" && event.status.toLowerCase() === "failed") {
+      // Keep a brief failed marker only when nothing else is active.
+      if (!remaining) {
+        result.phase = null;
+      }
+    }
+  }
+
+  /** Historical / alternate tool shapes still count as invocations. */
+  function acceptToolInvocation(event, type, result) {
+    if (isToolInvocationType(type)) {
+      acceptToolCall(event, type, result);
+      return;
+    }
+    // Result-shaped signal without a known pair: still proves tool vocabulary.
+    markRecognized();
+    toolVocabularySeen = true;
   }
 
   return {
@@ -732,6 +990,12 @@ export function createStreamTranscript() {
       switch (type) {
         case "thought":
           markRecognized();
+          // Do not overwrite an active tool phase with "thinking" — a long tool
+          // call is the thing the operator needs to see, not a stale thought.
+          if (activeTools.size > 0) {
+            result.phase = activeToolPhase();
+            result.toolProgress = result.phase;
+          }
           break;
         case "start":
           acceptStart(event, result);
@@ -740,15 +1004,36 @@ export function createStreamTranscript() {
           acceptEnd(event, result);
           break;
         case "error":
-          acceptError(event);
-          result.phase = "error";
+          acceptError(event, result);
           break;
         case "confine_violation":
-          acceptConfineViolation(event);
-          result.phase = "confine_violation";
+          acceptConfineViolation(event, result);
+          break;
+        case "tool_call":
+        case "tool_use":
+          acceptToolCall(event, type, result);
+          break;
+        case "tool_call_update":
+          acceptToolCallUpdate(event, result);
+          break;
+        case "tool_result":
+        case "tool-result":
+          acceptToolResult(event, result);
           break;
         case "tool_denied":
           acceptToolDenied(event);
+          break;
+        case "question_suppressed":
+          acceptQuestionSuppressed(event, result);
+          break;
+        case "warning":
+          acceptWarning(event);
+          break;
+        case "subagent_spawned":
+          acceptSubagentSpawned(event, result);
+          break;
+        case "subagent_finished":
+          acceptSubagentFinished(event, result);
           break;
         case "max_turns_reached":
           markRecognized();
@@ -758,11 +1043,19 @@ export function createStreamTranscript() {
           } else if (!stopReason) {
             stopReason = "max_turns_reached";
           }
+          {
+            const termUsage = normalizeUsage(event);
+            if (termUsage) {
+              usage = termUsage;
+              result.usage = termUsage;
+            }
+          }
           break;
         case "auto_continue":
         case "auto_continue_completed":
           markRecognized();
           autoContinueCount += 1;
+          result.phase = "auto_continue";
           break;
         case "model_resolved":
           markRecognized();
@@ -781,7 +1074,7 @@ export function createStreamTranscript() {
           break;
         default: {
           if (type && isToolSignalType(type)) {
-            acceptToolInvocation(event, type);
+            acceptToolInvocation(event, type, result);
           } else if (type && !isKnownStreamEventType(type)) {
             // Genuinely unknown — surface so vocabulary drift is never silent.
             unknownTypes.add(type);
@@ -802,6 +1095,10 @@ export function createStreamTranscript() {
       // Explicit end-event count wins when present: it is the provider's own
       // total. Otherwise the live invocation count, but only once the stream
       // has shown it speaks tool invocations at all.
+      //
+      // Older binary (no tool events, no end.toolCalls): toolCallCount stays
+      // null → toolVisibility "unavailable". That is NOT completed-blind.
+      // schemaVersion 2 end always carries toolCalls, including 0.
       let toolCallCount = null;
       if (explicitToolCallCount != null) {
         toolCallCount = explicitToolCallCount;
@@ -851,6 +1148,10 @@ export function createStreamTranscript() {
         errors: [...errors],
         confineViolations: [...confineViolations],
         toolDenials: [...toolDenials],
+        warnings: [...warnings],
+        questionsSuppressed: [...questionsSuppressed],
+        subagents: [...subagents],
+        subagentsRollup,
         compaction: [...compaction],
         maxTurnsReached,
         start: startMeta,
