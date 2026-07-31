@@ -3,7 +3,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { detectEcosystems } from "./ecosystem.mjs";
+import { detectEcosystems, sanitizePythonModuleName } from "./ecosystem.mjs";
 
 // Heavyweight directories that may be provisioned into a fresh worktree so the
 // first verify command does not fail for lack of dependencies. Covers the five
@@ -601,6 +601,110 @@ export function planWorktreeLinks(repoRoot, worktreePath, options = {}) {
     notes.push(`Runtime files copied into worktree (never linked): ${copiedFiles.join(", ")}`);
   }
 
+  // Nested project roots (game/.godot, backend/.venv): provision the same
+  // policy dirs under a depth-1 projectDir so monorepo caches are not missed.
+  const nestedRoots = Array.isArray(options.nestedProjectDirs)
+    ? options.nestedProjectDirs
+        .map((d) => String(d ?? "").trim().replace(/\\/g, "/"))
+        .filter((d) => d && d !== "." && !d.includes("..") && !path.isAbsolute(d))
+    : [];
+  for (const nestedRel of nestedRoots) {
+    for (const name of dirNames) {
+      if (name === "target") {
+        continue;
+      }
+      const from = path.join(root, ...nestedRel.split("/"), name);
+      const to = path.join(wt, ...nestedRel.split("/"), name);
+      if (!existsSync(from)) {
+        continue;
+      }
+      let stat;
+      try {
+        stat = statSync(from);
+      } catch {
+        continue;
+      }
+      if (!stat.isDirectory()) {
+        continue;
+      }
+      const tier = resolveDirPolicy(name, { ...options, env });
+      const linkName = `${nestedRel}/${name}`;
+      policy[linkName] = tier;
+      if (tier === "none" || tier === "env") {
+        continue;
+      }
+      if (tier === "share") {
+        links.push({ from, to, kind: shareKind, name: linkName });
+        sharedDirs.push(linkName);
+      } else {
+        links.push({ from, to, kind: "hardlink-seed", name: linkName });
+        privateDirs.push(linkName);
+      }
+    }
+  }
+
+  // Workspace package node_modules (pnpm/yarn): root node_modules alone is not
+  // enough — each packages/<pkg>/node_modules must exist in the worktree.
+  const nestedNm = discoverNestedNodeModules(root, {
+    existsSync,
+    readdirSync: options.readdirSync ?? fs.readdirSync,
+    maxDepth: 3
+  });
+  let nestedNmLinked = 0;
+  for (const rel of nestedNm) {
+    const from = path.join(root, ...rel.split("/"));
+    const to = path.join(wt, ...rel.split("/"));
+    if (!existsSync(from)) {
+      continue;
+    }
+    // Skip if already planned (e.g. via nestedProjectDirs).
+    if (links.some((l) => l.to === to)) {
+      continue;
+    }
+    let stat;
+    try {
+      stat = statSync(from);
+    } catch {
+      continue;
+    }
+    if (!stat.isDirectory()) {
+      continue;
+    }
+    const tier = resolveDirPolicy("node_modules", { ...options, env });
+    policy[rel] = tier;
+    if (tier === "share") {
+      links.push({ from, to, kind: shareKind, name: rel });
+      sharedDirs.push(rel);
+    } else if (tier === "copy") {
+      links.push({ from, to, kind: "hardlink-seed", name: rel });
+      privateDirs.push(rel);
+    } else {
+      continue;
+    }
+    nestedNmLinked += 1;
+  }
+  if (nestedNmLinked > 0) {
+    notes.push(
+      `Nested node_modules hardlink-seeded/linked (${nestedNmLinked}): workspace packages keep per-package deps in the worktree`
+    );
+  }
+
+  // Visible degradation when a workspace monorepo only has root node_modules
+  // planned (no nested packages found on disk — e.g. clean checkout without
+  // install). Agent should know verify may ERR_MODULE_NOT_FOUND.
+  const isWorkspaceHint =
+    options.isWorkspace === true ||
+    existsSync(path.join(root, "pnpm-workspace.yaml")) ||
+    existsSync(path.join(root, "lerna.json"));
+  if (isWorkspaceHint && nestedNmLinked === 0) {
+    const rootNm = existsSync(path.join(root, "node_modules"));
+    if (rootNm) {
+      notes.push(
+        "Workspace monorepo: only root node_modules was provisioned (no packages/*/node_modules found). pnpm/yarn workspaces need a install in the worktree or nested node_modules links for per-package resolution; verify may fail with ERR_MODULE_NOT_FOUND until then."
+      );
+    }
+  }
+
   return {
     links,
     notes,
@@ -635,6 +739,109 @@ export const BLENDER_SANDBOX_EXTENSIONS_RELATIVE = `${WORKTREE_SCRATCH_DIR}/blen
  */
 export const BLENDER_SANDBOX_ENABLE_NOTE =
   "a sandboxed add-on is auto-enabled in neither startup mode - the test script must enable it AND check the return: `mod = addon_utils.enable(\"<module>\", default_set=False, persistent=True);` then `if mod is None: sys.exit(\"enable() returned None: register() raised, see traceback above\")`. addon_utils.enable swallows register() exceptions and returns None.";
+
+/** Blender factory repository name under BLENDER_USER_EXTENSIONS. */
+export const BLENDER_EXTENSION_REPO = "user_default";
+
+/**
+ * Bounded discovery of nested `node_modules` directories (pnpm/yarn workspaces).
+ * Root `node_modules` is handled by PROVISION_LINK_DIRS; this finds
+ * `packages/foo/node_modules` up to maxDepth levels so workspace packages
+ * resolve in the worktree. Never descends into node_modules, .git, or other
+ * SKIP-class trees.
+ *
+ * @param {string} repoRoot
+ * @param {{
+ *   existsSync?: typeof fs.existsSync,
+ *   readdirSync?: typeof fs.readdirSync,
+ *   maxDepth?: number
+ * }} [options]
+ * @returns {string[]} repo-relative posix paths (never includes bare "node_modules")
+ */
+export function discoverNestedNodeModules(repoRoot, options = {}) {
+  const existsSync = options.existsSync ?? fs.existsSync;
+  const readdirSync = options.readdirSync ?? fs.readdirSync;
+  const maxDepth = Number.isInteger(options.maxDepth) ? options.maxDepth : 3;
+  const root = path.resolve(String(repoRoot ?? ""));
+  if (!root || !existsSync(root)) {
+    return [];
+  }
+
+  const skip = new Set([
+    "node_modules",
+    "vendor",
+    "target",
+    "venv",
+    "__pycache__",
+    "dist",
+    "build",
+    "out",
+    ".git",
+    ".godot",
+    ".import",
+    ".venv",
+    ".tox",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".turbo",
+    ".parcel-cache",
+    ".grok-build",
+    ".grok"
+  ]);
+  const found = [];
+
+  function walk(abs, relParts, depth) {
+    if (depth > maxDepth) {
+      return;
+    }
+    let entries;
+    try {
+      entries = readdirSync(abs, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    if (!Array.isArray(entries)) {
+      return;
+    }
+    for (const entry of entries) {
+      const name =
+        typeof entry === "string"
+          ? entry
+          : String(entry?.name ?? "");
+      if (!name || name === "." || name === "..") {
+        continue;
+      }
+      const isDir =
+        typeof entry === "string"
+          ? false
+          : typeof entry?.isDirectory === "function"
+            ? entry.isDirectory()
+            : false;
+      if (!isDir) {
+        continue;
+      }
+      if (name.startsWith(".") && name !== ".pnpm") {
+        // Still skip most dot-dirs; never treat them as package roots.
+        continue;
+      }
+      if (name === "node_modules") {
+        if (relParts.length > 0) {
+          found.push([...relParts, "node_modules"].join("/"));
+        }
+        // Never walk into node_modules.
+        continue;
+      }
+      if (skip.has(name)) {
+        continue;
+      }
+      walk(path.join(abs, name), [...relParts, name], depth + 1);
+    }
+  }
+
+  walk(root, [], 0);
+  return found;
+}
 
 /**
  * Bridge-owned Blender verify shim. Written under WORKTREE_SCRATCH_DIR so it is
@@ -809,7 +1016,18 @@ export function shouldAutoBlenderSandbox(descriptor, flags = {}) {
  *   readFileSync?: typeof fs.readFileSync,
  *   env?: NodeJS.ProcessEnv
  * }} [options]
- * @returns {{scriptsDir: string|null, extensionsDir: string|null, addonName: string|null, addonSource: string|null, links: Array<{from: string, to: string, kind: string}>, env: Record<string, string>, notes: string[]}}
+ * @returns {{
+ *   scriptsDir: string|null,
+ *   extensionsDir: string|null,
+ *   addonName: string|null,
+ *   moduleName: string|null,
+ *   isExtension: boolean,
+ *   addonSource: string|null,
+ *   links: Array<{from: string, to: string, kind: string}>,
+ *   env: Record<string, string>,
+ *   notes: string[],
+ *   blenderSandbox: Record<string, string|boolean|null>|null
+ * }}
  */
 export function planBlenderScriptSandbox(worktreePath, options = {}) {
   const platform = options.platform ?? process.platform;
@@ -829,10 +1047,13 @@ export function planBlenderScriptSandbox(worktreePath, options = {}) {
     scriptsDir: null,
     extensionsDir: null,
     addonName: null,
+    moduleName: null,
+    isExtension: false,
     addonSource: null,
     links: [],
     env: {},
-    notes: note ? [note] : []
+    notes: note ? [note] : [],
+    blenderSandbox: null
   });
 
   if (!worktreePath) {
@@ -855,36 +1076,90 @@ export function planBlenderScriptSandbox(worktreePath, options = {}) {
   const addonDirRelative = path.posix.dirname(addonRelative);
   const atRoot = addonDirRelative === "." || addonDirRelative === "";
   const addonSource = atRoot ? wt : path.join(wt, ...addonDirRelative.split("/"));
-  // Blender imports an add-on under its DIRECTORY name, so the link has to keep
-  // it. A repo whose root is itself the add-on has no such directory inside the
-  // worktree - and the worktree's own basename is a run id, not a module name -
-  // so the repository name is used, which is what the developer's own manual
-  // symlink into scripts/addons would have been called.
-  const addonName =
+
+  const isExtension = Boolean(descriptor.manifestPath) || Boolean(descriptor.isExtension);
+  // Prefer manifest id (already sanitised on the descriptor). For a root-level
+  // legacy add-on the worktree basename is a run id — always use repoRoot.
+  // Never trust descriptor.addonName when atRoot: detection on the worktree
+  // would have set it to the run id.
+  const rawName =
     options.addonName ??
-    (atRoot ? path.basename(path.resolve(String(options.repoRoot ?? wt))) : addonDirRelative);
+    (isExtension
+      ? descriptor.extensionId || descriptor.addonName || path.basename(path.resolve(String(options.repoRoot ?? wt)))
+      : atRoot
+        ? path.basename(path.resolve(String(options.repoRoot ?? wt)))
+        : descriptor.addonName || addonDirRelative);
+  const addonName = sanitizePythonModuleName(rawName);
 
   const scriptsDir = path.join(wt, ...BLENDER_SANDBOX_SCRIPTS_RELATIVE.split("/"));
   const extensionsDir = path.join(wt, ...BLENDER_SANDBOX_EXTENSIONS_RELATIVE.split("/"));
+
+  /** @type {Array<{from: string, to: string, kind: string, name?: string}>} */
+  const links = [];
+  let moduleName;
+  let linkTarget;
+  let linkDescription;
+
+  if (isExtension) {
+    // 4.2+ extensions must live under BLENDER_USER_EXTENSIONS/<repo>/<id>, not
+    // the legacy scripts/addons path. Wheels and bl_ext identity only resolve
+    // when Blender manages the package as an extension.
+    const repoDir = path.join(extensionsDir, BLENDER_EXTENSION_REPO);
+    linkTarget = path.join(repoDir, addonName);
+    moduleName =
+      typeof descriptor.moduleName === "string" && descriptor.moduleName.startsWith("bl_ext.")
+        ? descriptor.moduleName
+        : `bl_ext.${BLENDER_EXTENSION_REPO}.${addonName}`;
+    links.push({ from: repoDir, to: repoDir, kind: "mkdir", name: "blender-extension-repo" });
+    links.push({ from: addonSource, to: linkTarget, kind });
+    linkDescription = `${BLENDER_SANDBOX_EXTENSIONS_RELATIVE}/${BLENDER_EXTENSION_REPO}/${addonName}`;
+  } else {
+    linkTarget = path.join(scriptsDir, "addons", addonName);
+    moduleName = addonName;
+    links.push({ from: addonSource, to: linkTarget, kind });
+    linkDescription = `${BLENDER_SANDBOX_SCRIPTS_RELATIVE}/addons/${addonName}`;
+  }
+
+  const notes = [
+    isExtension
+      ? `--blender-sandbox: extension ${addonName} is linked into ${linkDescription}; BLENDER_USER_EXTENSIONS points at the sandbox (your Blender preferences are untouched). Enable with addon_utils.enable("${moduleName}", ...).`
+      : `--blender-sandbox: ${addonName} is linked into ${linkDescription} and BLENDER_USER_SCRIPTS points there, so this run sees only this add-on (your Blender preferences are untouched). Enable with addon_utils.enable("${moduleName}", ...).`,
+    BLENDER_SANDBOX_ENABLE_NOTE.replace("<module>", moduleName)
+  ];
+  if (descriptor.hasWheels) {
+    notes.push(
+      "--blender-sandbox: blender_manifest.toml declares [[wheels]]; the sandbox does not install wheel dependencies. Run `blender --command extension build` / install-file into the sandbox repo, or vendor the wheels, before enable() can import them."
+    );
+  }
+
+  const blenderSandbox = {
+    moduleName,
+    addonName,
+    isExtension,
+    scriptsDir,
+    extensionsDir,
+    linkTarget,
+    blenderVersionMin: descriptor.blenderVersionMin?.raw ?? null,
+    hasWheels: Boolean(descriptor.hasWheels)
+  };
 
   return {
     scriptsDir,
     extensionsDir,
     addonName,
+    moduleName,
+    isExtension,
     addonSource,
-    links: [{ from: addonSource, to: path.join(scriptsDir, "addons", addonName), kind }],
+    links,
     env: {
       BLENDER_USER_SCRIPTS: scriptsDir,
-      // Pointed at a sandbox directory that is never created. An absent
-      // extensions directory is how "this run sees none of your installed
-      // extensions" is expressed; Blender creates its user directories on
-      // demand and needs no help here.
+      // Always set: for extensions the repo is populated; for legacy add-ons an
+      // absent (empty) extensions tree still isolates the run from the user's
+      // installed extensions once the directory is created empty on demand.
       BLENDER_USER_EXTENSIONS: extensionsDir
     },
-    notes: [
-      `--blender-sandbox: ${addonName} is linked into ${BLENDER_SANDBOX_SCRIPTS_RELATIVE}/addons and BLENDER_USER_SCRIPTS points there, so this run sees only this add-on (your Blender preferences are untouched).`,
-      BLENDER_SANDBOX_ENABLE_NOTE
-    ]
+    notes,
+    blenderSandbox
   };
 }
 

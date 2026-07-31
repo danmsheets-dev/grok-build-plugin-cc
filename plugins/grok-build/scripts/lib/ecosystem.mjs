@@ -11,11 +11,16 @@ import process from "node:process";
  * A detection failure has to degrade to "no ecosystem", which callers already
  * treat as "behave exactly as 0.3.x did".
  *
- * Detection reads the repo root and exactly one directory below it. Deeper is
- * deliberately out of scope: a Godot project three levels down is a monorepo
- * layout the user should point the run at directly, and an unbounded walk over
- * a tree that contains node_modules/ or .godot/ is thousands of stat calls for
- * a guess.
+ * Detection reads the repository root and exactly one directory below it for
+ * every ecosystem (Godot, Blender, Python/Django, Node, Rust). Deeper nesting
+ * is deliberately out of scope: an unbounded walk over node_modules/ or
+ * .godot/ is thousands of stat calls for a guess. Each descriptor records
+ * `projectDir` (repo-relative posix, `"."` at root) so verify commands and
+ * provision can root themselves at the right place.
+ *
+ * A repository can be more than one ecosystem. `detectEcosystems` returns all
+ * of them in `ECOSYSTEM_PRIORITY` order; `defaultVerifyPlan` unions their
+ * verify commands so a Django + React monorepo exercises both stacks.
  */
 
 /** Directory names never descended into. */
@@ -271,31 +276,73 @@ export function exportSmokeExtensionForPlatform(platform) {
   return ".zip";
 }
 
+/**
+ * Locate a marker at the repo root or exactly one directory below it.
+ * Returns `{ abs, projectDir }` where projectDir is repo-relative posix (`"."`
+ * at root), or null when the marker is absent.
+ */
+function findMarkerAtDepth1(root, io, markerName) {
+  const atRoot = path.join(root, markerName);
+  if (exists(io, atRoot)) {
+    return { abs: atRoot, projectDir: ".", projectAbs: root };
+  }
+  for (const child of childDirs(root, io)) {
+    const candidate = path.join(child.dir, markerName);
+    if (exists(io, candidate)) {
+      return { abs: candidate, projectDir: child.rel, projectAbs: child.dir };
+    }
+  }
+  return null;
+}
+
+/**
+ * First marker name present at root or depth 1. Prefer root when any marker
+ * lives there so a monorepo root with its own pyproject is not shadowed by a
+ * nested package.
+ */
+function findAnyMarkerAtDepth1(root, io, markerNames) {
+  for (const marker of markerNames) {
+    if (exists(io, path.join(root, marker))) {
+      return { marker, projectDir: ".", projectAbs: root };
+    }
+  }
+  for (const child of childDirs(root, io)) {
+    for (const marker of markerNames) {
+      if (exists(io, path.join(child.dir, marker))) {
+        return { marker, projectDir: child.rel, projectAbs: child.dir };
+      }
+    }
+  }
+  return null;
+}
+
 function detectGodot(root, io) {
-  const projectFile = path.join(root, GODOT_PROJECT_FILE);
   // project.godot is the only marker that means "this is a Godot project". A
   // bare .godot/ or .import/ directory must NOT imply Godot: both are caches
   // that outlive the project that produced them (a moved or deleted project
   // leaves them behind), and both are already linked/excluded unconditionally
   // by provision.mjs / worktree.mjs, which is where they belong.
-  if (!exists(io, projectFile)) {
+  const hit = findMarkerAtDepth1(root, io, GODOT_PROJECT_FILE);
+  if (!hit) {
     return null;
   }
 
-  const text = readText(io, projectFile) ?? "";
+  const projectAbs = hit.projectAbs;
+  const projectDir = hit.projectDir;
+  const text = readText(io, hit.abs) ?? "";
   const configVersion = parseGodotConfigVersion(text);
   const major = godotMajorFromConfigVersion(configVersion);
   const { features, minor } = parseGodotFeatures(text);
 
-  const hasGut = exists(io, path.join(root, "addons", "gut", "gut_cmdln.gd"));
-  const hasGdUnit4 = exists(io, path.join(root, "addons", "gdUnit4"));
+  const hasGut = exists(io, path.join(projectAbs, "addons", "gut", "gut_cmdln.gd"));
+  const hasGdUnit4 = exists(io, path.join(projectAbs, "addons", "gdUnit4"));
 
   // First existing conventional test directory. gdUnit4's CLI runner takes an
   // explicit -a <dir> and errors out when it is missing, so a default verify
   // command for it is only emitted when there is somewhere to point it.
   let testDir = null;
   for (const candidate of ["test", "tests"]) {
-    if (exists(io, path.join(root, candidate))) {
+    if (exists(io, path.join(projectAbs, candidate))) {
       testDir = candidate;
       break;
     }
@@ -306,7 +353,7 @@ function detectGodot(root, io) {
   // presets file only enables an OPT-IN smoke export (see exportSmoke option
   // on defaultVerifyCommands) — never an automatic one, because a headless
   // export needs a configured template and can take minutes.
-  const exportPresetsPath = path.join(root, "export_presets.cfg");
+  const exportPresetsPath = path.join(projectAbs, "export_presets.cfg");
   const hasExportPresets = exists(io, exportPresetsPath);
   const exportPreset = hasExportPresets
     ? parseFirstExportPreset(readText(io, exportPresetsPath) ?? "")
@@ -317,7 +364,10 @@ function detectGodot(root, io) {
   return {
     id: "godot",
     root,
-    projectFile: GODOT_PROJECT_FILE,
+    // Repo-relative project root (posix). Verify uses `--path ${projectDir}`.
+    projectDir,
+    projectFile:
+      projectDir === "." ? GODOT_PROJECT_FILE : relPosix(projectDir, GODOT_PROJECT_FILE),
     configVersion,
     major,
     minor,
@@ -395,6 +445,47 @@ function parseBlenderManifestVersionMin(text) {
   };
 }
 
+/**
+ * Parse id / type / wheels from blender_manifest.toml (4.2+ extensions).
+ * `id` is what `addon_utils.enable` and `bl_ext.user_default.<id>` use; the
+ * directory name is not authoritative.
+ */
+function parseBlenderManifestMeta(text) {
+  const raw = String(text ?? "");
+  const idMatch = /^\s*id\s*=\s*"([^"]+)"/m.exec(raw);
+  const typeMatch = /^\s*type\s*=\s*"([^"]+)"/m.exec(raw);
+  const hasWheels = /^\s*\[\[wheels\]\]/m.test(raw) || /^\s*wheels\s*=/m.test(raw);
+  return {
+    extensionId: idMatch ? idMatch[1].trim() : null,
+    extensionType: typeMatch ? typeMatch[1].trim() : null,
+    hasWheels
+  };
+}
+
+/**
+ * Turn a repo/directory name into a legal Python identifier for
+ * `addon_utils.enable`. `mesh-tools` must become `mesh_tools`, never left as a
+ * name that cannot be imported.
+ *
+ * @param {string|null|undefined} name
+ * @returns {string}
+ */
+export function sanitizePythonModuleName(name) {
+  let s = String(name ?? "")
+    .trim()
+    .replace(/[-.\s]+/g, "_")
+    .replace(/[^A-Za-z0-9_]/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_+|_+$/g, "");
+  if (!s) {
+    return "addon";
+  }
+  if (!/^[A-Za-z_]/.test(s)) {
+    s = `_${s}`;
+  }
+  return s;
+}
+
 function detectBlender(root, io) {
   let hit = inspectBlenderDir(root, "", io);
   if (!hit) {
@@ -420,33 +511,68 @@ function detectBlender(root, io) {
   }
 
   let blenderVersionMin = null;
+  let extensionId = null;
+  let extensionType = null;
+  let hasWheels = false;
   if (hit.manifestPath) {
     const manifestText = readText(io, path.join(root, ...hit.manifestPath.split("/"))) ?? "";
     blenderVersionMin = parseBlenderManifestVersionMin(manifestText);
+    const meta = parseBlenderManifestMeta(manifestText);
+    extensionId = meta.extensionId;
+    extensionType = meta.extensionType;
+    hasWheels = meta.hasWheels;
   }
 
-  // Blender imports an add-on under its directory name. Root-level add-ons
-  // use the repository basename (same rule as planBlenderScriptSandbox).
+  // Blender imports an add-on under its directory name (legacy) or extension
+  // id (4.2+). Root-level add-ons use the repository basename. Always sanitise
+  // so a repo named `mesh-tools` does not produce an unimportable link name.
   const addonRelative = hit.manifestPath ?? hit.addonInitPath ?? null;
-  let moduleName = null;
+  let rawDirName = null;
   if (addonRelative) {
     const dir = path.posix.dirname(addonRelative.replace(/\\/g, "/"));
-    moduleName =
+    rawDirName =
       dir === "." || dir === ""
         ? path.basename(root)
         : dir.split("/").filter(Boolean)[0] ?? null;
   }
 
+  const isExtension = Boolean(hit.manifestPath);
+  const safeDirName = rawDirName ? sanitizePythonModuleName(rawDirName) : null;
+  const safeExtensionId = extensionId
+    ? sanitizePythonModuleName(extensionId)
+    : safeDirName;
+  // What addon_utils.enable / the verify shim must pass. Extensions live under
+  // the bl_ext.user_default namespace when sandboxed into BLENDER_USER_EXTENSIONS.
+  const moduleName = isExtension && safeExtensionId
+    ? `bl_ext.user_default.${safeExtensionId}`
+    : safeDirName;
+
+  // projectDir for the add-on package itself (directory containing the marker).
+  let projectDir = ".";
+  if (addonRelative) {
+    const dir = path.posix.dirname(addonRelative.replace(/\\/g, "/"));
+    if (dir && dir !== ".") {
+      projectDir = dir.split("/")[0] ?? ".";
+    }
+  }
+
   return {
     id: "blender",
     root,
+    projectDir,
     detectedBy: hit.detectedBy,
     manifestPath: hit.manifestPath,
     addonInitPath: hit.addonInitPath,
     moduleName,
+    extensionId: safeExtensionId,
+    extensionType,
+    hasWheels,
+    // Directory-link basename for legacy add-ons (sanitised).
+    addonName: isExtension ? safeExtensionId : safeDirName,
     // True when there is a module to sandbox (extension or legacy add-on). A
     // bare .blend project is NOT an add-on — auto-sandbox must not claim it.
     isAddon: Boolean(hit.manifestPath || hit.addonInitPath),
+    isExtension,
     testScript,
     blenderVersionMin,
     exeHint: resolveBinaryHint("blender", io.env)
@@ -484,10 +610,14 @@ function detectPackageManager(root, io, packageManagerField) {
 }
 
 function detectNode(root, io) {
-  const packageJson = path.join(root, "package.json");
-  if (!exists(io, packageJson)) {
+  const hit = findMarkerAtDepth1(root, io, "package.json");
+  if (!hit) {
     return null;
   }
+
+  const projectAbs = hit.projectAbs;
+  const projectDir = hit.projectDir;
+  const packageJson = hit.abs;
 
   let scripts = {};
   let dependencies = {};
@@ -515,7 +645,15 @@ function detectNode(root, io) {
 
   const testScript = typeof scripts.test === "string" ? scripts.test : "";
   const hasTestScript = Boolean(testScript) && !/no test specified/i.test(testScript);
-  const packageManager = detectPackageManager(root, io, packageManagerField);
+  // Lockfiles are usually at the monorepo root even when package.json lives in
+  // a child; check both project dir and repo root.
+  const packageManager = detectPackageManager(projectAbs, io, packageManagerField);
+  const packageManagerAtRoot =
+    projectDir !== "." ? detectPackageManager(root, io, packageManagerField) : packageManager;
+  const resolvedPm =
+    packageManager !== "npm" || projectDir === "."
+      ? packageManager
+      : packageManagerAtRoot;
 
   // When scripts.test is absent, call the runner directly only when a real
   // config file says the project uses it. Guessing `npx jest` on every repo
@@ -524,11 +662,11 @@ function detectNode(root, io) {
   let directTestRunner = null;
   if (!hasTestScript) {
     if (
-      exists(io, path.join(root, "vitest.config.ts")) ||
-      exists(io, path.join(root, "vitest.config.js")) ||
-      exists(io, path.join(root, "vitest.config.mjs")) ||
-      exists(io, path.join(root, "vite.config.ts")) ||
-      exists(io, path.join(root, "vite.config.js"))
+      exists(io, path.join(projectAbs, "vitest.config.ts")) ||
+      exists(io, path.join(projectAbs, "vitest.config.js")) ||
+      exists(io, path.join(projectAbs, "vitest.config.mjs")) ||
+      exists(io, path.join(projectAbs, "vite.config.ts")) ||
+      exists(io, path.join(projectAbs, "vite.config.js"))
     ) {
       // vite.config alone is not enough to prove vitest — only when vitest is
       // also a dependency, so a plain Vite app does not get a bogus plan.
@@ -536,10 +674,10 @@ function detectNode(root, io) {
         directTestRunner = "vitest";
       }
     } else if (
-      exists(io, path.join(root, "jest.config.js")) ||
-      exists(io, path.join(root, "jest.config.ts")) ||
-      exists(io, path.join(root, "jest.config.mjs")) ||
-      exists(io, path.join(root, "jest.config.cjs"))
+      exists(io, path.join(projectAbs, "jest.config.js")) ||
+      exists(io, path.join(projectAbs, "jest.config.ts")) ||
+      exists(io, path.join(projectAbs, "jest.config.mjs")) ||
+      exists(io, path.join(projectAbs, "jest.config.cjs"))
     ) {
       directTestRunner = "jest";
     }
@@ -547,21 +685,24 @@ function detectNode(root, io) {
 
   const hasTypeScript =
     Boolean(dependencies.typescript || devDependencies.typescript) &&
-    exists(io, path.join(root, "tsconfig.json"));
+    exists(io, path.join(projectAbs, "tsconfig.json"));
 
   const isWorkspace =
     workspaces != null ||
+    exists(io, path.join(projectAbs, "pnpm-workspace.yaml")) ||
     exists(io, path.join(root, "pnpm-workspace.yaml")) ||
+    exists(io, path.join(projectAbs, "lerna.json")) ||
     exists(io, path.join(root, "lerna.json"));
 
   return {
     id: "node",
     root,
+    projectDir,
     // `npm init` writes a placeholder test script that exits 1 on purpose.
     // Emitting `npm test` for it would fail every run of a project that has
     // simply never added tests.
     hasTestScript,
-    packageManager,
+    packageManager: resolvedPm,
     directTestRunner,
     hasTypeScript,
     isWorkspace
@@ -641,20 +782,39 @@ function formatPythonCommand(interpreter, args) {
 /**
  * Django is a Python subtype: same ecosystem id so priority and tooling stay
  * coherent, with `framework: "django"` selecting the manage.py verify plan.
+ *
+ * @param {string} projectAbs absolute path of the Python/Django project root
+ * @param {string} projectDir repo-relative posix project dir
  */
-function detectDjangoSignals(root, io, pyproject, requirements) {
-  if (!exists(io, path.join(root, "manage.py"))) {
+function detectDjangoSignals(projectAbs, projectDir, io, pyproject, requirements) {
+  if (!exists(io, path.join(projectAbs, "manage.py"))) {
     return null;
   }
 
-  const hasSettingsFile = exists(io, path.join(root, "settings.py"));
+  const hasSettingsFile = exists(io, path.join(projectAbs, "settings.py"));
+  let settingsModule = hasSettingsFile ? "settings" : null;
   const hasSettingsPkg =
-    exists(io, path.join(root, "settings", "__init__.py")) ||
-    // Common layout: <project>/settings.py one level down.
-    childDirs(root, io).some((child) =>
-      exists(io, path.join(child.dir, "settings.py")) ||
-      exists(io, path.join(child.dir, "settings", "__init__.py"))
-    );
+    exists(io, path.join(projectAbs, "settings", "__init__.py")) ||
+    // Common layout: <project>/settings.py one level down from manage.py.
+    childDirs(projectAbs, io).some((child) => {
+      if (exists(io, path.join(child.dir, "settings.py"))) {
+        if (!settingsModule) {
+          settingsModule = `${child.rel}.settings`;
+        }
+        return true;
+      }
+      if (exists(io, path.join(child.dir, "settings", "__init__.py"))) {
+        if (!settingsModule) {
+          settingsModule = `${child.rel}.settings`;
+        }
+        return true;
+      }
+      return false;
+    });
+
+  if (exists(io, path.join(projectAbs, "settings", "__init__.py")) && !settingsModule) {
+    settingsModule = "settings";
+  }
 
   const depText = `${pyproject}\n${requirements}`;
   const hasDjangoDep =
@@ -667,47 +827,71 @@ function detectDjangoSignals(root, io, pyproject, requirements) {
     return null;
   }
 
+  const managePy =
+    projectDir === "." ? "manage.py" : relPosix(projectDir, "manage.py");
+
   return {
     framework: "django",
-    managePy: "manage.py"
+    managePy,
+    settingsModule
   };
 }
 
 function detectPython(root, io) {
   const markers = ["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "manage.py"];
-  if (!markers.some((marker) => exists(io, path.join(root, marker)))) {
+  // Prefer manage.py over a bare pyproject when both exist at different depths
+  // so a monorepo with tools/pyproject.toml + backend/manage.py still finds Django.
+  const manageHit = findMarkerAtDepth1(root, io, "manage.py");
+  const anyHit = findAnyMarkerAtDepth1(root, io, markers);
+  if (!anyHit && !manageHit) {
     return null;
   }
 
-  const pyproject = readText(io, path.join(root, "pyproject.toml")) ?? "";
-  const requirements = readText(io, path.join(root, "requirements.txt")) ?? "";
+  // Prefer the manage.py location when present (Django monorepo), else first marker.
+  const projectDir = manageHit?.projectDir ?? anyHit.projectDir;
+  const projectAbs = manageHit?.projectAbs ?? anyHit.projectAbs;
+
+  const pyproject = readText(io, path.join(projectAbs, "pyproject.toml")) ?? "";
+  const requirements = readText(io, path.join(projectAbs, "requirements.txt")) ?? "";
+  // Also read root requirements when the project is nested (common monorepo).
+  const rootRequirements =
+    projectDir !== "." ? readText(io, path.join(root, "requirements.txt")) ?? "" : "";
   const platform = io.env?.GROK_BUILD_DETECT_PLATFORM || process.platform;
-  const interpreter = resolvePythonInterpreter(root, {
+  const interpreter = resolvePythonInterpreter(projectAbs, {
     existsSync: (target) => exists(io, target),
     platform
   });
 
   const hasPytest =
-    exists(io, path.join(root, "pytest.ini")) ||
-    exists(io, path.join(root, "conftest.py")) ||
+    exists(io, path.join(projectAbs, "pytest.ini")) ||
+    exists(io, path.join(projectAbs, "conftest.py")) ||
     /^\s*\[tool\.pytest/m.test(pyproject);
-  const hasTestsDir = exists(io, path.join(root, "tests")) || exists(io, path.join(root, "test"));
+  const hasTestsDir =
+    exists(io, path.join(projectAbs, "tests")) || exists(io, path.join(projectAbs, "test"));
   const hasRuff =
     /^\s*\[tool\.ruff/m.test(pyproject) ||
-    exists(io, path.join(root, "ruff.toml")) ||
-    exists(io, path.join(root, ".ruff.toml"));
+    exists(io, path.join(projectAbs, "ruff.toml")) ||
+    exists(io, path.join(projectAbs, ".ruff.toml"));
   const hasMypy =
     /^\s*\[tool\.mypy/m.test(pyproject) ||
-    exists(io, path.join(root, "mypy.ini")) ||
-    exists(io, path.join(root, ".mypy.ini"));
+    exists(io, path.join(projectAbs, "mypy.ini")) ||
+    exists(io, path.join(projectAbs, ".mypy.ini"));
 
-  const django = detectDjangoSignals(root, io, pyproject, requirements);
+  const django = detectDjangoSignals(
+    projectAbs,
+    projectDir,
+    io,
+    pyproject,
+    `${requirements}\n${rootRequirements}`
+  );
 
   return {
     id: "python",
     root,
+    projectDir,
     framework: django?.framework ?? null,
     managePy: django?.managePy ?? null,
+    settingsModule: django?.settingsModule ?? null,
     interpreter,
     hasTests: hasPytest || hasTestsDir,
     hasPytest,
@@ -717,10 +901,11 @@ function detectPython(root, io) {
 }
 
 function detectRust(root, io) {
-  if (!exists(io, path.join(root, "Cargo.toml"))) {
+  const hit = findMarkerAtDepth1(root, io, "Cargo.toml");
+  if (!hit) {
     return null;
   }
-  return { id: "rust", root };
+  return { id: "rust", root, projectDir: hit.projectDir };
 }
 
 const DETECTORS = Object.freeze({
@@ -871,9 +1056,43 @@ function preferWindowsConsoleExe(value, existsSync) {
 export const GODOT_CHECK_SCRIPT_RES =
   "res://.grok/plugins/grok-build-runtime/tools/grok_check.gd";
 
+/**
+ * Characters a repo-derived path may contain before it is allowed into a
+ * command string. See the long comment on SAFE_COMMAND_PATH_PATTERN below.
+ */
+const SAFE_COMMAND_PATH_PATTERN = /^[A-Za-z0-9 ._\/-]+$/;
+
+/**
+ * Quote a path token for a command string. Same rule as
+ * `resolveEcosystemBinary`: quote only when whitespace makes it necessary.
+ * Callers must have passed the value through `SAFE_COMMAND_PATH_PATTERN` first.
+ */
+function quoteCommandPath(value) {
+  return /\s/.test(value) ? `"${value}"` : value;
+}
+
+/**
+ * Safe `--path` / cwd token from descriptor.projectDir. Falls back to `"."`
+ * when missing or unsafe (never emits an injectable path).
+ */
+function safeProjectPathArg(descriptor) {
+  const raw =
+    typeof descriptor?.projectDir === "string" && descriptor.projectDir.trim()
+      ? descriptor.projectDir.trim().replace(/\\/g, "/")
+      : ".";
+  if (raw === "." || raw === "") {
+    return ".";
+  }
+  if (!SAFE_COMMAND_PATH_PATTERN.test(raw)) {
+    return ".";
+  }
+  return quoteCommandPath(raw);
+}
+
 function godotVerifyCommands(exe, descriptor, options = {}) {
   const commands = [];
   const major = descriptor.major;
+  const pathArg = safeProjectPathArg(descriptor);
   // Unknown major takes the Godot 4 branch: 4.x is what a project detected
   // today is overwhelmingly likely to be, and its flags are the ones a
   // config_version we failed to parse would most likely accept.
@@ -890,7 +1109,7 @@ function godotVerifyCommands(exe, descriptor, options = {}) {
   // real exit code. injectRuntimePlugin copies tools/ into the worktree.
   if (major !== 3) {
     commands.push(
-      `${exe} --headless --path . --script ${GODOT_CHECK_SCRIPT_RES} --quit`
+      `${exe} --headless --path ${pathArg} --script ${GODOT_CHECK_SCRIPT_RES} --quit`
     );
   }
 
@@ -898,21 +1117,27 @@ function godotVerifyCommands(exe, descriptor, options = {}) {
     // Godot 3 has neither --headless (4.0) nor --quit-after. Editor mode plus
     // --quit is the documented way to import assets and surface parse errors;
     // without -e/--editor the import never runs.
-    commands.push(`${exe} --no-window --path . --editor --quit`);
+    commands.push(`${exe} --no-window --path ${pathArg} --editor --quit`);
   } else {
     // --import imports assets without opening the editor; --quit-after 1 then
-    // runs the main scene for a single frame, which is what surfaces GDScript
-    // parse and load errors that --import alone never reaches.
-    commands.push(`${exe} --headless --path . --import`);
-    commands.push(`${exe} --headless --path . --quit-after 1`);
+    // runs the main scene for a single frame. Whole-project coverage of other
+    // scenes is provided by grok_check.gd above.
+    commands.push(`${exe} --headless --path ${pathArg} --import`);
+    commands.push(`${exe} --headless --path ${pathArg} --quit-after 1`);
   }
 
   if (descriptor.testRunner === "gut") {
-    commands.push(`${exe} ${headless} --path . -s addons/gut/gut_cmdln.gd -gexit`);
+    commands.push(`${exe} ${headless} --path ${pathArg} -s addons/gut/gut_cmdln.gd -gexit`);
   } else if (descriptor.testRunner === "gdunit4" && descriptor.testDir) {
-    commands.push(
-      `${exe} ${headless} --path . -s addons/gdUnit4/bin/GdUnitCmdTool.gd -a ${descriptor.testDir}`
-    );
+    const testDir =
+      typeof descriptor.testDir === "string" && SAFE_COMMAND_PATH_PATTERN.test(descriptor.testDir)
+        ? quoteCommandPath(descriptor.testDir)
+        : null;
+    if (testDir) {
+      commands.push(
+        `${exe} ${headless} --path ${pathArg} -s addons/gdUnit4/bin/GdUnitCmdTool.gd -a ${testDir}`
+      );
+    }
   }
 
   // Opt-in export smoke. Never touches export_credentials.cfg — that file is
@@ -930,9 +1155,9 @@ function godotVerifyCommands(exe, descriptor, options = {}) {
       );
       const out = `.grok-build/export-smoke${ext}`;
       if (major === 3) {
-        commands.push(`${exe} --no-window --path . --export ${quoted} ${out}`);
+        commands.push(`${exe} --no-window --path ${pathArg} --export ${quoted} ${out}`);
       } else {
-        commands.push(`${exe} --headless --path . --export-release ${quoted} ${out}`);
+        commands.push(`${exe} --headless --path ${pathArg} --export-release ${quoted} ${out}`);
       }
     }
   }
@@ -965,18 +1190,7 @@ function godotVerifyCommands(exe, descriptor, options = {}) {
  * descriptor field is also consumed as a real filesystem path (provision.mjs
  * links the add-on directory from it), where the raw name is what is wanted.
  */
-const SAFE_COMMAND_PATH_PATTERN = /^[A-Za-z0-9 ._\/-]+$/;
-
-/**
- * Quote a path token for a command string. Same rule as
- * `resolveEcosystemBinary`: quote only when whitespace makes it necessary, so
- * an ordinary `myaddon/blender_manifest.toml` renders unchanged. Callers must
- * have passed the value through `SAFE_COMMAND_PATH_PATTERN` first - a `"` can
- * never reach this.
- */
-function quoteCommandPath(value) {
-  return /\s/.test(value) ? `"${value}"` : value;
-}
+// SAFE_COMMAND_PATH_PATTERN and quoteCommandPath are defined above godotVerifyCommands.
 
 /** Relative path of the bridge-owned Blender verify shim (written by provision). */
 export const BLENDER_VERIFY_SHIM_RELATIVE = ".grok-build/blender/grok_verify_shim.py";
@@ -1042,25 +1256,80 @@ function blenderVerifyCommands(exe, descriptor) {
   return commands;
 }
 
+/**
+ * Package-manager flag that scopes a command to a subdirectory without `cd`.
+ * Returns null when projectDir is root or unsafe.
+ */
+function nodePrefixFlag(pm, projectDir) {
+  if (!projectDir || projectDir === "." || projectDir === "") {
+    return null;
+  }
+  if (!SAFE_COMMAND_PATH_PATTERN.test(projectDir)) {
+    return null;
+  }
+  const dir = quoteCommandPath(projectDir);
+  if (pm === "pnpm") {
+    return `--dir ${dir}`;
+  }
+  if (pm === "yarn") {
+    return `--cwd ${dir}`;
+  }
+  if (pm === "bun") {
+    return `--cwd ${dir}`;
+  }
+  // npm (default)
+  return `--prefix ${dir}`;
+}
+
 function nodeVerifyCommands(descriptor) {
   const commands = [];
   const pm = descriptor.packageManager || "npm";
+  const prefix = nodePrefixFlag(pm, descriptor.projectDir);
 
   if (descriptor.hasTestScript) {
-    // Always at the workspace root. `pnpm -r test` / per-package descent is
-    // never the default: it multiplies wall-clock by the package count and is
-    // not what a monorepo's root scripts.test is for.
-    commands.push(`${pm} test`);
+    // Always at the project (or workspace) root. `pnpm -r test` / per-package
+    // descent is never the default: it multiplies wall-clock by the package
+    // count and is not what a monorepo's root scripts.test is for.
+    if (prefix) {
+      // `npm --prefix frontend test` / `pnpm --dir frontend test`
+      commands.push(`${pm} ${prefix} test`);
+    } else {
+      commands.push(`${pm} test`);
+    }
   } else if (descriptor.directTestRunner === "vitest") {
-    commands.push(pm === "npm" ? "npx vitest run" : `${pm} exec vitest run`);
+    if (prefix) {
+      commands.push(
+        pm === "npm"
+          ? `npx --prefix ${quoteCommandPath(descriptor.projectDir)} vitest run`
+          : `${pm} ${prefix} exec vitest run`
+      );
+    } else {
+      commands.push(pm === "npm" ? "npx vitest run" : `${pm} exec vitest run`);
+    }
   } else if (descriptor.directTestRunner === "jest") {
-    commands.push(pm === "npm" ? "npx jest" : `${pm} exec jest`);
+    if (prefix) {
+      commands.push(
+        pm === "npm"
+          ? `npx --prefix ${quoteCommandPath(descriptor.projectDir)} jest`
+          : `${pm} ${prefix} exec jest`
+      );
+    } else {
+      commands.push(pm === "npm" ? "npx jest" : `${pm} exec jest`);
+    }
   }
 
   if (descriptor.hasTypeScript) {
     // tsc --noEmit is the cheap typecheck; only when TypeScript is actually a
     // dependency AND tsconfig.json exists (both gated at detection time).
-    commands.push(pm === "npm" ? "npx tsc --noEmit" : `${pm} exec tsc --noEmit`);
+    if (prefix) {
+      commands.push(
+        pm === "npm"
+          ? `npx --prefix ${quoteCommandPath(descriptor.projectDir)} tsc --noEmit`
+          : `${pm} ${prefix} exec tsc --noEmit`
+      );
+    } else {
+      commands.push(pm === "npm" ? "npx tsc --noEmit" : `${pm} exec tsc --noEmit`);
+    }
   }
 
   return commands;
@@ -1068,61 +1337,82 @@ function nodeVerifyCommands(descriptor) {
 
 function pythonVerifyCommands(descriptor, options = {}) {
   const platform = options.platform ?? process.platform;
+  const projectAbs =
+    descriptor.projectDir && descriptor.projectDir !== "." && descriptor.root
+      ? path.join(descriptor.root, ...String(descriptor.projectDir).split("/"))
+      : (descriptor.root ?? "");
   const interpreter =
     descriptor.interpreter && typeof descriptor.interpreter === "object"
       ? descriptor.interpreter
-      : resolvePythonInterpreter(descriptor.root ?? "", {
+      : resolvePythonInterpreter(projectAbs || descriptor.root || "", {
           existsSync: options.existsSync ?? fs.existsSync,
           platform
         });
 
   const commands = [];
+  const lintTarget =
+    typeof descriptor.projectDir === "string" &&
+    descriptor.projectDir !== "." &&
+    SAFE_COMMAND_PATH_PATTERN.test(descriptor.projectDir)
+      ? quoteCommandPath(descriptor.projectDir)
+      : ".";
 
-  if (descriptor.framework === "django" && descriptor.managePy) {
+  // manage.py path is already repo-relative when nested (e.g. backend/manage.py).
+  const managePy =
+    typeof descriptor.managePy === "string" && SAFE_COMMAND_PATH_PATTERN.test(descriptor.managePy)
+      ? descriptor.managePy
+      : descriptor.managePy && descriptor.managePy === "manage.py"
+        ? "manage.py"
+        : null;
+
+  if (descriptor.framework === "django" && managePy) {
     // Order matters: `check` is seconds, `makemigrations --check` is the
     // classic silent breakage (model changed, migration not committed), then
-    // the project's tests. DJANGO_SETTINGS_MODULE is not set here — it comes
-    // from the project config's trust-gated `env` block when present.
-    commands.push(formatPythonCommand(interpreter, [descriptor.managePy, "check"]));
+    // the project's tests. DJANGO_SETTINGS_MODULE is recorded on the descriptor
+    // (settingsModule); the bridge may surface it but does not invent env here.
+    commands.push(formatPythonCommand(interpreter, [managePy, "check"]));
     commands.push(
-      formatPythonCommand(interpreter, [
-        descriptor.managePy,
-        "makemigrations",
-        "--check",
-        "--dry-run"
-      ])
+      formatPythonCommand(interpreter, [managePy, "makemigrations", "--check", "--dry-run"])
     );
     if (descriptor.hasPytest) {
-      commands.push(formatPythonCommand(interpreter, ["-m", "pytest", "-q"]));
+      const pytestArgs = ["-m", "pytest", "-q"];
+      if (lintTarget !== ".") {
+        pytestArgs.push(lintTarget);
+      }
+      commands.push(formatPythonCommand(interpreter, pytestArgs));
     } else {
-      commands.push(formatPythonCommand(interpreter, [descriptor.managePy, "test"]));
+      commands.push(formatPythonCommand(interpreter, [managePy, "test"]));
     }
   } else if (descriptor.hasTests) {
-    commands.push(formatPythonCommand(interpreter, ["-m", "pytest", "-q"]));
+    const pytestArgs = ["-m", "pytest", "-q"];
+    if (lintTarget !== ".") {
+      pytestArgs.push(lintTarget);
+    }
+    commands.push(formatPythonCommand(interpreter, pytestArgs));
   }
 
   // Linters only when the project configures them — emitting ruff/mypy on a
   // repo that never opted in turns a healthy run red for style noise.
   if (descriptor.hasRuff) {
     if ((interpreter.prefix ?? [])[0] === "uv") {
-      commands.push("uv run ruff check .");
+      commands.push(`uv run ruff check ${lintTarget}`);
     } else if ((interpreter.prefix ?? [])[0] === "poetry") {
-      commands.push("poetry run ruff check .");
+      commands.push(`poetry run ruff check ${lintTarget}`);
     } else if ((interpreter.prefix ?? [])[0] === "pdm") {
-      commands.push("pdm run ruff check .");
+      commands.push(`pdm run ruff check ${lintTarget}`);
     } else {
-      commands.push(formatPythonCommand(interpreter, ["-m", "ruff", "check", "."]));
+      commands.push(formatPythonCommand(interpreter, ["-m", "ruff", "check", lintTarget]));
     }
   }
   if (descriptor.hasMypy) {
     if ((interpreter.prefix ?? [])[0] === "uv") {
-      commands.push("uv run mypy .");
+      commands.push(`uv run mypy ${lintTarget}`);
     } else if ((interpreter.prefix ?? [])[0] === "poetry") {
-      commands.push("poetry run mypy .");
+      commands.push(`poetry run mypy ${lintTarget}`);
     } else if ((interpreter.prefix ?? [])[0] === "pdm") {
-      commands.push("pdm run mypy .");
+      commands.push(`pdm run mypy ${lintTarget}`);
     } else {
-      commands.push(formatPythonCommand(interpreter, ["-m", "mypy", "."]));
+      commands.push(formatPythonCommand(interpreter, ["-m", "mypy", lintTarget]));
     }
   }
 
@@ -1160,18 +1450,96 @@ export function defaultVerifyCommands(descriptor, options = {}) {
     return [];
   }
 
+  // Per-ecosystem tool override (tools.godot / tools.blender) when building a
+  // multi-ecosystem plan; falls back to the single `override` string.
+  const perId =
+    options.toolOverrides && typeof options.toolOverrides === "object"
+      ? options.toolOverrides[descriptor.id]
+      : undefined;
+  const resolvedOptions =
+    perId !== undefined ? { ...options, override: perId } : options;
+
   switch (descriptor.id) {
     case "godot":
-      return godotVerifyCommands(resolveEcosystemBinary(descriptor, options), descriptor, options);
+      return godotVerifyCommands(
+        resolveEcosystemBinary(descriptor, resolvedOptions),
+        descriptor,
+        resolvedOptions
+      );
     case "blender":
-      return blenderVerifyCommands(resolveEcosystemBinary(descriptor, options), descriptor);
+      return blenderVerifyCommands(
+        resolveEcosystemBinary(descriptor, resolvedOptions),
+        descriptor
+      );
     case "node":
       return nodeVerifyCommands(descriptor);
     case "python":
-      return pythonVerifyCommands(descriptor, options);
-    case "rust":
+      return pythonVerifyCommands(descriptor, resolvedOptions);
+    case "rust": {
+      if (
+        descriptor.projectDir &&
+        descriptor.projectDir !== "." &&
+        SAFE_COMMAND_PATH_PATTERN.test(descriptor.projectDir)
+      ) {
+        return [`cargo test --manifest-path ${quoteCommandPath(relPosix(descriptor.projectDir, "Cargo.toml"))}`];
+      }
       return ["cargo test"];
+    }
     default:
       return [];
   }
+}
+
+/**
+ * Union verify plan across every detected ecosystem, de-duplicated, in
+ * ECOSYSTEM_PRIORITY order (engine-first, then language). Each ecosystem's own
+ * commands stay cheapest-first so a fast failure still reports fast.
+ *
+ * This is what makes a Django + React monorepo run both `manage.py check` and
+ * `npm test`, and a Blender add-on with pytest run both the Blender smoke and
+ * the Python suite.
+ *
+ * @param {Array<Record<string, any>>|null|undefined} descriptors
+ * @param {Parameters<typeof defaultVerifyCommands>[1]} [options]
+ * @returns {string[]}
+ */
+export function defaultVerifyPlan(descriptors, options = {}) {
+  if (!Array.isArray(descriptors) || descriptors.length === 0) {
+    return [];
+  }
+  const seen = new Set();
+  const commands = [];
+  for (const descriptor of descriptors) {
+    for (const command of defaultVerifyCommands(descriptor, options)) {
+      if (seen.has(command)) {
+        continue;
+      }
+      seen.add(command);
+      commands.push(command);
+    }
+  }
+  return commands;
+}
+
+/**
+ * Filter detected ecosystems by an optional project-config allowlist.
+ * Unknown / empty filter returns the full list unchanged.
+ *
+ * @param {Array<Record<string, any>>} descriptors
+ * @param {string[]|null|undefined} allowlist
+ */
+export function filterEcosystems(descriptors, allowlist) {
+  if (!Array.isArray(descriptors) || descriptors.length === 0) {
+    return [];
+  }
+  if (!Array.isArray(allowlist) || allowlist.length === 0) {
+    return descriptors;
+  }
+  const allowed = new Set(
+    allowlist.map((entry) => String(entry ?? "").trim().toLowerCase()).filter(Boolean)
+  );
+  if (allowed.size === 0) {
+    return descriptors;
+  }
+  return descriptors.filter((entry) => allowed.has(String(entry?.id ?? "").toLowerCase()));
 }

@@ -204,9 +204,36 @@ function normalizeProvision(raw) {
  * withholds. The `expected` text is what a user sees when their value is the
  * wrong shape, so it names the shape, not the type name.
  */
+/**
+ * Known ecosystem ids a project may list in `ecosystems` to narrow the
+ * multi-ecosystem verify plan. Non-executable: it only filters detection.
+ */
+const KNOWN_ECOSYSTEM_IDS = new Set(["godot", "blender", "rust", "python", "node"]);
+
+function normalizeEcosystems(raw) {
+  const values = normalizeStringArray(raw);
+  if (values === undefined) {
+    return undefined;
+  }
+  const out = [];
+  for (const entry of values) {
+    const id = entry.toLowerCase();
+    if (KNOWN_ECOSYSTEM_IDS.has(id) && !out.includes(id)) {
+      out.push(id);
+    }
+  }
+  return out.length > 0 ? out : undefined;
+}
+
 const SCHEMA = Object.freeze({
   version: { normalize: normalizePositiveInteger, expected: "a positive integer" },
+  // Singular legacy key (informational). Prefer `ecosystems` for multi-stack.
   ecosystem: { normalize: normalizeString, expected: "a non-empty string" },
+  // Non-executable allowlist: narrow detectEcosystems results for verify plan.
+  ecosystems: {
+    normalize: normalizeEcosystems,
+    expected: 'an array of ecosystem ids (e.g. ["python","node"])'
+  },
   verify: { normalize: normalizeStringArray, expected: "an array of command strings", executable: true },
   // >= 1, not >= 0: the bridge's resolveVerifyAttempts coerces anything below 1
   // to its built-in 2, so accepting 0 here would silently mean something other

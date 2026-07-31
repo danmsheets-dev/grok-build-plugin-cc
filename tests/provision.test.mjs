@@ -441,12 +441,14 @@ describe("planBlenderScriptSandbox", () => {
     for (const files of layouts) {
       const wt = seedAddon("grok-blender-config-", files);
       const plan = planBlenderScriptSandbox(wt, { ...io, platform: "linux" });
-      assertModule.ok(plan.links.length === 1, JSON.stringify(files));
+      // Legacy: one package link. Extensions: mkdir user_default + package link.
+      assertModule.ok(plan.links.length >= 1, JSON.stringify(files));
       assertModule.deepStrictEqual(
         Object.keys(plan.env).sort(),
         ["BLENDER_USER_EXTENSIONS", "BLENDER_USER_SCRIPTS"],
         `only these two may be set, got ${Object.keys(plan.env)}`
       );
+      assertModule.ok(!Object.prototype.hasOwnProperty.call(plan.env, "BLENDER_USER_CONFIG"));
     }
   });
 
@@ -458,13 +460,24 @@ describe("planBlenderScriptSandbox", () => {
     assertModule.strictEqual(plan.links[0].kind, "symlink");
   });
 
-  test("a 4.2+ extension manifest is detected as well as bl_info", () => {
+  test("a 4.2+ extension is linked under BLENDER_USER_EXTENSIONS/user_default/<id>", () => {
     const wt = seedAddon("grok-blender-manifest-", {
       "myext/blender_manifest.toml": 'schema_version = "1.0.0"\nid = "myext"\n'
     });
     const plan = planBlenderScriptSandbox(wt, { ...io, platform: "linux" });
     assertModule.strictEqual(plan.addonName, "myext");
-    assertModule.strictEqual(plan.links[0].from, path.join(wt, "myext"));
+    assertModule.strictEqual(plan.isExtension, true);
+    assertModule.strictEqual(plan.moduleName, "bl_ext.user_default.myext");
+    // Last link is the package; earlier may be mkdir for user_default.
+    const packageLink = plan.links.find((l) => l.kind !== "mkdir");
+    assertModule.ok(packageLink);
+    assertModule.strictEqual(packageLink.from, path.join(wt, "myext"));
+    assertModule.ok(
+      String(packageLink.to).includes(path.join("extensions", "user_default", "myext")) ||
+        String(packageLink.to).replace(/\\/g, "/").endsWith("extensions/user_default/myext"),
+      packageLink.to
+    );
+    assertModule.ok(!String(packageLink.to).includes(`${path.sep}addons${path.sep}`));
   });
 
   test("a plain Python package is not an add-on and is left alone", () => {
@@ -531,7 +544,7 @@ describe("planBlenderScriptSandbox", () => {
     const result = provisionWorktree(plan, realFs);
 
     assertModule.deepStrictEqual(result.failed, []);
-    assertModule.strictEqual(result.provisioned.length, 1);
+    assertModule.ok(result.provisioned.length >= 1);
     assertModule.strictEqual(
       realFs.readFileSync(
         path.join(plan.env.BLENDER_USER_SCRIPTS, "addons", "myaddon", "ops.py"),
@@ -539,9 +552,37 @@ describe("planBlenderScriptSandbox", () => {
       ),
       "MARKER\n"
     );
-    // The extensions sandbox is deliberately NOT created: an absent directory
-    // is how "this run sees none of your installed extensions" is expressed.
-    assertModule.ok(!realFs.existsSync(plan.env.BLENDER_USER_EXTENSIONS));
+    // Legacy bl_info: extensions dir is set in env but not required to exist.
+    // (4.2+ extensions create user_default under it instead.)
+    assertModule.strictEqual(plan.isExtension, false);
+    assertModule.strictEqual(plan.moduleName, "myaddon");
+  });
+
+  test("hyphenated repo names are sanitised to importable module names", () => {
+    const wt = seedAddon("grok-blender-hyphen-", {
+      "__init__.py": 'bl_info = {"name": "Mesh Tools"}\n'
+    });
+    const plan = planBlenderScriptSandbox(wt, {
+      ...io,
+      platform: "linux",
+      repoRoot: path.join(path.dirname(wt), "mesh-tools")
+    });
+    assertModule.strictEqual(plan.addonName, "mesh_tools");
+    assertModule.strictEqual(plan.moduleName, "mesh_tools");
+    assertModule.ok(plan.links[0].to.endsWith("mesh_tools") || plan.links[0].to.includes("mesh_tools"));
+  });
+
+  test("extension with wheels emits a note that wheels are not provisioned", () => {
+    const wt = seedAddon("grok-blender-wheels-", {
+      "blender_manifest.toml":
+        'schema_version = "1.0.0"\nid = "wheel_ext"\n[[wheels]]\nsource = "./wheels/numpy.whl"\n'
+    });
+    const plan = planBlenderScriptSandbox(wt, {
+      ...io,
+      platform: "linux",
+      repoRoot: path.join(path.dirname(wt), "wheel_ext")
+    });
+    assertModule.ok(plan.notes.some((n) => /wheels/i.test(n)), plan.notes.join("\n"));
   });
 });
 

@@ -54,9 +54,10 @@ import {
   sortJobsNewestFirst
 } from "./lib/job-control.mjs";
 import {
-  defaultVerifyCommands,
+  defaultVerifyPlan,
   detectEcosystems,
   detectPrimaryEcosystem,
+  filterEcosystems,
   resolveEcosystemBinary
 } from "./lib/ecosystem.mjs";
 import {
@@ -407,14 +408,18 @@ const TRUST_CONFIG_COMMAND = "node scripts/grok-bridge.mjs trust-config";
  */
 function resolveProjectRunPlan(workspaceRoot, cli = {}) {
   const projectConfig = loadWorkspaceProjectConfig(workspaceRoot);
-  const ecosystem = detectPrimaryEcosystem(workspaceRoot);
+  // Full multi-ecosystem detection, optionally narrowed by non-executable
+  // `ecosystems: ["python","node"]` in .grok-build.json.
+  const detected = detectEcosystems(workspaceRoot);
+  const ecosystems = filterEcosystems(detected, projectConfig.config.ecosystems);
+  const ecosystem = ecosystems[0] ?? null;
   // tools.* is an executable key, so it only reaches this call at all when the
   // config file is trusted; loadWorkspaceProjectConfig has already withheld it
-  // otherwise.
-  const toolOverride = ecosystem ? projectConfig.config.tools?.[ecosystem.id] : undefined;
+  // otherwise. Per-id overrides are applied inside defaultVerifyPlan.
+  const toolOverrides = projectConfig.config.tools ?? {};
   const exportSmoke = Boolean(cli.exportSmoke ?? projectConfig.config.exportSmoke);
-  const ecosystemVerify = defaultVerifyCommands(ecosystem, {
-    override: toolOverride,
+  const ecosystemVerify = defaultVerifyPlan(ecosystems, {
+    toolOverrides,
     exportSmoke
   });
 
@@ -424,7 +429,7 @@ function resolveProjectRunPlan(workspaceRoot, cli = {}) {
     ecosystemDefaults: { verify: ecosystemVerify }
   });
 
-  return { projectConfig, ecosystem, settings, exportSmoke };
+  return { projectConfig, ecosystem, ecosystems, settings, exportSmoke };
 }
 
 /**
@@ -573,15 +578,25 @@ export function redactEnvForRecord(overrides) {
  * The resolved verify plan, as reported by `verify-plan` and echoed in the run
  * header. Spawns nothing and reads nothing but the project's own files.
  */
-function buildVerifyPlanPayload({ projectConfig, ecosystem, settings }) {
+function buildVerifyPlanPayload({ projectConfig, ecosystem, ecosystems, settings }) {
+  const ecosystemList = Array.isArray(ecosystems) ? ecosystems : ecosystem ? [ecosystem] : [];
   return {
     ecosystem: ecosystem
       ? {
           id: ecosystem.id,
           major: ecosystem.major ?? null,
-          testRunner: ecosystem.testRunner ?? null
+          testRunner: ecosystem.testRunner ?? null,
+          projectDir: ecosystem.projectDir ?? "."
         }
       : null,
+    // Full multi-ecosystem set that contributed to the default plan.
+    ecosystems: ecosystemList.map((entry) => ({
+      id: entry.id,
+      projectDir: entry.projectDir ?? ".",
+      major: entry.major ?? null,
+      framework: entry.framework ?? null,
+      packageManager: entry.packageManager ?? null
+    })),
     commands: settings.verify,
     source: settings.sources.verify,
     disabled: Boolean(settings.verifyDisabled),
@@ -910,12 +925,32 @@ function loadHeadlessRules() {
   return headlessRulesCache;
 }
 
+// Blender sandbox facts for the agent (module name, env paths). Only composed
+// when a sandbox was actually provisioned for this run.
+let blenderRulesCache = null;
+function loadBlenderRulesTemplate() {
+  if (blenderRulesCache == null) {
+    try {
+      blenderRulesCache = loadPromptTemplate(ROOT_DIR, "blender").trim();
+    } catch {
+      blenderRulesCache = "";
+    }
+  }
+  return blenderRulesCache;
+}
+
 /**
  * System-prompt rules for a run. Always includes the final-report contract and
  * the headless non-interactive rule; isolated runs also get the isolation
- * preamble naming the only writable root.
+ * preamble naming the only writable root. Blender sandbox runs get the
+ * concrete module name and BLENDER_USER_* paths so the agent does not guess.
  *
- * @param {{ isolated?: boolean, worktreePath?: string|null, workspaceRoot?: string|null }} [options]
+ * @param {{
+ *   isolated?: boolean,
+ *   worktreePath?: string|null,
+ *   workspaceRoot?: string|null,
+ *   blenderSandbox?: Record<string, string|boolean|null>|null
+ * }} [options]
  * @returns {string}
  */
 function loadRunRules(options = {}) {
@@ -927,6 +962,23 @@ function loadRunRules(options = {}) {
         WORKSPACE_ROOT: String(options.workspaceRoot)
       })
     );
+  }
+  if (options.blenderSandbox && typeof options.blenderSandbox === "object") {
+    const tpl = loadBlenderRulesTemplate();
+    if (tpl) {
+      const bs = options.blenderSandbox;
+      parts.push(
+        interpolateTemplate(tpl, {
+          MODULE_NAME: String(bs.moduleName ?? ""),
+          ADDON_NAME: String(bs.addonName ?? ""),
+          IS_EXTENSION: bs.isExtension ? "yes (4.2+ extension)" : "no (legacy bl_info add-on)",
+          BLENDER_USER_SCRIPTS: String(bs.scriptsDir ?? ""),
+          BLENDER_USER_EXTENSIONS: String(bs.extensionsDir ?? ""),
+          BLENDER_VERSION_MIN: String(bs.blenderVersionMin ?? "unspecified"),
+          HAS_WHEELS: bs.hasWheels ? "yes (not auto-installed by the sandbox)" : "no"
+        })
+      );
+    }
   }
   return parts.join("\n\n");
 }
@@ -1510,16 +1562,28 @@ function describeGodotVersion(descriptor) {
  * separator gitignore syntax knows, on every platform.
  */
 function gitignoreProbesFor(descriptor) {
+  const projectPrefix =
+    typeof descriptor.projectDir === "string" &&
+    descriptor.projectDir !== "." &&
+    descriptor.projectDir !== ""
+      ? `${String(descriptor.projectDir).replace(/\\/g, "/").replace(/\/+$/, "")}/`
+      : "";
   if (descriptor.id === "godot") {
     // Probe the cache directory this project actually uses. Warning a Godot 4
     // project about an unignored `.import/` it will never create is noise.
+    // Nested monorepos (game/project.godot) probe under projectDir.
     return descriptor.cacheDir === ".import"
-      ? [{ path: ".import/__grok_probe", pattern: ".import/" }]
-      : [{ path: ".godot/imported/__grok_probe", pattern: ".godot/" }];
+      ? [{ path: `${projectPrefix}.import/__grok_probe`, pattern: `${projectPrefix}.import/` }]
+      : [
+          {
+            path: `${projectPrefix}.godot/imported/__grok_probe`,
+            pattern: `${projectPrefix}.godot/`
+          }
+        ];
   }
   if (descriptor.id === "blender") {
     // Blender writes <scene>.blend1, .blend2, ... next to every saved scene.
-    return [{ path: "__grok_probe.blend1", pattern: "*.blend[0-9]" }];
+    return [{ path: `${projectPrefix}__grok_probe.blend1`, pattern: "*.blend[0-9]" }];
   }
   return [];
 }
@@ -1691,7 +1755,7 @@ function buildEcosystemChecks(root, options = {}) {
   checks.push({
     name: "ecosystem",
     status: "ok",
-    detail: `${summary} - detection reads the repository root and one directory below it only, so a nested project is not detected`,
+    detail: `${summary} - detection reads the repository root and exactly one directory below it for every ecosystem (deeper monorepo layouts need ecosystems[] config or a cwd at the project root)`,
     fix: null
   });
 
@@ -2131,10 +2195,25 @@ async function handleDoctor(argv) {
 }
 
 function renderVerifyPlan(payload) {
+  const ecoLabel = (() => {
+    if (Array.isArray(payload.ecosystems) && payload.ecosystems.length > 1) {
+      return payload.ecosystems
+        .map((e) => (e.projectDir && e.projectDir !== "." ? `${e.id}@${e.projectDir}` : e.id))
+        .join(", ");
+    }
+    if (payload.ecosystem) {
+      const dir =
+        payload.ecosystem.projectDir && payload.ecosystem.projectDir !== "."
+          ? `@${payload.ecosystem.projectDir}`
+          : "";
+      return `${payload.ecosystem.id}${dir}`;
+    }
+    return "none detected";
+  })();
   const lines = [
     "# Grok Build Verify Plan",
     "",
-    `Ecosystem: ${payload.ecosystem ? payload.ecosystem.id : "none detected"}`,
+    `Ecosystem: ${ecoLabel}`,
     `Source: ${describeVerifySource(payload.source)}`
   ];
 
@@ -3072,8 +3151,13 @@ async function executeTaskRun(request) {
     process.stderr.write(`Warning: ${message}\n`);
     request.onProgress?.({ message: `Warning: ${message}` });
   };
+  const ecosystemIdsForPatterns = Array.isArray(verifyPlan?.ecosystems)
+    ? verifyPlan.ecosystems
+    : verifyPlan?.ecosystem
+      ? [verifyPlan.ecosystem]
+      : [];
   const outputFailurePatterns = resolveOutputFailurePatterns(
-    verifyPlan?.ecosystem,
+    ecosystemIdsForPatterns.length > 0 ? ecosystemIdsForPatterns : verifyPlan?.ecosystem,
     request.verifyFailurePatterns,
     { onWarning: warnAboutPattern }
   );
@@ -3082,7 +3166,10 @@ async function executeTaskRun(request) {
   });
   // Godot re-prints the same runtime error once per frame, so occurrence
   // counts are noise there and only the deduped signature can be trusted.
-  const rawCountComparison = verifyPlan?.ecosystem === "godot" ? "ignore" : "strict";
+  const rawCountComparison = ecosystemIdsForPatterns.includes("godot") ||
+    verifyPlan?.ecosystem === "godot"
+      ? "ignore"
+      : "strict";
   const maxDurationSeconds = resolveMaxDurationSeconds(request.maxDurationSeconds);
   const maxTurns = resolveMaxTurns(request.maxTurns);
   const maxCostUsd = resolveMaxCostUsd(request.maxCostUsd);
@@ -3100,6 +3187,8 @@ async function executeTaskRun(request) {
   let provisionSummary = null;
   /** @type {Record<string, string>|null} */
   let blenderSandboxEnv = null;
+  /** @type {Record<string, string|boolean|null>|null} */
+  let blenderSandboxInfo = null;
   /** @type {{ private: boolean, reason: string, cacheLine: string }|null} */
   let godotCacheMode = null;
   /** Shared-cache path for the cross-process import lock; null when private. */
@@ -3110,6 +3199,8 @@ async function executeTaskRun(request) {
   let provisionEnv = null;
   /** @type {Map<string, string>|null} */
   let uidSnapshotBefore = null;
+  /** Absolute path used for the .uid snapshot (may be a nested Godot projectDir). */
+  let uidSnapshotRoot = null;
   /** @type {{ ok: boolean, notes: string[] }|null} */
   let uidIntegrity = null;
   /** @type {string|null} */
@@ -3119,13 +3210,21 @@ async function executeTaskRun(request) {
 
   // Re-detect in the workspace root (not the worktree) so sandbox/auto-inject
   // decisions match the plan handleTask already resolved. Cheap and pure.
+  const runEcosystems = detectEcosystems(workspaceRoot);
   const runEcosystem =
     verifyPlan?.ecosystem != null
-      ? detectEcosystems(workspaceRoot).find((entry) => entry.id === verifyPlan.ecosystem) ??
+      ? runEcosystems.find((entry) => entry.id === verifyPlan.ecosystem) ??
         detectPrimaryEcosystem(workspaceRoot)
-      : detectPrimaryEcosystem(workspaceRoot);
+      : runEcosystems[0] ?? null;
+  const blenderDescriptor =
+    runEcosystems.find((entry) => entry.id === "blender") ??
+    (runEcosystem?.id === "blender" ? runEcosystem : null);
+  const godotDescriptor =
+    runEcosystems.find((entry) => entry.id === "godot") ??
+    (runEcosystem?.id === "godot" ? runEcosystem : null);
+  const nodeDescriptor = runEcosystems.find((entry) => entry.id === "node") ?? null;
 
-  const wantBlenderSandbox = shouldAutoBlenderSandbox(runEcosystem, {
+  const wantBlenderSandbox = shouldAutoBlenderSandbox(blenderDescriptor ?? runEcosystem, {
     isolate,
     write,
     explicit: request.blenderSandbox ? true : request.noBlenderSandbox ? false : null,
@@ -3162,13 +3261,18 @@ async function executeTaskRun(request) {
         }
       });
     }
+    const nestedProjectDirs = runEcosystems
+      .map((entry) => entry.projectDir)
+      .filter((d) => typeof d === "string" && d !== "." && d !== "");
     const plan = planWorktreeLinks(created.repoRoot, created.worktreePath, {
       // Only ever true/false when the project config said so; undefined lets
       // resolveGodotCacheMode fall through to env / the isolated private default.
       copyGodotCache: request.provisionCopy,
       provisionFiles: request.provisionFiles,
       dirPolicy: request.provisionLink,
-      linkDirs: request.linkDirs
+      linkDirs: request.linkDirs,
+      nestedProjectDirs,
+      isWorkspace: Boolean(nodeDescriptor?.isWorkspace)
     });
     godotCacheMode = plan.godotCache ?? null;
     if (plan.env && Object.keys(plan.env).length > 0) {
@@ -3198,9 +3302,14 @@ async function executeTaskRun(request) {
 
     if (godotCacheMode && !godotCacheMode.private) {
       // Shared with the main checkout: lock around engine access. The linked
-      // path in the worktree is a junction/symlink to the real cache.
+      // path in the worktree is a junction/symlink to the real cache. Honour
+      // projectDir so game/.godot monorepos lock the right tree.
+      const godotRoot =
+        godotDescriptor?.projectDir && godotDescriptor.projectDir !== "."
+          ? path.join(created.repoRoot, ...String(godotDescriptor.projectDir).split("/"))
+          : created.repoRoot;
       for (const name of GODOT_CACHE_DIRS) {
-        const candidate = path.join(created.repoRoot, name);
+        const candidate = path.join(godotRoot, name);
         if (fs.existsSync(candidate)) {
           sharedGodotCachePath = candidate;
           break;
@@ -3231,6 +3340,13 @@ async function executeTaskRun(request) {
       // do with the code.
       if (Object.keys(sandboxPlan.env).length > 0 && sandboxResult.failed.length === 0) {
         blenderSandboxEnv = sandboxPlan.env;
+        blenderSandboxInfo = sandboxPlan.blenderSandbox ?? {
+          moduleName: sandboxPlan.moduleName,
+          addonName: sandboxPlan.addonName,
+          isExtension: sandboxPlan.isExtension,
+          scriptsDir: sandboxPlan.scriptsDir,
+          extensionsDir: sandboxPlan.extensionsDir
+        };
       } else if (sandboxResult.failed.length > 0) {
         provisionSummary.notes.push(
           "--blender-sandbox: the add-on could not be linked, so BLENDER_USER_SCRIPTS was left alone and Blender will use your real add-on directory."
@@ -3245,6 +3361,11 @@ async function executeTaskRun(request) {
     if (ecosystemIds.length === 0 && runEcosystem?.id) {
       ecosystemIds.push(runEcosystem.id);
     }
+    for (const id of ecosystemIdsForPatterns) {
+      if (id && !ecosystemIds.includes(id)) {
+        ecosystemIds.push(id);
+      }
+    }
     const injected = injectRuntimePlugin(created.worktreePath, ecosystemIds, {
       pluginRoot: ROOT_DIR
     });
@@ -3256,7 +3377,8 @@ async function executeTaskRun(request) {
         injected: injected.injected,
         packs: injected.packs,
         target: injected.target
-      }
+      },
+      blenderSandbox: blenderSandboxInfo
     };
     for (const note of injected.notes) {
       request.onProgress?.({ phase: "starting", message: note });
@@ -3310,15 +3432,22 @@ async function executeTaskRun(request) {
     }
 
     // Snapshot *.uid before the agent so a regenerated companion is reported
-    // as the silent reference-break it is.
-    if (runEcosystem?.id === "godot" || ecosystemIds.includes("godot")) {
-      uidSnapshotBefore = snapshotUidFiles(created.worktreePath);
+    // as the silent reference-break it is. Root at the Godot projectDir.
+    if (runEcosystem?.id === "godot" || ecosystemIds.includes("godot") || godotDescriptor) {
+      uidSnapshotRoot =
+        godotDescriptor?.projectDir && godotDescriptor.projectDir !== "."
+          ? path.join(created.worktreePath, ...String(godotDescriptor.projectDir).split("/"))
+          : created.worktreePath;
+      uidSnapshotBefore = snapshotUidFiles(uidSnapshotRoot);
     }
 
     // A SECOND patch: the one above fires before planning even starts, so the
     // summary has nowhere to attach there.
     if (request.jobId) {
-      patchJobIfActive(workspaceRoot, request.jobId, { provision: provisionSummary });
+      patchJobIfActive(workspaceRoot, request.jobId, {
+        provision: provisionSummary,
+        blenderSandbox: blenderSandboxInfo
+      });
     }
     runCwd = created.worktreePath;
   } else if (wantBlenderSandbox || request.blenderSandbox) {
@@ -3344,7 +3473,8 @@ async function executeTaskRun(request) {
   });
 
   // Blender pre-flight: locked .blend files and version_min vs binary.
-  if (runEcosystem?.id === "blender" && verifyCommands.length > 0) {
+  const blenderRunDescriptor = blenderDescriptor ?? (runEcosystem?.id === "blender" ? runEcosystem : null);
+  if (blenderRunDescriptor && verifyCommands.length > 0) {
     const blendLock = detectBlendLocks(runCwd);
     if (blendLock.locked && blendLock.note) {
       provisionSummary = provisionSummary ?? { provisioned: [], failed: [], notes: [] };
@@ -3352,7 +3482,7 @@ async function executeTaskRun(request) {
       request.onProgress?.({ phase: "verifying", message: blendLock.note });
     }
 
-    const blenderExe = resolveEcosystemBinary(runEcosystem, {
+    const blenderExe = resolveEcosystemBinary(blenderRunDescriptor, {
       env: runEnv,
       override: undefined
     });
@@ -3376,7 +3506,7 @@ async function executeTaskRun(request) {
       if (parsed) {
         blenderVersionNote = `Blender version: ${parsed.raw}`;
         request.onProgress?.({ phase: "verifying", message: blenderVersionNote });
-        const guard = blenderVersionGuardNote(parsed, runEcosystem.blenderVersionMin);
+        const guard = blenderVersionGuardNote(parsed, blenderRunDescriptor.blenderVersionMin);
         if (guard) {
           provisionSummary = provisionSummary ?? { provisioned: [], failed: [], notes: [] };
           provisionSummary.notes.push(guard);
@@ -3704,7 +3834,8 @@ async function executeTaskRun(request) {
       rules: loadRunRules({
         isolated: Boolean(created),
         worktreePath: created?.worktreePath ?? null,
-        workspaceRoot
+        workspaceRoot,
+        blenderSandbox: blenderSandboxInfo
       }),
       outputFormat: "streaming-json",
       onProgress: request.onProgress,
@@ -4206,7 +4337,11 @@ async function executeTaskRun(request) {
     // Post-run .uid integrity: deleted/rewritten companions or dangling
     // uid:// refs. Prominence matters — this is the most damaging silent
     // Godot failure and looks like a normal file change in the manifest.
-    uidIntegrity = checkUidIntegrity(uidSnapshotBefore, created.worktreePath);
+    // Must use the same root as the pre-run snapshot (nested projectDir).
+    uidIntegrity = checkUidIntegrity(
+      uidSnapshotBefore,
+      uidSnapshotRoot ?? created.worktreePath
+    );
     if (!uidIntegrity.ok) {
       for (const note of uidIntegrity.notes) {
         request.onProgress?.({ phase: "finalizing", message: note });
@@ -5433,7 +5568,7 @@ async function handleTask(argv) {
   const cliSettings = cliSettingsFromTaskOptions(options);
   // exportSmoke is resolved inside resolveProjectRunPlan (CLI flag or config).
   cliSettings.exportSmoke = Boolean(options["godot-export-smoke"]);
-  const { projectConfig, ecosystem, settings, exportSmoke } = resolveProjectRunPlan(
+  const { projectConfig, ecosystem, ecosystems, settings, exportSmoke } = resolveProjectRunPlan(
     workspaceRoot,
     cliSettings
   );
@@ -5464,6 +5599,7 @@ async function handleTask(argv) {
     source: settings.sources.verify,
     disabled: Boolean(settings.verifyDisabled),
     ecosystem: ecosystem?.id ?? null,
+    ecosystems: Array.isArray(ecosystems) ? ecosystems.map((e) => e.id) : ecosystem ? [ecosystem.id] : [],
     configPresent: projectConfig.present,
     configTrusted: projectConfig.trusted,
     configWithheld: Object.keys(projectConfig.untrusted)
@@ -5664,7 +5800,7 @@ async function handleNestRun(argv) {
 
   const cliSettings = cliSettingsFromTaskOptions(options);
   cliSettings.exportSmoke = Boolean(options["godot-export-smoke"]);
-  const { projectConfig, ecosystem, settings, exportSmoke } = resolveProjectRunPlan(
+  const { projectConfig, ecosystem, ecosystems, settings, exportSmoke } = resolveProjectRunPlan(
     workspaceRoot,
     cliSettings
   );
@@ -5758,6 +5894,7 @@ async function handleNestRun(argv) {
     source: settings.sources.verify,
     disabled: Boolean(settings.verifyDisabled),
     ecosystem: ecosystem?.id ?? null,
+    ecosystems: Array.isArray(ecosystems) ? ecosystems.map((e) => e.id) : ecosystem ? [ecosystem.id] : [],
     configPresent: projectConfig.present,
     configTrusted: projectConfig.trusted,
     configWithheld: Object.keys(projectConfig.untrusted)

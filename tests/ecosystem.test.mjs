@@ -390,17 +390,20 @@ test("a Blender project with neither manifest nor test script still gets a smoke
 
 test("a Blender extension with only a manifest still gets registration smoke (not validate-only)", () => {
   // extension validate is a TOML schema check; without import/register smoke a
-  // syntax error in __init__.py verifies green.
+  // syntax error in __init__.py verifies green. 4.2+ extensions enable as
+  // bl_ext.user_default.<id>, not the bare directory name.
   const root = makeProject({
     "myext/blender_manifest.toml": 'schema_version = "1.0.0"\nid = "myext"\n',
     "myext/__init__.py": "bl_info = {}\n"
   });
   const blender = findDescriptor(root, "blender", { env: {} });
-  assert.equal(blender.moduleName, "myext");
+  assert.equal(blender.moduleName, "bl_ext.user_default.myext");
   const commands = defaultVerifyCommands(blender, { env: {}, platform: "linux" });
   assert.ok(commands.some((c) => c.includes("extension validate")), commands.join("\n"));
   assert.ok(
-    commands.some((c) => c.includes("grok_verify_shim.py") && c.includes("--enable myext")),
+    commands.some(
+      (c) => c.includes("grok_verify_shim.py") && c.includes("--enable bl_ext.user_default.myext")
+    ),
     commands.join("\n")
   );
 });

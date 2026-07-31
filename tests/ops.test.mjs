@@ -284,8 +284,8 @@ test("doctor probes the detected Godot toolchain", () => {
   const ecosystem = findCheck(payload, "ecosystem");
   assert.ok(ecosystem, "an engine repo must say which engine was detected");
   assert.match(ecosystem.detail, /godot \(Godot 4\.3, config_version 5\)/);
-  // The absence of these lines must not read as "this is not a Godot project".
-  assert.match(ecosystem.detail, /one directory below it only/);
+  // Depth-1 scan is explicit so nested monorepos are not silently out of scope.
+  assert.match(ecosystem.detail, /exactly one directory below it for every ecosystem/);
 
   const binary = findCheck(payload, "godot binary");
   assert.equal(binary?.status, "ok", JSON.stringify(binary));

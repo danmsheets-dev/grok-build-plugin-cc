@@ -133,7 +133,9 @@ export const OUTPUT_FAILURE_PATTERNS = Object.freeze({
     { id: "godot-export-templates-missing", re: /Export templates for this platform are missing/i },
     { id: "godot-export-template-file-missing", re: /Template file not found/i },
     { id: "godot-export-cannot-create", re: /Cannot create file/i },
-    { id: "godot-export-no-artifact", re: /export produced no artifact/i }
+    { id: "godot-export-no-artifact", re: /export produced no artifact/i },
+    // Whole-project check (grok_check.gd) summary when failures > 0.
+    { id: "godot-grok-check-failed", re: /^GROK_CHECK: failures=[1-9]/ }
   ]),
   blender: Object.freeze([
     {
@@ -250,23 +252,42 @@ export function compileUserPatterns(rawPatterns, options = {}) {
 }
 
 /**
- * The output-failure pattern set for one run: the detected ecosystem's
- * defaults, extended by whatever `verifyFailurePatterns` the project config
- * adds (which is how the deliberately-excluded broad Godot markers are opted
- * into).
+ * The output-failure pattern set for one run: the union of every detected
+ * ecosystem's defaults, extended by whatever `verifyFailurePatterns` the
+ * project config adds (which is how the deliberately-excluded broad Godot
+ * markers are opted into).
  *
- * Takes the ecosystem as an **id string** rather than a descriptor because
- * this is resolved inside the run, and a background run reads its request back
- * out of a JSON file — a RegExp does not survive that trip, so only the
- * ecosystem id and the raw pattern strings are ever serialized.
+ * Accepts a single ecosystem id string **or** an array of ids so a multi-
+ * ecosystem verify plan (Django + React, Blender + Python) gets every relevant
+ * marker. Takes ids rather than descriptors because this is resolved inside
+ * the run, and a background run reads its request back out of a JSON file —
+ * a RegExp does not survive that trip.
  *
- * @param {string|null|undefined} ecosystemId
+ * @param {string|string[]|null|undefined} ecosystemIdOrIds
  * @param {string[]|null|undefined} extraPatterns
  * @param {{ onWarning?: (message: string) => void }} [options]
  */
-export function resolveOutputFailurePatterns(ecosystemId, extraPatterns, options = {}) {
-  const key = String(ecosystemId ?? "").trim().toLowerCase();
-  const base = OUTPUT_FAILURE_PATTERNS[key] ?? [];
+export function resolveOutputFailurePatterns(ecosystemIdOrIds, extraPatterns, options = {}) {
+  const ids = Array.isArray(ecosystemIdOrIds)
+    ? ecosystemIdOrIds
+    : ecosystemIdOrIds != null && String(ecosystemIdOrIds).trim() !== ""
+      ? [ecosystemIdOrIds]
+      : [];
+  const seen = new Set();
+  const base = [];
+  for (const id of ids) {
+    const key = String(id ?? "").trim().toLowerCase();
+    if (!key) {
+      continue;
+    }
+    for (const pattern of OUTPUT_FAILURE_PATTERNS[key] ?? []) {
+      if (seen.has(pattern.id)) {
+        continue;
+      }
+      seen.add(pattern.id);
+      base.push(pattern);
+    }
+  }
   const extra = compileUserPatterns(extraPatterns, { ...options, flags: "m" }).map((re, index) => ({
     id: `config-pattern-${index + 1}`,
     re
