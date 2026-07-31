@@ -179,6 +179,18 @@ if (isPrint || hasFlag("-r") || hasFlag("--resume") || hasFlag("-c") || hasFlag(
       process.exit(0);
     }
 
+    // FIELD-2: a fix turn that emits its OWN final report. The bridge must keep
+    // the task-turn report as the run result and stash this under fixAttempts.
+    if (scenario === "reporting" && /The verify command .* failed/.test(prompt)) {
+      emit({ type: "thought", data: "trying to fix the verify failure" });
+      emit({
+        type: "text",
+        data: "===GROK-FINAL-REPORT===\\n## Result\\nI fixed cargo test.\\n===END-GROK-FINAL-REPORT==="
+      });
+      emit(endEvent);
+      process.exit(0);
+    }
+
     // One completed message, deliberately much longer than any progress
     // preview should ever be and with no newlines to shorten at. Real shape:
     // a turn of narration that runs to several KB.

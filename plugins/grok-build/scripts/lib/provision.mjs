@@ -634,7 +634,111 @@ export const BLENDER_SANDBOX_EXTENSIONS_RELATIVE = `${WORKTREE_SCRATCH_DIR}/blen
  * scripts directory nothing is enabled for them, in either startup mode.
  */
 export const BLENDER_SANDBOX_ENABLE_NOTE =
-  "a sandboxed add-on is auto-enabled in neither startup mode - the test script must call addon_utils.enable(\"<module>\", default_set=False, persistent=True).";
+  "a sandboxed add-on is auto-enabled in neither startup mode - the test script must enable it AND check the return: `mod = addon_utils.enable(\"<module>\", default_set=False, persistent=True);` then `if mod is None: sys.exit(\"enable() returned None: register() raised, see traceback above\")`. addon_utils.enable swallows register() exceptions and returns None.";
+
+/**
+ * Bridge-owned Blender verify shim. Written under WORKTREE_SCRATCH_DIR so it is
+ * never committed. Wraps user test scripts so a unittest suite that prints
+ * FAILED without sys.exit(1) still fails verification, and performs a checked
+ * addon_utils.enable for registration smoke.
+ */
+export const BLENDER_VERIFY_SHIM_SOURCE = `# grok-build Blender verify shim — do not edit; rewritten each run
+import json
+import runpy
+import sys
+import traceback
+import unittest
+
+def _emit_result(tests=0, failures=0, errors=0, skipped=0, extra=None):
+    payload = {
+        "tests": int(tests),
+        "failures": int(failures),
+        "errors": int(errors),
+        "skipped": int(skipped),
+    }
+    if extra:
+        payload.update(extra)
+    print("GROK_BUILD_BLENDER_RESULT: " + json.dumps(payload, separators=(",", ":")))
+
+def _enable_checked(module_name):
+    import addon_utils
+    mod = addon_utils.enable(module_name, default_set=False, persistent=True)
+    if mod is None:
+        _emit_result(errors=1, extra={"enable": module_name, "ok": False})
+        sys.exit(
+            "enable() returned None: register() raised or module missing, see traceback above"
+        )
+    return mod
+
+def _run_unittest_path(target):
+    # Discover/run via the user's script under runpy. Patch TextTestRunner.run so
+    # a non-successful TestResult exits 1 even when the script forgets sys.exit.
+    original_run = unittest.TextTestRunner.run
+
+    def patched_run(self, test):
+        result = original_run(self, test)
+        failures = len(getattr(result, "failures", []) or [])
+        errors = len(getattr(result, "errors", []) or [])
+        tests_run = int(getattr(result, "testsRun", 0) or 0)
+        skipped = len(getattr(result, "skipped", []) or [])
+        _emit_result(tests=tests_run, failures=failures, errors=errors, skipped=skipped)
+        if not result.wasSuccessful():
+            sys.exit(1)
+        return result
+
+    unittest.TextTestRunner.run = patched_run
+    try:
+        runpy.run_path(target, run_name="__main__")
+    except SystemExit:
+        raise
+    except Exception:
+        traceback.print_exc()
+        _emit_result(errors=1, extra={"script": target})
+        sys.exit(1)
+
+def main(argv):
+    args = list(argv)
+    if args and args[0] == "--":
+        args = args[1:]
+    if not args:
+        print("grok_verify_shim: expected -- <script> or -- --enable <module>", file=sys.stderr)
+        sys.exit(2)
+    if args[0] == "--enable":
+        if len(args) < 2 or not args[1].strip():
+            print("grok_verify_shim: --enable requires a module name", file=sys.stderr)
+            sys.exit(2)
+        module_name = args[1].strip()
+        _enable_checked(module_name)
+        try:
+            import addon_utils
+            addon_utils.disable(module_name, default_set=False)
+        except Exception:
+            pass
+        _emit_result(tests=1, failures=0, errors=0, extra={"enable": module_name, "ok": True})
+        return
+    target = args[0]
+    _run_unittest_path(target)
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
+`;
+
+/**
+ * Ensure the Blender verify shim exists under cwd (worktree or main).
+ *
+ * @param {string} cwd
+ * @param {{ mkdirSync?: typeof fs.mkdirSync, writeFileSync?: typeof fs.writeFileSync }} [io]
+ * @returns {string} absolute path of the shim
+ */
+export function ensureBlenderVerifyShim(cwd, io = {}) {
+  const mkdirSync = io.mkdirSync ?? fs.mkdirSync;
+  const writeFileSync = io.writeFileSync ?? fs.writeFileSync;
+  const dir = path.join(path.resolve(String(cwd)), WORKTREE_SCRATCH_DIR, "blender");
+  mkdirSync(dir, { recursive: true });
+  const target = path.join(dir, "grok_verify_shim.py");
+  writeFileSync(target, BLENDER_VERIFY_SHIM_SOURCE, "utf8");
+  return target;
+}
 
 /**
  * Whether an isolated write run should auto-enable the Blender sandbox.
@@ -1238,6 +1342,14 @@ export function injectRuntimePlugin(worktreePath, ecosystemIds, options = {}) {
     const agentsSrc = path.join(source, "agents");
     if (existsSync(agentsSrc)) {
       copyPathSync(agentsSrc, path.join(target, "agents"), io);
+    }
+
+    // tools/ holds engine helper scripts (e.g. Godot grok_check.gd). Always
+    // copy when present so verify commands that reference
+    // res://.grok/plugins/grok-build-runtime/tools/... resolve after inject.
+    const toolsSrc = path.join(source, "tools");
+    if (existsSync(toolsSrc)) {
+      copyPathSync(toolsSrc, path.join(target, "tools"), io);
     }
   } catch (error) {
     notes.push(

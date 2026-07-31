@@ -264,7 +264,9 @@ export function collectUidReferences(root, options = {}) {
   const readFileSync = options.readFileSync ?? fs.readFileSync;
   const maxDepth = Number.isFinite(options.maxDepth) ? options.maxDepth : 12;
   const refs = new Set();
-  const textExt = new Set([".tscn", ".tres", ".gd", ".cs", ".godot"]);
+  // Include shaders so uid:// references embedded in .gdshader / .gdshaderinc
+  // are seen by integrity checks (dissolve effects etc. routinely use them).
+  const textExt = new Set([".tscn", ".tres", ".gd", ".cs", ".godot", ".gdshader", ".gdshaderinc"]);
   const skip = new Set([".godot", ".import", ".git", "node_modules", ".grok-build", ".grok"]);
 
   function walk(dir, rel, depth) {

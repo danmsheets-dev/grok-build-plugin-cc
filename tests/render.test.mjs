@@ -709,6 +709,35 @@ test("renderStoredJobResult prefers the final report over the stored narration",
   assert.doesNotMatch(output, /Let me look at/);
 });
 
+test("renderStoredJobResult shows task report first and labels verify fix history after", () => {
+  const output = renderStoredJobResult(
+    { id: "run-fix", status: "completed-unverified", title: "Grok Build Delegate" },
+    {
+      result: {
+        finalReport: "## Result\n24 findings about architecture.",
+        rawOutput: "## Result\n24 findings about architecture.",
+        verify: {
+          fixAttempts: [
+            {
+              attempt: 1,
+              command: "cargo test",
+              finalReport: "## Result\nI fixed cargo test."
+            }
+          ]
+        }
+      }
+    }
+  );
+
+  assert.match(output, /24 findings about architecture/);
+  assert.match(output, /Verify fix history \(not the task deliverable\)/);
+  assert.match(output, /I fixed cargo test/);
+  // Task deliverable appears before fix history.
+  const taskIdx = output.indexOf("24 findings");
+  const fixIdx = output.indexOf("Verify fix history");
+  assert.ok(taskIdx >= 0 && fixIdx > taskIdx);
+});
+
 test("renderStoredJobResult still falls back to rawOutput, then to a review's stdout", () => {
   // lastMessage is deliberately absent from that chain: preferring a bare
   // trailing line over the stored output would make show print LESS than today.

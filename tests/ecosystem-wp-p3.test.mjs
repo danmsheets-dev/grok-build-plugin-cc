@@ -53,37 +53,41 @@ function makeProject(files = {}) {
   return root;
 }
 
-// ─── Godot --check-only gating ─────────────────────────────────────────────
+// ─── Godot whole-project check (never bare --check-only) ───────────────────
 
-test("Godot 4 verify plan emits --check-only ahead of --import", () => {
+test("Godot 4 verify plan emits grok_check.gd ahead of --import, never bare --check-only", () => {
   const root = makeProject({ "project.godot": "config_version=5\n" });
   const godot = detectPrimaryEcosystem(root, { env: {} });
   assert.equal(godot.supportsCheckOnly, true);
   const commands = defaultVerifyCommands(godot, { env: {}, platform: "linux" });
-  assert.ok(commands[0].includes("--check-only"), commands.join("\n"));
+  assert.ok(commands[0].includes("grok_check.gd"), commands.join("\n"));
+  assert.ok(commands.every((c) => !/(?:^|\s)--check-only(?:\s|$)/.test(c)), commands.join("\n"));
   assert.ok(commands.some((c) => c.includes("--import")));
 });
 
-test("Godot 3 verify plan never emits --check-only", () => {
+test("Godot 3 verify plan never emits --check-only or grok_check.gd", () => {
   const root = makeProject({ "project.godot": "config_version=4\n" });
   const godot = detectPrimaryEcosystem(root, { env: {} });
   assert.equal(godot.supportsCheckOnly, false);
   const commands = defaultVerifyCommands(godot, { env: {}, platform: "linux" });
   assert.ok(commands.every((c) => !c.includes("--check-only")), commands.join("\n"));
+  assert.ok(commands.every((c) => !c.includes("grok_check.gd")), commands.join("\n"));
 });
 
-test("Godot export smoke is opt-in and uses export-release on Godot 4", () => {
+test("Godot export smoke is opt-in and uses platform-correct extension on Godot 4", () => {
   const root = makeProject({
     "project.godot": "config_version=5\n",
-    "export_presets.cfg": '[preset.0]\nname="Windows Desktop"\n'
+    "export_presets.cfg": '[preset.0]\nname="Windows Desktop"\nplatform="Windows Desktop"\n'
   });
   const godot = detectPrimaryEcosystem(root, { env: {} });
   assert.equal(godot.hasExportPresets, true);
   assert.equal(godot.exportPresetName, "Windows Desktop");
+  assert.equal(godot.exportPresetPlatform, "Windows Desktop");
   const off = defaultVerifyCommands(godot, { env: {}, platform: "linux" });
   assert.ok(off.every((c) => !c.includes("export-release")), off.join("\n"));
   const on = defaultVerifyCommands(godot, { env: {}, platform: "linux", exportSmoke: true });
   assert.ok(on.some((c) => c.includes("--export-release") && c.includes("Windows Desktop")), on.join("\n"));
+  assert.ok(on.some((c) => c.includes("export-smoke.exe")), on.join("\n"));
   assert.ok(on.every((c) => !c.includes("export_credentials")), on.join("\n"));
 });
 
@@ -342,6 +346,12 @@ test("injectRuntimePlugin copies ecosystem packs and is excluded from commit pat
   assert.ok(
     fs.existsSync(
       path.join(wt, ".grok", "plugins", "grok-build-runtime", "skills", "godot-engine", "SKILL.md")
+    )
+  );
+  // tools/ holds grok_check.gd — required for the Godot 4 default plan.
+  assert.ok(
+    fs.existsSync(
+      path.join(wt, ".grok", "plugins", "grok-build-runtime", "tools", "grok_check.gd")
     )
   );
 

@@ -906,6 +906,8 @@ export function buildTaskStatusLines(meta = {}, rawOutput = "") {
     // Never render Verified: yes for noop/blind/truncated - even when the
     // verify loop happened to return true, it proved nothing about the work.
     lines.push(naLine);
+  } else if (meta.verifyNote && /skipped \(read-only run\)/i.test(String(meta.verifyNote))) {
+    lines.push("Verified: n/a - skipped (read-only run)");
   } else if (meta.verified === true) {
     lines.push(`Verified: yes${meta.verifyNote ? ` (${meta.verifyNote})` : ""}`);
   } else if (meta.verified === false) {
@@ -1246,13 +1248,17 @@ export function buildBridgeResultBlock(job = {}, storedJob = null) {
   const verify = record.verify ?? record.result?.verify ?? null;
   let verifyLabel = "none";
   if (verify && typeof verify === "object") {
-    const planSource = verify.plan?.source ?? verify.source ?? null;
-    const note = verify.note ?? null;
-    const verdict =
-      verified === true ? "passed" : verified === false ? "failed" : VERIFIED_NA_STATUSES.has(status) ? "n/a" : "n/a";
-    verifyLabel = [planSource ? `source=${planSource}` : null, note, `verdict=${verdict}`]
-      .filter(Boolean)
-      .join("; ");
+    if (verify.skippedReadOnly || /skipped \(read-only run\)/i.test(String(verify.note ?? ""))) {
+      verifyLabel = "skipped (read-only run)";
+    } else {
+      const planSource = verify.plan?.source ?? verify.source ?? null;
+      const note = verify.note ?? null;
+      const verdict =
+        verified === true ? "passed" : verified === false ? "failed" : VERIFIED_NA_STATUSES.has(status) ? "n/a" : "n/a";
+      verifyLabel = [planSource ? `source=${planSource}` : null, note, `verdict=${verdict}`]
+        .filter(Boolean)
+        .join("; ");
+    }
   } else if (VERIFIED_NA_STATUSES.has(status)) {
     verifyLabel = verifiedNaLine(status, stopReason) ?? "n/a";
   }
@@ -1299,13 +1305,38 @@ export function renderStoredJobResult(job, storedJob) {
   // would make /grok-build:show print LESS than it does today. `grok.stdout`
   // stays last so stored *review* jobs, whose payload has no rawOutput at all,
   // render exactly as before.
+  //
+  // FIELD-2: task result FIRST, then clearly labelled fix-turn history so a
+  // verify-fix report never masquerades as the deliverable.
   const rawOutput =
     (typeof storedJob?.result?.finalReport === "string" && storedJob.result.finalReport) ||
     (typeof storedJob?.result?.rawOutput === "string" && storedJob.result.rawOutput) ||
     (typeof storedJob?.result?.grok?.stdout === "string" && storedJob.result.grok.stdout) ||
     "";
-  if (rawOutput) {
-    const output = rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
+  const fixAttempts =
+    storedJob?.result?.verify?.fixAttempts ??
+    storedJob?.verify?.fixAttempts ??
+    null;
+  if (rawOutput || (Array.isArray(fixAttempts) && fixAttempts.length > 0)) {
+    let output = rawOutput ? (rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`) : "";
+    if (Array.isArray(fixAttempts) && fixAttempts.length > 0) {
+      const fixLines = ["", "--- Verify fix history (not the task deliverable) ---"];
+      for (const entry of fixAttempts) {
+        fixLines.push(
+          `Fix attempt ${entry.attempt ?? "?"}${entry.command ? ` for \`${entry.command}\`` : ""}:`
+        );
+        const body =
+          (typeof entry.finalReport === "string" && entry.finalReport.trim()) ||
+          (typeof entry.lastMessage === "string" && entry.lastMessage.trim()) ||
+          "(no report from this fix turn)";
+        fixLines.push(body.endsWith("\n") ? body.trimEnd() : body);
+        fixLines.push("");
+      }
+      output = `${output}${fixLines.join("\n")}`;
+      if (!output.endsWith("\n")) {
+        output += "\n";
+      }
+    }
     const withSession = threadId
       ? `${output}\nGrok session ID: ${threadId}\nResume in Grok: ${resumeCommand}\n`
       : output;

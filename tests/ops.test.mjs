@@ -546,6 +546,7 @@ test("the ecosystem probes are fully injectable and spawn nothing", () => {
     "godot binary",
     "godot headless",
     "godot console output",
+    "godot export templates",
     "gitignore hygiene"
   ]);
   assert.ok(
@@ -896,9 +897,14 @@ test("a trusted project config drives verification end to end", () => {
     `${JSON.stringify({ verify: [verifyCommand] }, null, 2)}\n`,
     "utf8"
   );
+  // Isolated --write needs a HEAD commit to create the worktree against.
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md", ".grok-build.json"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
 
   // Untrusted first: the run must NOT execute a command the user has not
   // vouched for, even though the file is right there in the repo.
+  // Read-only on purpose — trust gating is independent of write/verify skip.
   const untrusted = run("node", [SCRIPT, "run", "--json", "do something"], {
     cwd: repo,
     env: pluginDataEnv(pluginDataDir, binDir)
@@ -915,7 +921,23 @@ test("a trusted project config drives verification end to end", () => {
   assert.equal(trust.status, 0, trust.stderr);
   assert.equal(JSON.parse(trust.stdout).recorded, true);
 
-  const result = run("node", [SCRIPT, "run", "--json", "do something"], {
+  // FIELD-3: read-only runs skip baseline + verify entirely, so verified is
+  // null even when a trusted config would otherwise drive them. Assert that
+  // skip here, then prove the real end-to-end path on a --write run below.
+  const readOnly = run("node", [SCRIPT, "run", "--json", "do something"], {
+    cwd: repo,
+    env: pluginDataEnv(pluginDataDir, binDir)
+  });
+  assert.equal(readOnly.status, 0, readOnly.stderr || readOnly.stdout);
+  const readOnlyPayload = JSON.parse(readOnly.stdout);
+  assert.deepEqual(readOnlyPayload.verify.commands, [verifyCommand]);
+  assert.equal(readOnlyPayload.verify.plan.source, "config");
+  assert.equal(readOnlyPayload.verify.plan.configTrusted, true);
+  assert.equal(readOnlyPayload.verified, null, "read-only runs skip verify (FIELD-3)");
+  assert.equal(readOnlyPayload.verify.baselines.length, 0, "read-only runs skip baseline too");
+
+  // Write run is what actually executes the trusted config's verify plan.
+  const result = run("node", [SCRIPT, "run", "--write", "--json", "do something"], {
     cwd: repo,
     env: pluginDataEnv(pluginDataDir, binDir)
   });

@@ -80,7 +80,9 @@ import {
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   GODOT_CACHE_DIRS,
+  WORKTREE_SCRATCH_DIR,
   diffSharedFingerprints,
+  ensureBlenderVerifyShim,
   fingerprintSharedDirs,
   injectRuntimePlugin,
   planBlenderScriptSandbox,
@@ -1733,6 +1735,7 @@ function buildEcosystemChecks(root, options = {}) {
 
     if (descriptor.id === "godot") {
       checks.push(buildGodotConsoleOutputCheck(binary, root, runProbe, platform));
+      checks.push(buildGodotExportTemplatesCheck(descriptor, platform));
     }
   }
 
@@ -1795,6 +1798,87 @@ function buildGodotConsoleOutputCheck(binary, root, runProbe, platform) {
     status: "warn",
     detail: `${binary} exits 0 but writes nothing to stdout or stderr`,
     fix: `${remedy} Until then, verification can only read the exit code, and Godot exits 0 on a GDScript parse error.`
+  };
+}
+
+/**
+ * Warn before a run when export templates for the detected editor major are
+ * missing — export-smoke otherwise exits 0 with no artifact.
+ */
+function buildGodotExportTemplatesCheck(descriptor, platform) {
+  const major = descriptor?.major;
+  const versionHint =
+    major != null && descriptor?.minor != null
+      ? `${major}.${descriptor.minor}`
+      : major != null
+        ? String(major)
+        : null;
+
+  const candidates = [];
+  if (platform === "win32") {
+    const appdata = process.env.APPDATA || process.env.LOCALAPPDATA;
+    if (appdata) {
+      candidates.push(path.join(appdata, "Godot", "export_templates"));
+    }
+  } else if (platform === "darwin") {
+    const home = process.env.HOME;
+    if (home) {
+      candidates.push(path.join(home, "Library", "Application Support", "Godot", "export_templates"));
+    }
+  } else {
+    const home = process.env.HOME;
+    if (home) {
+      candidates.push(path.join(home, ".local", "share", "godot", "export_templates"));
+    }
+  }
+
+  let foundRoot = null;
+  let versionMatch = null;
+  for (const root of candidates) {
+    if (!fs.existsSync(root)) {
+      continue;
+    }
+    foundRoot = root;
+    try {
+      const entries = fs.readdirSync(root);
+      if (versionHint) {
+        versionMatch = entries.find(
+          (name) =>
+            String(name).startsWith(versionHint) ||
+            String(name).startsWith(`${versionHint}.`)
+        );
+      } else if (entries.length > 0) {
+        versionMatch = entries[0];
+      }
+    } catch {
+      // unreadable dir
+    }
+    break;
+  }
+
+  if (versionMatch) {
+    return {
+      name: "godot export templates",
+      status: "ok",
+      detail: `found ${versionMatch} under ${foundRoot}`,
+      fix: null
+    };
+  }
+
+  if (foundRoot) {
+    return {
+      name: "godot export templates",
+      status: "warn",
+      detail: `export_templates dir exists at ${foundRoot} but no template matching ${versionHint ?? "this editor"} was found`,
+      fix: "Install export templates from the Godot editor (Editor → Manage Export Templates), or disable --godot-export-smoke / exportSmoke until they are present. Without templates, export-smoke exits 0 and writes nothing."
+    };
+  }
+
+  return {
+    name: "godot export templates",
+    status: "warn",
+    detail: "no Godot export_templates directory found on this machine",
+    fix: "Install export templates from the Godot editor before using --godot-export-smoke. Without them the smoke step is a no-op pass."
   };
 }
 
@@ -3224,19 +3308,15 @@ async function executeTaskRun(request) {
   /** @type {Awaited<ReturnType<typeof probeBaselines>>} */
   let baselines = [];
   let baselineProbeMs = null;
+  // Read-only runs deny Edit/Write/NotebookEdit. A run that cannot write cannot
+  // break a test, so baseline + verify-agent verify are pure dead wall-clock
+  // (FIELD-3: measured 15+ minutes wasted on audit runs). Skip entirely.
+  const verifySkippedReadOnly = write === false && verifyCommands.length > 0;
   // The probe used to be gated on `created`, i.e. on an isolated write run
-  // only. Under --no-isolate, or read-only, there was no baseline at all:
-  // baselines.find() returned undefined, compareFailureSignatures compared
-  // against an empty set, and every failure that was already there before the
-  // run started came back as "new-failures" attributed to the agent. It now
-  // runs whenever there is anything to attribute, in runCwd - the same
-  // directory the post-agent pass below uses, so the comparison stays
-  // apples-to-apples whether or not a worktree exists.
-  //
-  // The skip is deliberate and narrow: a read-only run with no verify attempts
-  // has nothing it could possibly be blamed for, so the extra pass is pure
-  // wall-clock cost. Everywhere else the cost is real (a full extra verify
-  // pass) and is reported in the run's status block rather than hidden.
+  // only. Under --no-isolate there was no baseline at all: baselines.find()
+  // returned undefined, compareFailureSignatures compared against an empty
+  // set, and every pre-existing failure came back as "new-failures". It now
+  // runs for write runs whenever there is anything to attribute, in runCwd.
   //
   // --no-verify-baseline is the one way to opt out of paying for it. It does
   // NOT mean "we don't know what was already broken" - it means the user chose
@@ -3246,7 +3326,7 @@ async function executeTaskRun(request) {
   // apart from a probe that never ran.
   const baselineSkipped = Boolean(request.noVerifyBaseline);
   const shouldProbeBaselines =
-    verifyCommands.length > 0 && !baselineSkipped && !(write === false && verifyAttempts === 0);
+    verifyCommands.length > 0 && !baselineSkipped && write !== false;
   // Only ever raised, never lowered: the generous default below is the floor
   // for the one measurement the whole attribution story rests on, and a user
   // who asked for more time for their engine's cold import meant the probe
@@ -3255,7 +3335,12 @@ async function executeTaskRun(request) {
     BASELINE_PROBE_TIMEOUT_MS,
     verifyTiming.baselineTimeoutMs ?? 0
   );
-  if (baselineSkipped && verifyCommands.length > 0) {
+  if (verifySkippedReadOnly) {
+    request.onProgress?.({
+      phase: "verifying",
+      message: "Verify: skipped (read-only run)"
+    });
+  } else if (baselineSkipped && verifyCommands.length > 0) {
     baselines = verifyCommands.map((command) => ({
       command,
       // null, not false: nothing was measured, so "did it pass?" has no answer.
@@ -3274,6 +3359,34 @@ async function executeTaskRun(request) {
       phase: "verifying",
       message: `Verify baseline: skipped (--no-verify-baseline); every failure counts as this run's`
     });
+  }
+
+  // Before any verify command: materialise scratch dirs and the Blender shim.
+  // Export-smoke writes under .grok-build/; Godot exits 0 with no artifact when
+  // the parent directory is missing. The Blender shim must exist for default
+  // plans that invoke it.
+  if (write && verifyCommands.length > 0 && !verifySkippedReadOnly) {
+    try {
+      fs.mkdirSync(path.join(runCwd, WORKTREE_SCRATCH_DIR), { recursive: true });
+    } catch {
+      // Non-fatal; individual commands may still fail honestly.
+    }
+    if (verifyCommands.some((command) => String(command).includes("grok_verify_shim.py"))) {
+      try {
+        ensureBlenderVerifyShim(runCwd);
+      } catch {
+        // Command will fail with a clear missing-script error.
+      }
+    }
+    // Ensure Godot whole-project check script is on disk (isolated inject may
+    // already have done this; non-isolated write runs still need tools/).
+    if (verifyCommands.some((command) => String(command).includes("grok_check.gd"))) {
+      try {
+        injectRuntimePlugin(runCwd, ["godot"], { pluginRoot: ROOT_DIR });
+      } catch {
+        // Command will fail if the script is still missing.
+      }
+    }
   }
 
   if (shouldProbeBaselines) {
@@ -3598,9 +3711,30 @@ async function executeTaskRun(request) {
   let verifyNote = null;
   /** @type {object[]} */
   let verifyResults = [];
+  /** @type {object[]} */
+  let verifyFixAttempts = [];
   let attempt = 0;
 
-  if (!timedOut && verifyCommands.length > 0) {
+  // FIELD-2: the task-turn deliverable must survive the fix loop. Capture the
+  // primary answer NOW (after auto-continue, before any fix turn) so a fix
+  // turn's ===GROK-FINAL-REPORT=== cannot replace the work the user asked for.
+  const primaryTaskDeliverable = {
+    finalReport:
+      agentResults
+        .map((entry) => (typeof entry?.finalReport === "string" ? entry.finalReport : ""))
+        .filter(Boolean)[0] ?? "",
+    lastMessage:
+      agentResults
+        .map((entry) => (typeof entry?.lastMessage === "string" ? entry.lastMessage : ""))
+        .filter(Boolean)[0] ?? "",
+    threadId: result.threadId ?? null,
+    status: result.status
+  };
+
+  if (verifySkippedReadOnly) {
+    verified = null;
+    verifyNote = "skipped (read-only run)";
+  } else if (!timedOut && verifyCommands.length > 0) {
     while (attempt <= verifyAttempts) {
       const iterationResults = [];
       // The first failure genuinely attributable to THIS run - as opposed to
@@ -3759,7 +3893,21 @@ async function executeTaskRun(request) {
       if (!firstBlamed) {
         verified = true;
         if (iterationResults.some((entry) => !entry.ok)) {
-          verifyNote = "remaining failures are unchanged from baseline or could not be attributed to this run";
+          const preExisting = iterationResults.filter(
+            (entry) =>
+              !entry.ok &&
+              (entry.attribution === "pre-existing-failure" ||
+                entry.attribution === "baseline-already-failing" ||
+                entry.attribution === "unchanged-from-baseline" ||
+                entry.failureSource === "baseline")
+          );
+          if (preExisting.length > 0 && preExisting.length === iterationResults.filter((e) => !e.ok).length) {
+            verifyNote =
+              "pre-existing-failure: command(s) already failed at baseline; not this run's responsibility (no fix turn, status not downgraded)";
+          } else {
+            verifyNote =
+              "remaining failures are unchanged from baseline or could not be attributed to this run";
+          }
         }
         break;
       }
@@ -3810,8 +3958,32 @@ async function executeTaskRun(request) {
         },
         maxDurationSeconds
       );
-      result = fixAgent.result;
+      // FIELD-2: accumulate, do not replace. Keep the task-turn deliverable on
+      // `result`; record the fix turn separately so show renders the real
+      // answer first and the fix history after.
+      verifyFixAttempts.push({
+        attempt: attempt + 1,
+        command: firstBlamed.command,
+        finalReport:
+          typeof fixAgent.result?.finalReport === "string" ? fixAgent.result.finalReport : "",
+        lastMessage:
+          typeof fixAgent.result?.lastMessage === "string" ? fixAgent.result.lastMessage : "",
+        status: fixAgent.result?.status ?? null,
+        stopReason: fixAgent.result?.stopReason ?? null,
+        threadId: fixAgent.result?.threadId ?? null
+      });
       agentResults.push(fixAgent.result);
+      // Advance session/status plumbing only — never finalReport / lastMessage.
+      result = {
+        ...result,
+        threadId: fixAgent.result?.threadId ?? result.threadId,
+        status: fixAgent.result?.status ?? result.status,
+        stopReason: fixAgent.result?.stopReason ?? result.stopReason,
+        stderr: fixAgent.result?.stderr ?? result.stderr,
+        // Preserve the primary task deliverable explicitly.
+        finalReport: primaryTaskDeliverable.finalReport || result.finalReport,
+        lastMessage: primaryTaskDeliverable.lastMessage || result.lastMessage
+      };
       cumulativeUsage = addUsage(cumulativeUsage, fixAgent.result.usage);
       if (fixAgent.timedOut) {
         timedOut = true;
@@ -4049,22 +4221,20 @@ async function executeTaskRun(request) {
     }
   }
 
-  // The text channel is the ONE thing that accumulates across turns. `result`
-  // used to be overwritten wholesale by the verify fix loop, so a fix turn that
-  // ended on a tool call with no trailing prose (the common shape - the fix
-  // prompt asks for an edit and a re-run, not an essay) threw away the original
-  // run's answer entirely, and the user got "Grok did not return a final
-  // message." for a run that did the work and passed verification.
-  //
-  // Newest non-empty wins per field, so a silent fix turn falls back to the main
-  // run's answer while a talkative one still gets the last word.
-  const newestNonEmpty = (field) =>
+  // FIELD-2: the run result must ACCUMULATE, not replace. Keep the first
+  // task-turn report as the run's `result`. Fix-turn reports live in
+  // verifyFixAttempts only — picking newestNonEmpty used to hand the caller a
+  // note about `cargo test` instead of the 26 KB deliverable they asked for.
+  const firstNonEmpty = (field) =>
     agentResults
       .map((entry) => (typeof entry?.[field] === "string" ? entry[field] : ""))
-      .filter(Boolean)
-      .at(-1) ?? "";
-  const finalReport = newestNonEmpty("finalReport");
-  const lastMessage = newestNonEmpty("lastMessage");
+      .filter(Boolean)[0] ?? "";
+  const finalReport =
+    (primaryTaskDeliverable.finalReport && String(primaryTaskDeliverable.finalReport)) ||
+    firstNonEmpty("finalReport");
+  const lastMessage =
+    (primaryTaskDeliverable.lastMessage && String(primaryTaskDeliverable.lastMessage)) ||
+    firstNonEmpty("lastMessage");
   // Concatenated rather than picked: the transcript is the log, and every turn's
   // narration belongs in it.
   const transcript = agentResults
@@ -4277,9 +4447,12 @@ async function executeTaskRun(request) {
     plan: verifyPlan,
     attempts: attempt,
     note: verifyNote,
-    // The probe is now unconditional, so on a non-isolated run it doubles the
-    // verify wall clock. That cost has to be visible rather than showing up as
-    // an unexplained delay.
+    // Read-only runs skip baseline + verify entirely (FIELD-3).
+    skippedReadOnly: Boolean(verifySkippedReadOnly),
+    // Fix-turn reports only — never the task deliverable (FIELD-2).
+    fixAttempts: verifyFixAttempts,
+    // The probe is now unconditional on write runs, so on a non-isolated write
+    // it doubles the verify wall clock. That cost has to be visible.
     baselineProbeMs,
     baselines,
     // Whether the user opted out of measuring the baseline at all, which is

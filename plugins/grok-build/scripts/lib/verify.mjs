@@ -1,6 +1,69 @@
+import fs from "node:fs";
+import path from "node:path";
 import process from "node:process";
 
 import { resolveMaxOutputBytes, runCommandAsync } from "./process.mjs";
+
+/**
+ * Relative path of the Godot whole-project check script after runtime-plugin
+ * injection (see injectRuntimePlugin + runtime-plugin/tools/grok_check.gd).
+ * Bare `--check-only` without `--script` never exits on Godot 4 — this is the
+ * only honest whole-project parse that does.
+ */
+export const GODOT_CHECK_SCRIPT_RES =
+  "res://.grok/plugins/grok-build-runtime/tools/grok_check.gd";
+
+/**
+ * Detect the export-smoke output path embedded in a verify command, if any.
+ * @param {string} command
+ * @returns {string|null} workspace-relative posix-ish path
+ */
+export function expectedExportSmokeArtifact(command) {
+  const match = /(\.grok-build\/export-smoke\.[A-Za-z0-9_]+)/.exec(String(command ?? ""));
+  return match ? match[1] : null;
+}
+
+/**
+ * After a Godot export-smoke command returns, require a non-empty artifact on
+ * disk. Godot often exits 0 and writes nothing when templates are missing or
+ * the parent directory did not exist.
+ *
+ * @param {string} command
+ * @param {string} cwd
+ * @param {{ existsSync?: typeof fs.existsSync, statSync?: typeof fs.statSync }} [io]
+ * @returns {{ ok: true } | { ok: false, message: string }}
+ */
+export function assertExportSmokeArtifact(command, cwd, io = {}) {
+  const rel = expectedExportSmokeArtifact(command);
+  if (!rel) {
+    return { ok: true };
+  }
+  const existsSync = io.existsSync ?? fs.existsSync;
+  const statSync = io.statSync ?? fs.statSync;
+  const abs = path.join(cwd, ...rel.split("/"));
+  try {
+    if (!existsSync(abs)) {
+      return {
+        ok: false,
+        message: `export produced no artifact: expected ${rel} after export-smoke (missing file)`
+      };
+    }
+    const st = statSync(abs);
+    const size = Number(st?.size) || 0;
+    if (size <= 0) {
+      return {
+        ok: false,
+        message: `export produced no artifact: expected ${rel} after export-smoke (zero bytes)`
+      };
+    }
+  } catch {
+    return {
+      ok: false,
+      message: `export produced no artifact: expected ${rel} after export-smoke (stat failed)`
+    };
+  }
+  return { ok: true };
+}
 
 const DEFAULT_FLOOR_MS = 120_000;
 const DEFAULT_CAP_MS = 900_000;
@@ -58,15 +121,37 @@ export const OUTPUT_FAILURE_PATTERNS = Object.freeze({
     { id: "godot-script-error", re: /^\s*SCRIPT ERROR:/ },
     { id: "godot-user-script-error", re: /^\s*USER SCRIPT ERROR:/ },
     { id: "godot-user-error", re: /^\s*USER ERROR:/ },
+    { id: "godot-shader-error", re: /^\s*(?:USER )?SHADER ERROR:/ },
+    { id: "godot-shader-compile-failed", re: /^\s*ERROR: Shader compilation failed/ },
     { id: "godot-parse-error", re: /\bParse Error\b/ },
     { id: "godot-script-load-failed", re: /Failed to load script / },
     { id: "godot-import-failed", re: /Error importing '/ },
-    { id: "godot-scene-instantiate-failed", re: /Failed to instantiate scene/ }
+    { id: "godot-scene-instantiate-failed", re: /Failed to instantiate scene/ },
+    // Export-smoke honesty: Godot often exits 0 with no artifact when templates
+    // are missing or the output path cannot be created.
+    { id: "godot-export-no-template", re: /No export template found/i },
+    { id: "godot-export-templates-missing", re: /Export templates for this platform are missing/i },
+    { id: "godot-export-template-file-missing", re: /Template file not found/i },
+    { id: "godot-export-cannot-create", re: /Cannot create file/i },
+    { id: "godot-export-no-artifact", re: /export produced no artifact/i }
   ]),
   blender: Object.freeze([
     {
       id: "blender-python-script-failed",
       re: /^Error: Python script failed(?:, look above for details| - exiting)/
+    },
+    // unittest.TextTestRunner prints this summary and returns normally; without
+    // a marker, --python-exit-code never fires and a red suite verifies green.
+    { id: "blender-unittest-failed", re: /^FAILED \((?:failures|errors)=/ },
+    // pytest short test summary line (e.g. "===== 2 failed, 3 passed in 0.1s =====").
+    { id: "blender-pytest-failed", re: /^=+ .* (?:failed|error)/ },
+    // Exact literal addon_utils.enable prints before handle_error when
+    // register() raises — enable() then returns None without re-raising.
+    { id: "blender-register-exception", re: /^Exception in module register\(\):/ },
+    // Bridge-owned shim result line when failures or errors are non-zero.
+    {
+      id: "blender-shim-result-failed",
+      re: /^GROK_BUILD_BLENDER_RESULT: .*"(?:failures|errors)":[1-9]/
     }
   ])
 });
@@ -79,9 +164,10 @@ export const OUTPUT_FAILURE_PATTERNS = Object.freeze({
  * necessity — Godot prints them behind several different prefixes — and Godot
  * cheerfully emits lines like `WARNING: Parse Error recovered, continuing.`
  * A single guard is both easier to reason about and impossible for a later
- * pattern addition to forget.
+ * pattern addition to forget. Includes SHADER WARNING so phrase-shaped
+ * patterns never promote a shader warning to a failure.
  */
-const OUTPUT_WARNING_LINE = /^(?:SCRIPT |USER |USER SCRIPT )?WARNING\b/;
+const OUTPUT_WARNING_LINE = /^(?:SCRIPT |USER |USER SCRIPT |SHADER |USER SHADER )?WARNING\b/;
 
 /**
  * Which output lines trip a failure pattern.
@@ -340,8 +426,22 @@ export async function runVerifyCommand(command, cwd, options = {}) {
     parts.push("(no output)");
   }
 
+  // Judge export-smoke by the filesystem, not Godot's exit code: --export-release
+  // frequently exits 0, prints "[ DONE ] savepack", and writes nothing when
+  // templates are missing or the output directory did not exist.
+  let artifactFailure = null;
+  if (status === 0 && outputFailures.length === 0) {
+    const artifact = assertExportSmokeArtifact(command, cwd);
+    if (!artifact.ok) {
+      artifactFailure = artifact.message;
+      parts.push(artifactFailure);
+    }
+  }
+
+  const ok = status === 0 && outputFailures.length === 0 && !artifactFailure;
+
   return {
-    ok: status === 0 && outputFailures.length === 0,
+    ok,
     ...(noOutput
       ? {
           noOutput: true,
@@ -355,8 +455,14 @@ export async function runVerifyCommand(command, cwd, options = {}) {
     // it, and they already match summarizeFailures' \berror\b heuristic, so
     // echoing them a second time would double-count rawCount and needlessly
     // trip the more-failures-same-signature branch.
-    ...(outputFailures.length > 0
-      ? { failureSource: "output-pattern", matchedLines: outputFailures.map((entry) => entry.line) }
+    ...(outputFailures.length > 0 || artifactFailure
+      ? {
+          failureSource: "output-pattern",
+          matchedLines: [
+            ...outputFailures.map((entry) => entry.line),
+            ...(artifactFailure ? [artifactFailure] : [])
+          ]
+        }
       : {}),
     // How much of the middle the ring dropped, so a truncated capture is a
     // number in the run record rather than something only a reader of the
@@ -874,10 +980,19 @@ export function classifyVerifyFailure(current, baselineEntry, options = {}) {
     return { blamed: false, reason: "unchanged-from-baseline", comparison: comparison.outcome };
   }
 
-  if (comparison.outcome === "incomparable" && baselineEntry?.ok === false) {
-    // Neither run's output matched a recognisable failure pattern, but this
-    // command was ALREADY failing before the agent started.
-    return { blamed: false, reason: "baseline-already-failing", comparison: comparison.outcome };
+  // Partition by baseline result (FIELD-1). A command that was already red
+  // before the agent started is NEVER the agent's responsibility: it must not
+  // trigger a fix turn and must not downgrade the run. Signature drift on a
+  // pre-broken suite (cargo test reordering, different panic text after an
+  // unrelated edit) used to look like "new-failures" and burn the whole
+  // remaining budget demanding a fix of something the agent never owned.
+  if (baselineEntry?.ok === false) {
+    // Preserve the older label when neither side had extractable signatures so
+    // existing records stay readable; everything else is pre-existing-failure.
+    if (comparison.outcome === "incomparable") {
+      return { blamed: false, reason: "baseline-already-failing", comparison: comparison.outcome };
+    }
+    return { blamed: false, reason: "pre-existing-failure", comparison: comparison.outcome };
   }
 
   return { blamed: true, reason: comparison.outcome, comparison: comparison.outcome };

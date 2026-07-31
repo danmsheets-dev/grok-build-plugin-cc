@@ -222,20 +222,25 @@ test("detection degrades to no ecosystem when the filesystem throws", () => {
   );
 });
 
-test("defaultVerifyCommands for Godot 4 with GUT imports and runs gut_cmdln", () => {
+test("defaultVerifyCommands for Godot 4 with GUT uses grok_check.gd and never bare --check-only", () => {
   const commands = defaultVerifyCommands(
     { id: "godot", major: 4, testRunner: "gut", supportsCheckOnly: true },
     { env: {}, platform: "linux" }
   );
-  assert.ok(commands.some((command) => command.includes("--check-only")), commands.join("\n"));
+  // Bare --check-only without --script never exits on Godot 4.
+  assert.ok(commands.every((command) => !/(?:^|\s)--check-only(?:\s|$)/.test(command)), commands.join("\n"));
+  assert.ok(
+    commands.some((command) => command.includes("grok_check.gd")),
+    commands.join("\n")
+  );
   assert.ok(commands.some((command) => command.includes("--import")), commands.join("\n"));
   assert.ok(
     commands.some((command) => command.includes("gut_cmdln.gd -gexit")),
     commands.join("\n")
   );
   assert.ok(commands.every((command) => command.startsWith("godot ")));
-  // --check-only must precede the slow import so a parse error fails in seconds.
-  const checkIdx = commands.findIndex((command) => command.includes("--check-only"));
+  // Whole-project check must precede the slow import so a parse error fails fast.
+  const checkIdx = commands.findIndex((command) => command.includes("grok_check.gd"));
   const importIdx = commands.findIndex((command) => command.includes("--import"));
   assert.ok(checkIdx >= 0 && importIdx > checkIdx, commands.join("\n"));
 });
@@ -247,6 +252,7 @@ test("defaultVerifyCommands for Godot 3 uses --no-window and never --check-only 
   );
   assert.ok(commands.every((command) => command.includes("--no-window")), commands.join("\n"));
   assert.ok(commands.every((command) => !command.includes("--check-only")), commands.join("\n"));
+  assert.ok(commands.every((command) => !command.includes("grok_check.gd")), commands.join("\n"));
   assert.ok(commands.every((command) => !command.includes("--quit-after")), commands.join("\n"));
   assert.ok(commands.some((command) => command.includes("gut_cmdln.gd -gexit")));
 });
@@ -290,15 +296,28 @@ test("no default verify command ever emits shell parameter expansion", () => {
   }
 });
 
-test("defaultVerifyCommands for Blender validates the manifest and exits non-zero on script errors", () => {
+test("defaultVerifyCommands for Blender validates the manifest and runs tests via the bridge shim", () => {
   const commands = defaultVerifyCommands(
-    { id: "blender", manifestPath: "myaddon/blender_manifest.toml", testScript: "tests/run_tests.py" },
+    {
+      id: "blender",
+      manifestPath: "myaddon/blender_manifest.toml",
+      testScript: "tests/run_tests.py",
+      moduleName: "myaddon"
+    },
     { env: {}, platform: "linux" }
   );
   assert.ok(commands.some((command) => command.includes("--command extension validate myaddon/blender_manifest.toml")));
-  const script = commands.find((command) => command.includes("--python tests/run_tests.py"));
-  assert.ok(script);
+  // Tests go through the shim so FAILED without sys.exit(1) still fails verify.
+  const script = commands.find(
+    (command) => command.includes("grok_verify_shim.py") && command.includes("tests/run_tests.py")
+  );
+  assert.ok(script, commands.join("\n"));
   assert.match(script, /--background --factory-startup --python-exit-code 1/);
+  // Registration smoke is unconditional so a manifest-only plan cannot skip Python.
+  assert.ok(
+    commands.some((command) => command.includes("grok_verify_shim.py") && command.includes("--enable myaddon")),
+    commands.join("\n")
+  );
 });
 
 test("a manifest path carrying a shell metacharacter emits no validate command", () => {
@@ -323,8 +342,11 @@ test("a manifest path carrying a shell metacharacter emits no validate command",
       `${platform}: ${commands.join("\n")}`
     );
     // Refusing must not leave the project unverified: the smoke check stands in.
-    assert.equal(commands.length, 1);
-    assert.match(commands[0], /--python-expr "import bpy"/);
+    assert.ok(commands.length >= 1, commands.join("\n"));
+    assert.ok(
+      commands.some((command) => /--python-expr "import bpy"/.test(command) || command.includes("grok_verify_shim")),
+      commands.join("\n")
+    );
   }
 });
 
@@ -364,6 +386,23 @@ test("a Blender project with neither manifest nor test script still gets a smoke
   );
   assert.equal(commands.length, 1);
   assert.match(commands[0], /--background --factory-startup --python-exit-code 1 --python-expr/);
+});
+
+test("a Blender extension with only a manifest still gets registration smoke (not validate-only)", () => {
+  // extension validate is a TOML schema check; without import/register smoke a
+  // syntax error in __init__.py verifies green.
+  const root = makeProject({
+    "myext/blender_manifest.toml": 'schema_version = "1.0.0"\nid = "myext"\n',
+    "myext/__init__.py": "bl_info = {}\n"
+  });
+  const blender = findDescriptor(root, "blender", { env: {} });
+  assert.equal(blender.moduleName, "myext");
+  const commands = defaultVerifyCommands(blender, { env: {}, platform: "linux" });
+  assert.ok(commands.some((c) => c.includes("extension validate")), commands.join("\n"));
+  assert.ok(
+    commands.some((c) => c.includes("grok_verify_shim.py") && c.includes("--enable myext")),
+    commands.join("\n")
+  );
 });
 
 test("node defaults skip npm's placeholder test script", () => {

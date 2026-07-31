@@ -13,14 +13,22 @@ The only reliable headless invocation the bridge uses:
 blender --background --factory-startup --python-exit-code 1 --python <script>
 ```
 
-- `--python-exit-code 1` turns a Python exception into a non-zero exit. Without
-  it Blender exits 0 and the failure is invisible.
+- `--python-exit-code 1` turns an **uncaught** Python exception into a non-zero
+  exit. Without it Blender exits 0 and the failure is invisible. A unittest
+  runner that collects failures and returns normally still exits 0 — the
+  bridge wraps test scripts in a shim that forces `sys.exit(1)` on a red
+  `TestResult`.
 - `--factory-startup` disables **every** installed add-on, including the one
-  under test. The test script must enable it:
+  under test. The test script must enable it **and check the return value**:
+  `addon_utils.enable` wraps `register()` in try/except, prints the traceback,
+  and **returns `None` without re-raising**. Ignoring the return verifies green
+  on a broken add-on.
 
 ```python
-import addon_utils
-addon_utils.enable("<module>", default_set=False, persistent=True)
+import addon_utils, sys
+mod = addon_utils.enable("<module>", default_set=False, persistent=True)
+if mod is None:
+    sys.exit("enable() returned None: register() raised, see traceback above")
 ```
 
 ## Add-on directory control

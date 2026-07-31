@@ -209,14 +209,66 @@ function parseGodotFeatures(text) {
 }
 
 /**
- * First named export preset in export_presets.cfg, if any.
+ * First named export preset in export_presets.cfg, with its platform when set.
  *
- * Only the name is needed for a headless smoke export. Credentials live in the
- * sibling export_credentials.cfg (never committed, never read here).
+ * Credentials live in the sibling export_credentials.cfg (never committed,
+ * never read here). Platform drives the binary extension for export-smoke:
+ * a Windows Desktop preset that writes `.zip` always produces nothing useful.
+ *
+ * @returns {{ name: string, platform: string|null }|null}
  */
+function parseFirstExportPreset(text) {
+  const raw = String(text ?? "");
+  // Prefer the first [preset.N] block so a later preset cannot steal the name.
+  const block = /\[preset\.\d+\]([\s\S]*?)(?=\n\[preset\.\d+\]|\n\[|$)/.exec(raw);
+  const scope = block ? block[1] : raw;
+  const nameMatch = /^\s*name\s*=\s*"([^"]+)"/m.exec(scope);
+  if (!nameMatch) {
+    // Fall back to the historical first-name-anywhere behaviour when blocks
+    // are missing or malformed.
+    const loose = /^\s*name\s*=\s*"([^"]+)"/m.exec(raw);
+    return loose ? { name: loose[1], platform: null } : null;
+  }
+  const platformMatch = /^\s*platform\s*=\s*"([^"]+)"/m.exec(scope);
+  return {
+    name: nameMatch[1],
+    platform: platformMatch ? platformMatch[1] : null
+  };
+}
+
+/** @deprecated use parseFirstExportPreset; kept for any external caller tests */
 function parseFirstExportPresetName(text) {
-  const match = /^\s*name\s*=\s*"([^"]+)"/m.exec(String(text ?? ""));
-  return match ? match[1] : null;
+  return parseFirstExportPreset(text)?.name ?? null;
+}
+
+/**
+ * Binary extension for a Godot export preset platform string.
+ * Default `.zip` only for Web/macOS-style pack outputs.
+ */
+export function exportSmokeExtensionForPlatform(platform) {
+  const p = String(platform ?? "").trim().toLowerCase();
+  if (!p) {
+    return ".zip";
+  }
+  if (p.includes("windows")) {
+    return ".exe";
+  }
+  if (p.includes("linux") || p.includes("x11") || p.includes("bsd")) {
+    return ".x86_64";
+  }
+  if (p.includes("mac") || p.includes("osx") || p === "macos") {
+    return ".zip";
+  }
+  if (p.includes("web") || p.includes("html")) {
+    return ".html";
+  }
+  if (p.includes("android")) {
+    return ".apk";
+  }
+  if (p.includes("ios")) {
+    return ".ipa";
+  }
+  return ".zip";
 }
 
 function detectGodot(root, io) {
@@ -256,9 +308,11 @@ function detectGodot(root, io) {
   // export needs a configured template and can take minutes.
   const exportPresetsPath = path.join(root, "export_presets.cfg");
   const hasExportPresets = exists(io, exportPresetsPath);
-  const exportPresetName = hasExportPresets
-    ? parseFirstExportPresetName(readText(io, exportPresetsPath) ?? "")
+  const exportPreset = hasExportPresets
+    ? parseFirstExportPreset(readText(io, exportPresetsPath) ?? "")
     : null;
+  const exportPresetName = exportPreset?.name ?? null;
+  const exportPresetPlatform = exportPreset?.platform ?? null;
 
   return {
     id: "godot",
@@ -275,10 +329,11 @@ function detectGodot(root, io) {
     cacheDir: major === 3 ? ".import" : ".godot",
     hasExportPresets,
     exportPresetName,
-    // --check-only is Godot 4 only (added alongside --headless). Godot 3 has
-    // no equivalent; emitting it would fail the verify plan on a healthy 3.x
-    // project. Unknown major takes the Godot 4 branch, matching every other
-    // flag choice in this module.
+    exportPresetPlatform,
+    // Historical flag: bare `--check-only` without `--script` never exits on
+    // Godot 4 (it boots main_scene forever). The default plan no longer emits
+    // that form; whole-project check uses runtime-plugin/tools/grok_check.gd.
+    // Kept on the descriptor so older callers/tests can still branch on major.
     supportsCheckOnly: major !== 3,
     exeHint: resolveBinaryHint("godot", io.env)
   };
@@ -370,12 +425,25 @@ function detectBlender(root, io) {
     blenderVersionMin = parseBlenderManifestVersionMin(manifestText);
   }
 
+  // Blender imports an add-on under its directory name. Root-level add-ons
+  // use the repository basename (same rule as planBlenderScriptSandbox).
+  const addonRelative = hit.manifestPath ?? hit.addonInitPath ?? null;
+  let moduleName = null;
+  if (addonRelative) {
+    const dir = path.posix.dirname(addonRelative.replace(/\\/g, "/"));
+    moduleName =
+      dir === "." || dir === ""
+        ? path.basename(root)
+        : dir.split("/").filter(Boolean)[0] ?? null;
+  }
+
   return {
     id: "blender",
     root,
     detectedBy: hit.detectedBy,
     manifestPath: hit.manifestPath,
     addonInitPath: hit.addonInitPath,
+    moduleName,
     // True when there is a module to sandbox (extension or legacy add-on). A
     // bare .blend project is NOT an add-on — auto-sandbox must not claim it.
     isAddon: Boolean(hit.manifestPath || hit.addonInitPath),
@@ -799,6 +867,10 @@ function preferWindowsConsoleExe(value, existsSync) {
   }
 }
 
+/** res:// path of the whole-project check after injectRuntimePlugin copies tools/. */
+export const GODOT_CHECK_SCRIPT_RES =
+  "res://.grok/plugins/grok-build-runtime/tools/grok_check.gd";
+
 function godotVerifyCommands(exe, descriptor, options = {}) {
   const commands = [];
   const major = descriptor.major;
@@ -807,15 +879,19 @@ function godotVerifyCommands(exe, descriptor, options = {}) {
   // config_version we failed to parse would most likely accept.
   const headless = major === 3 ? "--no-window" : "--headless";
 
-  // --check-only parses GDScript without running or importing. A broken script
-  // fails in seconds rather than after a full asset import. Godot 3 has no
-  // such flag; supportsCheckOnly is set on the descriptor so a caller that
-  // only has a major can still gate correctly.
-  const supportsCheckOnly =
-    descriptor.supportsCheckOnly === true ||
-    (descriptor.supportsCheckOnly !== false && major !== 3);
-  if (supportsCheckOnly) {
-    commands.push(`${exe} --headless --path . --check-only`);
+  // NEVER emit bare `--check-only` without `--script`. Godot's own docs say
+  // `--check-only` only works with `--script`; without it the flag is inert
+  // and Godot boots run/main_scene headlessly forever. Measured on 4.7: 15 min
+  // baseline hang, then infrastructure timeout, so a Godot project could never
+  // report verified:true on the default plan.
+  //
+  // Whole-project check: runtime-plugin/tools/grok_check.gd walks res:// and
+  // ResourceLoader.load()s every .gd/.gdshader/.tscn/.tres, then quits with a
+  // real exit code. injectRuntimePlugin copies tools/ into the worktree.
+  if (major !== 3) {
+    commands.push(
+      `${exe} --headless --path . --script ${GODOT_CHECK_SCRIPT_RES} --quit`
+    );
   }
 
   if (major === 3) {
@@ -842,24 +918,21 @@ function godotVerifyCommands(exe, descriptor, options = {}) {
   // Opt-in export smoke. Never touches export_credentials.cfg — that file is
   // machine-local secrets and already in worktree.mjs's never-commit list.
   // Output lands under the run scratch dir so a successful smoke cannot stage
-  // a binary into the commit.
+  // a binary into the commit. Extension follows the preset platform; the
+  // bridge mkdir's .grok-build/ and runVerifyCommand stats the artifact.
   if (options.exportSmoke && descriptor.hasExportPresets && descriptor.exportPresetName) {
     const preset = descriptor.exportPresetName;
     const safePreset = SAFE_COMMAND_PATH_PATTERN.test(preset) ? preset : null;
     if (safePreset) {
       const quoted = quoteCommandPath(safePreset);
-      const out =
-        major === 3
-          ? `.grok-build/export-smoke.zip`
-          : `.grok-build/export-smoke.zip`;
+      const ext = exportSmokeExtensionForPlatform(
+        descriptor.exportPresetPlatform ?? options.exportPresetPlatform
+      );
+      const out = `.grok-build/export-smoke${ext}`;
       if (major === 3) {
-        commands.push(
-          `${exe} --no-window --path . --export ${quoted} ${out}`
-        );
+        commands.push(`${exe} --no-window --path . --export ${quoted} ${out}`);
       } else {
-        commands.push(
-          `${exe} --headless --path . --export-release ${quoted} ${out}`
-        );
+        commands.push(`${exe} --headless --path . --export-release ${quoted} ${out}`);
       }
     }
   }
@@ -905,6 +978,9 @@ function quoteCommandPath(value) {
   return /\s/.test(value) ? `"${value}"` : value;
 }
 
+/** Relative path of the bridge-owned Blender verify shim (written by provision). */
+export const BLENDER_VERIFY_SHIM_RELATIVE = ".grok-build/blender/grok_verify_shim.py";
+
 function blenderVerifyCommands(exe, descriptor) {
   const commands = [];
 
@@ -922,24 +998,42 @@ function blenderVerifyCommands(exe, descriptor) {
     // `--command extension validate` is a real manifest schema check that
     // loads no scene. A blender_manifest.toml can only exist for 4.2+, which
     // is exactly where the subcommand exists, so it is safe to assume here.
+    // It does NOT import Python — registration smoke below covers that.
     commands.push(`${exe} --command extension validate ${quoteCommandPath(manifestPath)}`);
   }
 
+  const shim = BLENDER_VERIFY_SHIM_RELATIVE;
+  const moduleName =
+    typeof descriptor.moduleName === "string" &&
+    SAFE_COMMAND_PATH_PATTERN.test(descriptor.moduleName)
+      ? descriptor.moduleName
+      : null;
+
   // testScript needs no such guard: `detectBlender` only ever assigns it one of
   // two hardcoded candidates, so no repo-controlled bytes reach it.
+  // Run through the bridge shim so a unittest suite that reports FAILED
+  // without sys.exit(1) still fails verification (false-green fix).
   if (descriptor.testScript) {
-    // --python-exit-code turns an exception in the script into a non-zero
-    // exit; without it Blender exits 0 and the failure is invisible to
-    // exit-code checking. --factory-startup disables every installed add-on
-    // INCLUDING the one under test, so the script has to enable it itself with
-    // addon_utils.enable("<module>", default_set=False, persistent=True).
     commands.push(
-      `${exe} --background --factory-startup --python-exit-code 1 --python ${descriptor.testScript}`
+      `${exe} --background --factory-startup --python-exit-code 1 --python ${shim} -- ${descriptor.testScript}`
     );
-  } else if (!manifestPath) {
-    // Nothing better to run than a smoke check: it still catches a broken
-    // install or a GUI-only build that cannot start headless, and it is the
-    // only thing that can be asserted about an arbitrary .blend repo.
+  }
+
+  // Registration / import smoke is unconditional whenever we know a module
+  // name: `extension validate` alone never imports __init__.py, so a syntax
+  // error in the add-on used to verify green on a manifest-only plan.
+  if (moduleName) {
+    commands.push(
+      `${exe} --background --factory-startup --python-exit-code 1 --python ${shim} -- --enable ${moduleName}`
+    );
+  } else if (!descriptor.testScript && !manifestPath) {
+    // Bare .blend project: only assert the binary can start headless.
+    commands.push(
+      `${exe} --background --factory-startup --python-exit-code 1 --python-expr "import bpy"`
+    );
+  } else if (!descriptor.testScript && manifestPath && !moduleName) {
+    // Manifest present but module name could not be derived safely — still
+    // smoke-import bpy so the plan is never validate-only.
     commands.push(
       `${exe} --background --factory-startup --python-exit-code 1 --python-expr "import bpy"`
     );

@@ -7,11 +7,13 @@ import { makeTempDir } from "./helpers.mjs";
 import { startHeartbeat } from "../plugins/grok-build/scripts/lib/tracked-jobs.mjs";
 import {
   OUTPUT_FAILURE_PATTERNS,
+  assertExportSmokeArtifact,
   classifyVerifyFailure,
   compareFailureSignatures,
   compileUserPatterns,
   deriveVerifyTimeoutMs,
   detectOutputFailures,
+  expectedExportSmokeArtifact,
   normalizeFailureText,
   probeBaselines,
   resolveOutputFailurePatterns,
@@ -258,6 +260,23 @@ test("classifyVerifyFailure does not blame an already-failing baseline with unex
   );
   assert.equal(result.blamed, false);
   assert.equal(result.reason, "baseline-already-failing");
+});
+
+test("classifyVerifyFailure never blames a command that failed at baseline even when signatures drift", () => {
+  // FIELD-1: cargo test was already red at baseline; post-agent failure text
+  // often differs (reordering, different panic). That must NOT trigger a fix
+  // turn or downgrade status — it is pre-existing-failure.
+  const result = classifyVerifyFailure(
+    { signature: ["error: different failure after agent"], rawCount: 1 },
+    {
+      ok: false,
+      signature: ["error: original baseline failure"],
+      rawCount: 1,
+      timedOut: false
+    }
+  );
+  assert.equal(result.blamed, false);
+  assert.equal(result.reason, "pre-existing-failure");
 });
 
 test("classifyVerifyFailure blames unextractable output when the baseline actually passed", () => {
@@ -952,6 +971,63 @@ test("detectOutputFailures matches Blender's anchored python-failure marker only
     "ok - 12 tests passed"
   ].join("\n");
   assert.deepEqual(detectOutputFailures(passingWithTraceback, OUTPUT_FAILURE_PATTERNS.blender), []);
+});
+
+test("detectOutputFailures catches Blender unittest FAILED summaries and register() swallows", () => {
+  const unittestFailed = detectOutputFailures(
+    "FAILED (failures=6, errors=0)",
+    OUTPUT_FAILURE_PATTERNS.blender
+  );
+  assert.equal(unittestFailed.length, 1);
+  assert.equal(unittestFailed[0].id, "blender-unittest-failed");
+
+  const registerEx = detectOutputFailures(
+    "Exception in module register(): RuntimeError: register_class expected a subclass",
+    OUTPUT_FAILURE_PATTERNS.blender
+  );
+  assert.equal(registerEx.length, 1);
+  assert.equal(registerEx[0].id, "blender-register-exception");
+
+  const shimFailed = detectOutputFailures(
+    'GROK_BUILD_BLENDER_RESULT: {"tests":12,"failures":6,"errors":0}',
+    OUTPUT_FAILURE_PATTERNS.blender
+  );
+  assert.equal(shimFailed.length, 1);
+  assert.equal(shimFailed[0].id, "blender-shim-result-failed");
+});
+
+test("detectOutputFailures catches Godot SHADER ERROR and never promotes SHADER WARNING", () => {
+  const shaderErr = [
+    "SHADER ERROR: No matching function found for: 'nonexistent_function'.",
+    "ERROR: Shader compilation failed."
+  ].join("\n");
+  const matched = detectOutputFailures(shaderErr, OUTPUT_FAILURE_PATTERNS.godot);
+  assert.ok(matched.length >= 2, JSON.stringify(matched));
+  assert.ok(matched.some((m) => m.id === "godot-shader-error"));
+  assert.ok(matched.some((m) => m.id === "godot-shader-compile-failed"));
+
+  assert.deepEqual(
+    detectOutputFailures("SHADER WARNING: unused uniform", OUTPUT_FAILURE_PATTERNS.godot),
+    []
+  );
+});
+
+test("assertExportSmokeArtifact fails when the export file is missing or empty", () => {
+  const cwd = makeTempDir("export-smoke-");
+  const cmd = 'godot --headless --path . --export-release "Windows Desktop" .grok-build/export-smoke.exe';
+  assert.equal(expectedExportSmokeArtifact(cmd), ".grok-build/export-smoke.exe");
+  const missing = assertExportSmokeArtifact(cmd, cwd);
+  assert.equal(missing.ok, false);
+  assert.match(missing.message, /export produced no artifact/);
+
+  fs.mkdirSync(path.join(cwd, ".grok-build"), { recursive: true });
+  fs.writeFileSync(path.join(cwd, ".grok-build", "export-smoke.exe"), "");
+  const empty = assertExportSmokeArtifact(cmd, cwd);
+  assert.equal(empty.ok, false);
+
+  fs.writeFileSync(path.join(cwd, ".grok-build", "export-smoke.exe"), "pk\x03\x04fake");
+  const ok = assertExportSmokeArtifact(cmd, cwd);
+  assert.equal(ok.ok, true);
 });
 
 test("detectOutputFailures counts a line that trips two patterns once", () => {

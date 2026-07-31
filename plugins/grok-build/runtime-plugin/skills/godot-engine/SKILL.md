@@ -26,11 +26,16 @@ description: Godot-specific facts for isolated grok-build runs (uids, caches, he
 
 ## Headless verify (bridge-owned)
 
-- `godot --headless --path . --check-only` (Godot 4) parses scripts without a
-  full import — fast fail for syntax/type errors.
+- **Never** run bare `godot --headless --path . --check-only` without
+  `--script`. Godot's docs require `--check-only` with `--script`; without it
+  the flag is inert and Godot boots `run/main_scene` headlessly **forever**.
+- Bridge default (Godot 4):  
+  `godot --headless --path . --script res://.grok/plugins/grok-build-runtime/tools/grok_check.gd --quit`  
+  walks `res://`, loads every `.gd` / `.gdshader` / `.tscn` / `.tres`, and
+  quits with a real exit code.
 - `godot --headless --path . --import` **exits 0 while printing**
-  `SCRIPT ERROR:` / `Parse Error`. Exit code alone is not success; the bridge
-  reads the output.
+  `SCRIPT ERROR:` / `Parse Error` / `SHADER ERROR:`. Exit code alone is not
+  success; the bridge reads the output.
 - Godot 3 uses `--no-window` instead of `--headless`.
 - Never invent shell expansions like `${GODOT_BIN:-godot}` in commands.
 
