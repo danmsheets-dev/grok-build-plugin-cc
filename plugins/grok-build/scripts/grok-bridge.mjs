@@ -28,6 +28,7 @@ import {
   DEFAULT_CONTINUE_PROMPT,
   describeMissingBinary,
   detectCliBrand,
+  ensureHomeEnv,
   getGrokAuthStatus,
   getGrokAvailability,
   listGrokModels,
@@ -1004,6 +1005,29 @@ function formatIsolationHeaderLine(info = {}) {
  * Reconcile abandoned active jobs in this workspace so status stops lying.
  * Called from runs/show/stop/prune/wait before they report.
  */
+/**
+ * Tail of a background worker's crash stream, or null when it wrote nothing.
+ *
+ * Bounded: a worker that died screaming can have produced a lot of stderr, and
+ * this text is inlined into `runs` output. The tail is the part that carries
+ * the actual error - a stack's most specific frame is at the top, but the
+ * message that matters is at the end of the stream.
+ */
+export function readWorkerCrashDetail(workspaceRoot, jobId, options = {}) {
+  const maxChars = Number.isFinite(Number(options.maxChars)) ? Number(options.maxChars) : 1200;
+  let text = "";
+  try {
+    text = fs.readFileSync(resolveWorkerCrashLog(workspaceRoot, jobId), "utf8");
+  } catch {
+    return null;
+  }
+  const trimmed = text.trim();
+  if (!trimmed) {
+    return null;
+  }
+  return trimmed.length > maxChars ? `…${trimmed.slice(-maxChars)}` : trimmed;
+}
+
 function reconcileAbandonedInWorkspace(workspaceRoot, options = {}) {
   const jobs = listJobs(workspaceRoot);
   const results = [];
@@ -1012,7 +1036,8 @@ function reconcileAbandonedInWorkspace(workspaceRoot, options = {}) {
       claimImpl: claimJobTerminal,
       killImpl: options.killImpl,
       graceMs: options.graceMs,
-      now: options.now
+      now: options.now,
+      resolveCrashDetail: readWorkerCrashDetail
     });
     if (result) {
       results.push(result);
@@ -1101,6 +1126,40 @@ export function looksLikeUserQuestion(message) {
 }
 
 /**
+ * Did the brief itself tell the agent not to change anything?
+ *
+ * A write run is the only way to ask for an isolated worktree, so operators
+ * routinely use `--write` for read-only work - a smoke test, an audit, "list
+ * the files matching X and do not edit anything". Such a run changing zero
+ * files is the REQUESTED outcome, and flagging it as implausible taught
+ * supervisors to distrust the signal on the runs where it matters.
+ *
+ * Deliberately narrow: it matches explicit prohibitions, not any mention of
+ * reading. A brief that says "read the parser, then fix the bug" must still be
+ * held to producing an edit.
+ *
+ * @param {string|null|undefined} prompt
+ * @returns {boolean}
+ */
+export function promptForbidsEdits(prompt) {
+  const text = String(prompt ?? "");
+  if (!text.trim()) {
+    return false;
+  }
+  // The verb list carries its inflections explicitly ("without editing", "do
+  // not modify"), because the prohibition is as often a gerund as an infinitive.
+  const verb =
+    "(?:edit|edits|editing|modify|modifies|modifying|change|changes|changing|write|writes|writing|touch|touches|touching|alter|alters|altering)";
+  return new RegExp(
+    `\\b(?:do not|do n't|don't|dont|never|without|refrain from|avoid)\\s+(?:any\\s+)?${verb}\\b` +
+      "|\\bno\\s+(?:edits|changes|modifications|file changes)\\b" +
+      "|\\bread[- ]only\\b" +
+      "|\\bmake no changes\\b",
+    "i"
+  ).test(text);
+}
+
+/**
  * Cheap plausibility signal for write runs that finished impossibly fast with
  * no work (BRIDGE-1 bonus). Signal only — does not invent a terminal status.
  *
@@ -1109,12 +1168,17 @@ export function looksLikeUserQuestion(message) {
  *   durationMs?: number|null,
  *   changedFileCount?: number|null,
  *   toolCallCount?: number|null,
+ *   promptForbidsEdits?: boolean,
  *   env?: NodeJS.ProcessEnv
  * }} input
  * @returns {boolean}
  */
 export function detectImplausiblyShort(input = {}) {
   if (!input.write) {
+    return false;
+  }
+  // The brief asked for no edits and got none. That is the run succeeding.
+  if (input.promptForbidsEdits) {
     return false;
   }
   const env = input.env ?? process.env;
@@ -1988,15 +2052,23 @@ function buildDoctorReport(cwd, options = {}) {
       : "Authenticate the Grok CLI (run `grok` interactively), then verify with `grok models`."
   });
 
+  // main() has already run ensureHomeEnv, so by the time doctor reports, a
+  // Windows shell that arrived without HOME has one. Say which - reporting a
+  // bare "ok" for a value the bridge supplied would hide the fact that nothing
+  // in the user's own environment sets it, and the next tool they run by hand
+  // will still be missing it.
+  const homeFill = ensureHomeEnv(process.env);
   const homeSet = Boolean(process.env.HOME || process.env.GROK_HOME);
   checks.push({
     name: "HOME/GROK_HOME",
     ok: homeSet,
-    detail: homeSet
-      ? (process.env.GROK_HOME
-        ? `GROK_HOME=${process.env.GROK_HOME}`
-        : `HOME=${process.env.HOME}`)
-      : "neither HOME nor GROK_HOME is set",
+    detail: !homeSet
+      ? "neither HOME nor GROK_HOME is set"
+      : homeFill.defaulted
+        ? `HOME=${process.env.HOME} (defaulted from %USERPROFILE%; nothing in this shell sets HOME)`
+        : process.env.GROK_HOME
+          ? `GROK_HOME=${process.env.GROK_HOME}`
+          : `HOME=${process.env.HOME}`,
     fix: homeSet
       ? null
       : "Set HOME (on Windows, to %USERPROFILE%) because grok subcommands fail without it."
@@ -3611,7 +3683,14 @@ async function executeTaskRun(request) {
     // emits none of those - it is the bridge running the command, not the agent.
     request.onProgress?.({
       phase: "verifying",
-      message: `Verify baseline: measuring ${verifyCommands.length} command${verifyCommands.length === 1 ? "" : "s"} before the agent starts`
+      message:
+        `Verify baseline: measuring ${verifyCommands.length} command${verifyCommands.length === 1 ? "" : "s"} before the agent starts ` +
+        `(the agent has not launched yet; pass --no-verify-baseline to skip when the tree is already known green)`,
+      // The commands themselves, once, as a block rather than a line: on a
+      // Godot plan these are long and the operator needs to know WHICH of the
+      // four is the cold import they are waiting on.
+      logTitle: "Verify baseline plan",
+      logBody: verifyCommands.map((command, position) => `${position + 1}. ${command}`).join("\n")
     });
     // A generous cap, not the derived per-attempt timeout: this is the ONLY
     // chance to learn what was already broken before the agent touched
@@ -3645,7 +3724,10 @@ async function executeTaskRun(request) {
         // passing, and blame the agent for it the moment the real pass ran.
         maxOutputBytes: verifyTiming.maxOutputBytes ?? undefined,
         outputFailurePatterns,
-        ignorePatterns: verifyIgnorePatterns
+        ignorePatterns: verifyIgnorePatterns,
+        // Per-command narration. Without it the whole probe is one log line and
+        // then nothing for however long the slowest engine command takes.
+        onProgress: (event) => request.onProgress?.(event)
       });
     } finally {
       baselineLock?.release();
@@ -4622,6 +4704,7 @@ async function executeTaskRun(request) {
     durationMs,
     changedFileCount: effectiveChangedFileCount,
     toolCallCount,
+    promptForbidsEdits: promptForbidsEdits(request.prompt),
     env: process.env
   });
   // Refresh the log header now that session id + served model are known.
@@ -5111,7 +5194,20 @@ function buildTaskRunMetadata({ prompt, resumeLast = false }) {
 }
 
 function renderQueuedTaskLaunch(payload) {
-  return `${payload.title} started in the background as ${payload.jobId}. Check /grok-build:runs ${payload.jobId} for progress.\n`;
+  const lines = [
+    `${payload.title} started in the background as ${payload.jobId}. Check /grok-build:runs ${payload.jobId} for progress.`
+  ];
+  // Same disclosure as the JSON payload's verify.baseline: a queued run that
+  // spends its first minutes in a pre-agent baseline should say so while the
+  // operator is still looking at the launch output, not leave them to infer it
+  // from a stalled phase column later.
+  const baseline = payload.verify?.baseline;
+  if (baseline?.willRunBeforeAgent) {
+    lines.push(
+      `Before the agent starts, ${baseline.commandCount} verify command${baseline.commandCount === 1 ? "" : "s"} run as a baseline; on a cold engine cache this can take several minutes. Re-run with ${baseline.skipFlag} to skip it when the tree is already green.`
+    );
+  }
+  return `${lines.join("\n")}\n`;
 }
 
 function createBridgeJob({ prefix, kind, title, workspaceRoot, jobClass, summary, write = false }) {
@@ -5302,13 +5398,43 @@ async function runForegroundCommand(job, runner, options = {}) {
   return execution;
 }
 
+/**
+ * Where a background worker's own stdout/stderr go.
+ *
+ * `stdio: "ignore"` routed the worker's last words to the null device, so any
+ * failure that escaped runTrackedJob - a module-load error, an uncaught
+ * exception in a stream handler, an OOM - left a two-line log, no terminal
+ * claim, and literally nothing to debug from. Two identical 117-byte logs, one
+ * with HOME set and one without, is exactly what that looks like from the
+ * operator's seat.
+ *
+ * The stream is separate from the run log on purpose: it carries raw
+ * interpreter output (stack traces, native warnings) and must not be mistaken
+ * for the structured progress log that `runs` renders.
+ */
+export function resolveWorkerCrashLog(workspaceRoot, jobId) {
+  return path.join(path.dirname(resolveJobLogFile(workspaceRoot, jobId)), `${jobId}.worker.err`);
+}
+
 function spawnDetachedRunWorker(cwd, jobId) {
   const scriptPath = path.join(ROOT_DIR, "scripts", "grok-bridge.mjs");
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  let crashStdio = "ignore";
+  try {
+    // Opened here, in the parent, so the child never has to succeed at
+    // anything before its output has somewhere to land. If even this fails,
+    // fall back to the old behaviour rather than refusing to launch.
+    const fd = fs.openSync(resolveWorkerCrashLog(workspaceRoot, jobId), "a");
+    crashStdio = ["ignore", fd, fd];
+  } catch {
+    crashStdio = "ignore";
+  }
+
   const child = spawn(process.execPath, [scriptPath, "run-worker", "--cwd", cwd, "--job-id", jobId], {
     cwd,
     env: process.env,
     detached: true,
-    stdio: "ignore",
+    stdio: crashStdio,
     windowsHide: true
   });
   child.unref();
@@ -5360,6 +5486,17 @@ export function enqueueBackgroundJob(cwd, job, request, options = {}) {
     });
   }
 
+  // What the caller actually queued, answered at queue time.
+  //
+  // A background launch used to return an id and nothing about the work: a
+  // supervisor that queued a Godot write run had no way to know it had also
+  // queued a four-command pre-agent baseline that can run for minutes before
+  // the agent starts. The first sign was a run sitting in phase "verifying"
+  // with agentPid: null, which reads as a hang. Say so up front instead.
+  const verifyCommands = Array.isArray(request?.verifyCommands) ? request.verifyCommands : [];
+  const baselineSkipped = Boolean(request?.noVerifyBaseline);
+  const runsBaseline = verifyCommands.length > 0 && !baselineSkipped && request?.write !== false;
+
   return {
     payload: {
       jobId: job.id,
@@ -5368,7 +5505,19 @@ export function enqueueBackgroundJob(cwd, job, request, options = {}) {
       summary: job.summary,
       logFile,
       bridgePid: workerPid,
-      pid: workerPid
+      pid: workerPid,
+      verify: {
+        commandCount: verifyCommands.length,
+        commands: verifyCommands,
+        planSource: request?.verifyPlan?.source ?? null,
+        baseline: {
+          // True means: the agent does not start until these finish.
+          willRunBeforeAgent: runsBaseline,
+          commandCount: runsBaseline ? verifyCommands.length : 0,
+          skipped: baselineSkipped,
+          skipFlag: "--no-verify-baseline"
+        }
+      }
     },
     logFile
   };
@@ -6746,6 +6895,96 @@ async function readStoredJobWithRetry(workspaceRoot, jobId, options = {}) {
   return last;
 }
 
+/**
+ * Guarantee that a background worker's death is always explained.
+ *
+ * Every previous exit path out of this process except runTrackedJob's own
+ * try/catch was silent: the job file stayed "running" with a dead pid, and only
+ * the reconciler's generic "Run abandoned; process exited without a terminal
+ * claim." ever reached the user - a sentence that says a process died without
+ * saying why, which is what made two different failures indistinguishable in
+ * the field.
+ *
+ * Three nets, in the order they can fire:
+ *  - unhandledRejection / uncaughtException: the real error, with its stack,
+ *    into the run log AND the terminal claim.
+ *  - exit: a last-chance sweep for any other way out (an explicit exit deep in
+ *    a library, a fatal signal Node still runs handlers for). Synchronous by
+ *    necessity, which is why every write it performs is a *Sync call.
+ *
+ * All of it is best-effort: a failure to explain the failure must not itself
+ * throw, or the worker dies silently again for a new reason.
+ *
+ * @param {string} workspaceRoot
+ * @param {string} jobId
+ * @param {string|null} logFile
+ * @returns {() => void} disarm, called once the run claimed its own outcome
+ */
+function installWorkerCrashGuards(workspaceRoot, jobId, logFile) {
+  let armed = true;
+
+  const claimCrash = (label, error) => {
+    if (!armed) {
+      return;
+    }
+    armed = false;
+    const detail =
+      error instanceof Error
+        ? `${error.message}\n${error.stack ?? ""}`.trim()
+        : String(error ?? "unknown");
+    try {
+      appendLogBlock(logFile, `Background worker ${label}`, detail);
+    } catch {
+      // Nothing left to log with.
+    }
+    try {
+      claimJobTerminal(workspaceRoot, jobId, "failed", {
+        // The actual reason, not "abandoned". Truncated because errorMessage is
+        // rendered inline by `runs`; the full stack is in the log block above.
+        errorMessage: `Background worker ${label}: ${
+          error instanceof Error ? error.message : String(error ?? "unknown")
+        }`.slice(0, 2000),
+        phase: "failed",
+        bridgePid: null,
+        agentPid: null,
+        pid: null,
+        logFile
+      });
+    } catch {
+      // The reconciler remains the backstop.
+    }
+  };
+
+  const onUncaught = (error) => {
+    claimCrash("crashed", error);
+    process.exit(1);
+  };
+  const onRejection = (reason) => {
+    claimCrash("crashed", reason);
+    process.exit(1);
+  };
+  const onExit = (code) => {
+    if (!armed) {
+      return;
+    }
+    claimCrash(
+      "exited without completing",
+      new Error(`process exited with code ${code} before the run claimed an outcome`)
+    );
+  };
+
+  process.on("uncaughtException", onUncaught);
+  process.on("unhandledRejection", onRejection);
+  process.on("exit", onExit);
+
+  return () => {
+    armed = false;
+    process.off("uncaughtException", onUncaught);
+    process.off("unhandledRejection", onRejection);
+    process.off("exit", onExit);
+  };
+}
+
 async function handleTaskWorker(argv) {
   const { options } = parseCommandInput(argv, {
     valueOptions: ["cwd", "job-id"]
@@ -6755,16 +6994,33 @@ async function handleTaskWorker(argv) {
     throw new Error("Missing required --job-id for run-worker.");
   }
 
-  const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const storedJob = await readStoredJobWithRetry(workspaceRoot, options["job-id"]);
+  const jobId = String(options["job-id"]);
+  // Armed BEFORE the stored job is read: "the job file never appeared" and
+  // "the request payload was malformed" are themselves failures a background
+  // caller could previously only see as an empty log.
+  const disarmGuards = installWorkerCrashGuards(
+    workspaceRoot,
+    jobId,
+    resolveJobLogFile(workspaceRoot, jobId)
+  );
+
+  try {
+    return await runTaskWorker(workspaceRoot, jobId);
+  } finally {
+    disarmGuards();
+  }
+}
+
+async function runTaskWorker(workspaceRoot, jobId) {
+  const storedJob = await readStoredJobWithRetry(workspaceRoot, jobId);
   if (!storedJob) {
-    throw new Error(`No stored job found for ${options["job-id"]}.`);
+    throw new Error(`No stored job found for ${jobId}.`);
   }
 
   const request = storedJob.request;
   if (!request || typeof request !== "object") {
-    throw new Error(`Stored job ${options["job-id"]} is missing its run request payload.`);
+    throw new Error(`Stored job ${jobId} is missing its run request payload.`);
   }
 
   const { logFile, progress } = createTrackedProgress(
@@ -7233,6 +7489,13 @@ function handleModels(argv) {
 }
 
 async function main() {
+  // Before any subcommand, including the detached worker: the CLI cannot read
+  // its own credentials or session store without HOME, and Windows shells do
+  // not set one. Doing it here rather than per-command means the value is also
+  // inherited by every process this one spawns - the agent CLI, verify
+  // commands, git - which is the point.
+  ensureHomeEnv(process.env);
+
   const [subcommand, ...argv] = process.argv.slice(2);
   if (!subcommand || subcommand === "help" || subcommand === "--help" || subcommand === "-h") {
     printUsage();

@@ -151,19 +151,43 @@ function normalizeProgressEvent(value) {
   };
 }
 
+/**
+ * Append to a run log, surviving Windows sharing conflicts.
+ *
+ * The job log is read live by `runs`/`show` and tailed by operators, and on
+ * Windows an open reader can make appendFileSync fail with EPERM/EBUSY. A
+ * dropped log line is a nuisance; an exception here is fatal, because most
+ * callers are inside child-process stream handlers where a throw is uncaught.
+ * Retry briefly, then give up quietly.
+ */
+function appendLogRaw(logFile, text) {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    try {
+      fs.appendFileSync(logFile, text, "utf8");
+      return;
+    } catch (error) {
+      if (error?.code !== "EPERM" && error?.code !== "EACCES" && error?.code !== "EBUSY") {
+        return;
+      }
+      const buffer = new SharedArrayBuffer(4);
+      Atomics.wait(new Int32Array(buffer), 0, 0, 5);
+    }
+  }
+}
+
 export function appendLogLine(logFile, message) {
   const normalized = String(message ?? "").trim();
   if (!logFile || !normalized) {
     return;
   }
-  fs.appendFileSync(logFile, `[${nowIso()}] ${redactSecrets(normalized)}\n`, "utf8");
+  appendLogRaw(logFile, `[${nowIso()}] ${redactSecrets(normalized)}\n`);
 }
 
 export function appendLogBlock(logFile, title, body) {
   if (!logFile || !body) {
     return;
   }
-  fs.appendFileSync(logFile, `\n[${nowIso()}] ${title}\n${redactSecrets(String(body).trimEnd())}\n`, "utf8");
+  appendLogRaw(logFile, `\n[${nowIso()}] ${title}\n${redactSecrets(String(body).trimEnd())}\n`);
 }
 
 export function createJobLogFile(workspaceRoot, jobId, title) {
@@ -315,6 +339,27 @@ export function createJobProgressUpdater(workspaceRoot, jobId, options = {}) {
     return Number.isFinite(value) ? value : lastRefreshAt;
   };
 
+  // Bookkeeping must never be able to kill the run it is reporting on.
+  //
+  // This updater is called from inside the CLI child's stdout/'close' handlers,
+  // so a throw here is an UNCAUGHT EXCEPTION, not a rejected promise: it walks
+  // straight past runTrackedJob's catch, past main()'s catch, and terminates
+  // the process. In a detached background worker (stdio: "ignore") that exit is
+  // completely silent - no terminal claim, no error line, a log frozen at
+  // whatever was appended just before. That is precisely the "abandoned; process
+  // exited without a terminal claim" report, and its trigger was a Windows
+  // rename losing to a concurrent `runs` poll. writeFileAtomic no longer loses
+  // that race, but the invariant is worth enforcing where it is cheap: a failed
+  // status patch costs a stale field, never the run.
+  const safePatch = (root, id, value) => {
+    try {
+      patchImpl(root, id, value);
+    } catch {
+      // Intentionally swallowed. The next event patches again; the heartbeat
+      // and the terminal claim are independent of this call.
+    }
+  };
+
   return (event) => {
     const normalized = normalizeProgressEvent(event);
     const patch = {};
@@ -356,13 +401,13 @@ export function createJobProgressUpdater(workspaceRoot, jobId, options = {}) {
         return;
       }
       lastRefreshAt = now;
-      patchImpl(workspaceRoot, jobId, { lastEventAt: nowIso() });
+      safePatch(workspaceRoot, jobId, { lastEventAt: nowIso() });
       return;
     }
 
     lastRefreshAt = now;
     patch.lastEventAt = nowIso();
-    patchImpl(workspaceRoot, jobId, patch);
+    safePatch(workspaceRoot, jobId, patch);
   };
 }
 
@@ -371,15 +416,25 @@ export function createProgressReporter({ stderr = false, logFile = null, onEvent
     return null;
   }
 
+  // Same reasoning as createJobProgressUpdater's safePatch: this reporter runs
+  // inside child-process stream handlers, so anything it throws is an uncaught
+  // exception that kills the run. Logging and status are observability; losing
+  // a line is a nuisance, losing the run is a lost hour of agent work. Note
+  // process.stderr.write is in here too - a detached worker's stderr is a
+  // closed/ignored handle, and writing to one can raise EPIPE/EBADF.
   return (eventOrMessage) => {
-    const event = normalizeProgressEvent(eventOrMessage);
-    const stderrMessage = event.stderrMessage ?? event.message;
-    if (stderr && stderrMessage) {
-      process.stderr.write(`[grok-cc] ${stderrMessage}\n`);
+    try {
+      const event = normalizeProgressEvent(eventOrMessage);
+      const stderrMessage = event.stderrMessage ?? event.message;
+      if (stderr && stderrMessage) {
+        process.stderr.write(`[grok-cc] ${stderrMessage}\n`);
+      }
+      appendLogLine(logFile, event.message);
+      appendLogBlock(logFile, event.logTitle, event.logBody);
+      onEvent?.(event);
+    } catch {
+      // See above: progress reporting never fails a run.
     }
-    appendLogLine(logFile, event.message);
-    appendLogBlock(logFile, event.logTitle, event.logBody);
-    onEvent?.(event);
   };
 }
 

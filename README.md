@@ -96,6 +96,30 @@ Write policy layering:
 - `/grok-build:stop` terminates **both** process trees when present (agent then bridge/worker).
 - If you do not pass `--model` or `--effort`, Grok chooses its own defaults.
 
+#### Pre-agent verify baseline
+
+A **write** run with a verify plan measures that plan once *before* the agent starts, so
+failures that were already present are never blamed on the run. On an engine project with a
+cold cache (Godot's first `--import`, a fresh `cargo build`) that baseline can run for
+minutes while `agentPid` is still `null`.
+
+- The launch output and `run --json` both report it up front, under `verify.baseline`.
+- Each command is logged as it starts and as it finishes, with its duration and whether it
+  was already passing.
+- Pass `--no-verify-baseline` to skip it when you have just verified the tree yourself.
+  Verification then becomes strict: with no baseline to compare against, **every** failure
+  counts as this run's.
+
+#### Background runs and concurrent polling
+
+The `run --background` + poll `runs` loop is safe to drive as fast as you like. Job records
+are written with a contended-rename retry and read with a torn-read retry, because Windows
+refuses a rename over any file another process has open — and the poller is that process.
+
+If a background worker ever does die, it now says why: its interpreter output is captured to
+`<state-dir>/jobs/<run-id>.worker.err`, and the run's `errorMessage` carries the tail of it
+rather than only "Run abandoned; process exited without a terminal claim."
+
 ### `/grok-build:import`
 
 Import the current Claude transcript into Grok:
@@ -156,6 +180,7 @@ Kills every distinct pid among `agentPid` (detached grok child) and `bridgePid` 
 | `CLAUDE_PLUGIN_DATA` | Plugin data root; state lives under `.../state` |
 | `CLAUDE_ENV_FILE` | Host env file for session hooks |
 | `CLAUDE_PROJECT_DIR` | Project directory from the host |
+| `HOME` / `GROK_HOME` | Where the CLI keeps config, credentials and sessions. On Windows the bridge defaults both to `%USERPROFILE%` when neither is set; an explicit value is never overwritten. |
 
 State fallback when `CLAUDE_PLUGIN_DATA` is unset: `$TMPDIR/grok-cc-runs`.
 

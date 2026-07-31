@@ -20,6 +20,9 @@ export const DEFAULT_CONTINUE_PROMPT =
 const DEFAULT_BINARY = "grok";
 const BINARY_ENV = "GROK_BINARY";
 
+/** The HOME value THIS process supplied, when the environment carried none. */
+let appliedHomeDefault = null;
+
 // How much raw stdout is shown when the streaming parser recognized nothing at
 // all. Enough to carry a final answer and the context around it; small enough
 // that a run which streamed megabytes of an unknown format does not push all of
@@ -32,6 +35,67 @@ export function resolveGrokBinary(env = process.env) {
     return String(override).trim();
   }
   return DEFAULT_BINARY;
+}
+
+/**
+ * Give the CLI a HOME on Windows.
+ *
+ * The Grok/Hyper CLIs resolve their config, credentials and session store off
+ * HOME. Windows does not set it - `%USERPROFILE%` is the equivalent - and
+ * whether a shell happens to define one is luck: Git Bash and WSL do, cmd.exe,
+ * PowerShell, most CI runners and most agent tool-shells do not.
+ *
+ * doctor already DETECTED this and printed the right fix. That was the whole
+ * problem: it diagnosed a fatal condition and then let `run` queue a job
+ * anyway, so the operator got a job id for a run that could not work. Detecting
+ * a fixable environment defect and not fixing it is the worst of both.
+ *
+ * Only ever fills a blank - an explicit HOME or GROK_HOME is the user's choice
+ * and is left exactly as it is.
+ *
+ * @param {NodeJS.ProcessEnv} [env] mutated in place
+ * @returns {{ applied: boolean, home: string|null, source: string|null }}
+ */
+export function ensureHomeEnv(env = process.env, platform = process.platform) {
+  const existing = env.HOME ?? env.GROK_HOME;
+  if (existing && String(existing).trim()) {
+    // Idempotent by design - main() fills HOME once at startup and doctor asks
+    // again later to report on it. Without this the second caller would see a
+    // set HOME and report the user's environment as healthy, when in fact it
+    // was this process that supplied the value and nothing outside it has one.
+    if (appliedHomeDefault && appliedHomeDefault === String(existing).trim()) {
+      return { applied: false, home: appliedHomeDefault, source: "USERPROFILE", defaulted: true };
+    }
+    return {
+      applied: false,
+      home: String(existing).trim(),
+      source: env.HOME ? "HOME" : "GROK_HOME",
+      defaulted: false
+    };
+  }
+  if (platform !== "win32") {
+    // On POSIX an absent HOME is a genuinely broken environment rather than a
+    // platform default, and there is no second variable to derive it from.
+    return { applied: false, home: null, source: null, defaulted: false };
+  }
+  const profile = env.USERPROFILE ?? (env.HOMEDRIVE && env.HOMEPATH ? `${env.HOMEDRIVE}${env.HOMEPATH}` : null);
+  if (!profile || !String(profile).trim()) {
+    return { applied: false, home: null, source: null, defaulted: false };
+  }
+  const home = String(profile).trim();
+  env.HOME = home;
+  // GROK_HOME too: the CLI prefers it when set, and leaving it blank while
+  // filling HOME would make the two disagree for anything reading either.
+  if (!env.GROK_HOME || !String(env.GROK_HOME).trim()) {
+    env.GROK_HOME = home;
+  }
+  appliedHomeDefault = home;
+  return { applied: true, home, source: "USERPROFILE", defaulted: true };
+}
+
+/** Test seam: forget that this process supplied a HOME default. */
+export function resetHomeEnvDefaultForTests() {
+  appliedHomeDefault = null;
 }
 
 export function runGrok(args = [], options = {}) {

@@ -325,6 +325,107 @@ export function collectUidReferences(root, options = {}) {
 }
 
 /**
+ * Collect uid tokens declared by Godot's importer in `*.import` sidecars.
+ *
+ * These are the second half of a Godot 4 project's uid namespace: `.uid` files
+ * cover scripts and hand-authored resources, `.import` files cover everything
+ * the importer owns (textures, audio, fonts, meshes). A dangling-reference
+ * check that reads only the first half declares the second half broken.
+ *
+ * @param {string} root
+ * @param {{ readdirSync?: typeof fs.readdirSync, readFileSync?: typeof fs.readFileSync, maxDepth?: number }} [options]
+ * @returns {Set<string>}
+ */
+export function collectImportedUidTokens(root, options = {}) {
+  return collectUidTokensOnDisk(root, { ...options, extensions: [".import"] });
+}
+
+/**
+ * Every uid token DECLARED anywhere on disk: `.uid` companions and `.import`
+ * sidecars alike.
+ *
+ * Deliberately does not reuse snapshotUidFiles' skip list. That list exists for
+ * change ATTRIBUTION - it drops vendored add-ons (`addons/gut`,
+ * `addons/gdUnit4`) so a run is never blamed for third-party churn. Reusing it
+ * here made the two halves of the dangling check asymmetric: references were
+ * collected from inside those add-ons (collectUidReferences never skipped
+ * them), while the uids that satisfy those references were not. On a GUT
+ * project that alone manufactures dozens of dangling reports.
+ *
+ * "What exists on disk" must be answered over the whole tree. Which changes are
+ * the run's fault is a separate question, answered elsewhere.
+ *
+ * @param {string} root
+ * @param {{
+ *   readdirSync?: typeof fs.readdirSync,
+ *   readFileSync?: typeof fs.readFileSync,
+ *   maxDepth?: number,
+ *   extensions?: string[]
+ * }} [options]
+ * @returns {Set<string>}
+ */
+export function collectUidTokensOnDisk(root, options = {}) {
+  const readdirSync = options.readdirSync ?? fs.readdirSync;
+  const readFileSync = options.readFileSync ?? fs.readFileSync;
+  const maxDepth = Number.isFinite(options.maxDepth) ? options.maxDepth : 12;
+  const suffixes = Array.isArray(options.extensions) ? options.extensions : [".uid", ".import"];
+  const tokens = new Set();
+  // VCS/tooling noise only.
+  const skip = new Set([".git", "node_modules", ".grok-build", ".grok"]);
+
+  function walk(dir, depth) {
+    if (depth > maxDepth) {
+      return;
+    }
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const name = typeof entry === "string" ? entry : String(entry?.name ?? "");
+      if (!name || name === "." || name === "..") {
+        continue;
+      }
+      const childPath = path.join(dir, name);
+      const isDir =
+        typeof entry !== "string" && typeof entry?.isDirectory === "function"
+          ? entry.isDirectory()
+          : false;
+      if (isDir) {
+        // `.godot/` is skipped as a directory but is also where the editor
+        // keeps its own uid cache; the .import sidecars live beside the assets.
+        if (name.startsWith(".") || skip.has(name)) {
+          continue;
+        }
+        walk(childPath, depth + 1);
+        continue;
+      }
+      if (!suffixes.some((suffix) => name.endsWith(suffix))) {
+        continue;
+      }
+      let text;
+      try {
+        text = String(readFileSync(childPath, "utf8") ?? "");
+      } catch {
+        continue;
+      }
+      const re = /uid:\/\/[A-Za-z0-9_]+/g;
+      let match;
+      while ((match = re.exec(text)) !== null) {
+        tokens.add(match[0]);
+      }
+    }
+  }
+
+  if (root) {
+    walk(path.resolve(String(root)), 0);
+  }
+  return tokens;
+}
+
+/**
  * Compare a before-snapshot of `*.uid` files to the tree after an isolated run.
  *
  * A deleted or rewritten `.uid` is the single most damaging silent failure in
@@ -376,7 +477,23 @@ export function checkUidIntegrity(before, root, options = {}) {
     }
   }
 
-  const knownTokens = new Set();
+  // Two independent reasons a healthy project reported dangling references,
+  // both fixed by asking the whole tree what uids actually exist:
+  //
+  //  1. Imported assets have no `.uid` companion at all. A texture, sound or
+  //     font is assigned its uid by the importer, which records it in
+  //     `<asset>.import`. Every scene referencing one carried a token no `.uid`
+  //     file could ever match.
+  //  2. `after` comes from snapshotUidFiles, which skips vendored add-ons for
+  //     change-attribution reasons - while collectUidReferences reads inside
+  //     them. References from `addons/gut` were compared against a token set
+  //     that excluded `addons/gut`.
+  //
+  // Together those are the reported "55 dangling uid:// refs" on a project that
+  // passes its own --import and full suite.
+  const knownTokens = collectUidTokensOnDisk(root, options);
+  // The snapshot's own tokens still count: it may have read a `.uid` that the
+  // disk scan's skip list or depth cap did not reach.
   for (const body of after.values()) {
     const token = parseUidToken(body);
     if (token) {

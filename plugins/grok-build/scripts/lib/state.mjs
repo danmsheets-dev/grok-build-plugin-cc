@@ -75,6 +75,27 @@ export function ensureStateDir(cwd) {
   fs.mkdirSync(resolveJobsDir(cwd), { recursive: true });
 }
 
+// Windows only ever lets ONE handle rename over an existing file, and every
+// concurrent reader holds one. Measured directly on Win10 with four reader
+// processes doing plain readFileSync in a loop against one writer doing
+// write-temp-then-rename: 43 renames succeeded and 15,802 failed with EPERM.
+// The readers never failed - the WRITER is the victim.
+//
+// That is not a theoretical race, it is the documented `run --background` +
+// poll `runs` workflow: the supervisor's poll loop is the reader, the detached
+// worker is the writer, and every job-file write the worker attempts while a
+// poll is in flight throws. The throw escaped through the progress updater
+// (called from a child-process 'close' handler, so an uncaught exception rather
+// than a rejected promise) and killed the worker silently, mid-run, with no
+// terminal claim and a log frozen at whatever line was appended last.
+//
+// Retry the rename rather than the whole write: the temp file is already on
+// disk and correct, only the publish step is contended. The sharing conflict
+// clears as soon as the reader closes its handle, which is microseconds.
+const RENAME_MAX_ATTEMPTS = 60;
+const RENAME_RETRY_MS = 5;
+const RENAME_CONTENTION_CODES = new Set(["EPERM", "EACCES", "EBUSY", "ENOTEMPTY"]);
+
 function writeFileAtomic(filePath, content) {
   const dir = path.dirname(filePath);
   fs.mkdirSync(dir, { recursive: true });
@@ -83,7 +104,41 @@ function writeFileAtomic(filePath, content) {
     `.${path.basename(filePath)}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`
   );
   fs.writeFileSync(tempPath, content, "utf8");
-  fs.renameSync(tempPath, filePath);
+
+  let lastError = null;
+  for (let attempt = 0; attempt < RENAME_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      fs.renameSync(tempPath, filePath);
+      return;
+    } catch (error) {
+      if (!RENAME_CONTENTION_CODES.has(error?.code)) {
+        try {
+          fs.unlinkSync(tempPath);
+        } catch {
+          // Best effort; the real error below is what matters.
+        }
+        throw error;
+      }
+      lastError = error;
+      sleepMs(RENAME_RETRY_MS);
+    }
+  }
+
+  // Every retry lost the race. Publishing the content matters more than
+  // publishing it atomically: a reader that catches a torn read retries (see
+  // readJobFileIfPresent / loadState), but a run whose terminal claim never
+  // lands is lost forever. Write in place as the last resort.
+  try {
+    fs.writeFileSync(filePath, content, "utf8");
+  } catch {
+    throw lastError;
+  } finally {
+    try {
+      fs.unlinkSync(tempPath);
+    } catch {
+      // Leftover temp files are swept by prune; never fail a write over one.
+    }
+  }
 }
 
 // Confirmed directly: a lock file left behind by a crashed process (no PID,
@@ -442,38 +497,61 @@ export function loadState(cwd) {
     return defaultState();
   }
 
+  // Same publish race as readJobFile, with a sharper edge: the failure branch
+  // below QUARANTINES the file (renames it out of the way). A torn read caught
+  // mid-write would therefore not just fail one command, it would move every
+  // run record in the workspace aside and report the state as corrupt. So the
+  // read is exhausted first, and only content that stays unparseable for the
+  // whole window is treated as genuinely corrupt.
   let raw = "";
-  try {
-    raw = fs.readFileSync(stateFile, "utf8");
-  } catch (error) {
-    throw new Error(`Failed to read bridge state file ${stateFile}: ${error.message}`);
-  }
-
-  if (!raw.trim()) {
-    return defaultState();
-  }
-
-  try {
-    const parsed = JSON.parse(raw);
-    return {
-      ...defaultState(),
-      ...parsed,
-      config: {
-        ...defaultState().config,
-        ...(parsed.config ?? {})
-      },
-      jobs: Array.isArray(parsed.jobs) ? parsed.jobs : []
-    };
-  } catch (error) {
-    const quarantinePath = `${stateFile}.corrupt-${Date.now()}`;
+  let readError = null;
+  let parseError = null;
+  for (let attempt = 0; attempt < READ_MAX_ATTEMPTS; attempt += 1) {
     try {
-      fs.renameSync(stateFile, quarantinePath);
-    } catch {
+      raw = fs.readFileSync(stateFile, "utf8");
+      readError = null;
+    } catch (error) {
+      if (!READ_CONTENTION_CODES.has(error?.code)) {
+        throw new Error(`Failed to read bridge state file ${stateFile}: ${error.message}`);
+      }
+      readError = error;
+      sleepMs(READ_RETRY_MS);
+      continue;
     }
-    throw new Error(
-      `Bridge state file is corrupt and was quarantined${quarantinePath ? ` to ${quarantinePath}` : ""}: ${error.message}`
-    );
+
+    if (!raw.trim()) {
+      return defaultState();
+    }
+
+    try {
+      const parsed = JSON.parse(raw);
+      return {
+        ...defaultState(),
+        ...parsed,
+        config: {
+          ...defaultState().config,
+          ...(parsed.config ?? {})
+        },
+        jobs: Array.isArray(parsed.jobs) ? parsed.jobs : []
+      };
+    } catch (error) {
+      parseError = error;
+      sleepMs(READ_RETRY_MS);
+    }
   }
+
+  if (readError) {
+    throw new Error(`Failed to read bridge state file ${stateFile}: ${readError.message}`);
+  }
+
+  const quarantinePath = `${stateFile}.corrupt-${Date.now()}`;
+  try {
+    fs.renameSync(stateFile, quarantinePath);
+  } catch {
+  }
+  throw new Error(
+    `Bridge state file is corrupt and was quarantined${quarantinePath ? ` to ${quarantinePath}` : ""}: ${parseError?.message ?? "unparseable"}`
+  );
 }
 
 // Confirmed in the field: a repo with heavy grok-build usage (dozens of write
@@ -628,8 +706,35 @@ export function writeJobFile(cwd, jobId, payload) {
   return jobFile;
 }
 
+// The other half of the Windows publish race. A reader can arrive in the
+// instant between unlink and rename (ENOENT), while the target handle is being
+// swapped (EPERM/EBUSY), or - when writeFileAtomic fell back to an in-place
+// write - part-way through the new bytes (JSON.parse SyntaxError). None of
+// those mean the record is gone or corrupt; they mean "come back in a
+// millisecond". Only a read that keeps failing for the whole window is real.
+// ~200ms of patience. The contended window is normally microseconds (a reader
+// closing its handle), but a loaded machine can stretch a writer's fallback
+// write well past that, and the cost of waiting is paid only on the path that
+// would otherwise have failed outright.
+const READ_MAX_ATTEMPTS = 40;
+const READ_RETRY_MS = 5;
+const READ_CONTENTION_CODES = new Set(["EPERM", "EACCES", "EBUSY", "ENOENT"]);
+
 export function readJobFile(jobFile) {
-  return JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  let lastError = null;
+  for (let attempt = 0; attempt < READ_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      return JSON.parse(fs.readFileSync(jobFile, "utf8"));
+    } catch (error) {
+      const retryable = READ_CONTENTION_CODES.has(error?.code) || error instanceof SyntaxError;
+      if (!retryable) {
+        throw error;
+      }
+      lastError = error;
+      sleepMs(READ_RETRY_MS);
+    }
+  }
+  throw lastError;
 }
 
 function removeJobFile(jobFile) {

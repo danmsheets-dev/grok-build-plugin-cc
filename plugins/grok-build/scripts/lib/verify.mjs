@@ -526,9 +526,24 @@ export async function runVerifyCommand(command, cwd, options = {}) {
 export async function probeBaselines(commands, cwd, options = {}) {
   const runVerifyCommandImpl = options.runVerifyCommandImpl ?? runVerifyCommand;
   const baselines = [];
+  // The baseline runs BEFORE the agent, in the bridge, and emits none of the
+  // agent's own progress events. On a Godot repo the default plan is four
+  // commands, one of which is a cold `--import` against a private cache: from
+  // the operator's seat that was one log line followed by several minutes of
+  // total silence with `agentPid: null`, which is indistinguishable from a
+  // hang. Report each command as it starts and as it lands, with its duration
+  // and verdict, so the silence is accounted for while it is happening.
+  const onProgress = typeof options.onProgress === "function" ? options.onProgress : null;
+  const total = (commands ?? []).length;
+  let index = 0;
 
   for (const command of commands ?? []) {
+    index += 1;
     const started = Date.now();
+    onProgress?.({
+      phase: "verifying",
+      message: `Verify baseline ${index}/${total}: running ${command}`
+    });
     // The output budget, the failure patterns, the ignore list and the
     // ENVIRONMENT all have to match the post-agent pass. A baseline captured
     // under a tighter bound (or without the pattern set that makes an exit-0
@@ -576,9 +591,42 @@ export async function probeBaselines(commands, cwd, options = {}) {
       elidedBytes: Number(probe?.elidedBytes) || 0,
       commandNotFound: Boolean(probe?.commandNotFound)
     });
+
+    // Verdict included, not just timing: "already failing" is the single most
+    // useful thing to know while the baseline is still running, because it
+    // tells the operator up front which post-agent failures will be attributed
+    // to the run and which were already there.
+    const verdict = probe?.timedOut
+      ? "timed out"
+      : probe?.commandNotFound
+        ? "command not found"
+        : probe?.ok
+          ? "already passing"
+          : "already failing";
+    onProgress?.({
+      phase: "verifying",
+      message: `Verify baseline ${index}/${total}: ${verdict} in ${formatDurationMs(ms)}`
+    });
   }
 
   return baselines;
+}
+
+/** Human duration for progress lines: ms under a second, else seconds. */
+function formatDurationMs(ms) {
+  const value = Number(ms);
+  if (!Number.isFinite(value) || value < 0) {
+    return "unknown time";
+  }
+  if (value < 1000) {
+    return `${Math.round(value)}ms`;
+  }
+  if (value < 60_000) {
+    return `${(value / 1000).toFixed(1)}s`;
+  }
+  const minutes = Math.floor(value / 60_000);
+  const seconds = Math.round((value % 60_000) / 1000);
+  return `${minutes}m ${seconds}s`;
 }
 
 /**

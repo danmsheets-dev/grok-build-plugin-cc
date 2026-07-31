@@ -201,7 +201,13 @@ export function shouldReconcileAbandoned(job = {}, options = {}) {
  *
  * @param {string} workspaceRoot
  * @param {object} job
- * @param {{ claimImpl?: Function, killImpl?: Function, graceMs?: number, now?: number }} [options]
+ * @param {{
+ *   claimImpl?: Function,
+ *   killImpl?: Function,
+ *   graceMs?: number,
+ *   now?: number,
+ *   resolveCrashDetail?: (workspaceRoot: string, jobId: string) => string|null
+ * }} [options]
  */
 export function reconcileAbandonedJob(workspaceRoot, job, options = {}) {
   if (!job?.id || !shouldReconcileAbandoned(job, options)) {
@@ -218,8 +224,21 @@ export function reconcileAbandonedJob(workspaceRoot, job, options = {}) {
       reason: "no-claim-impl"
     };
   }
+  // "Abandoned" names the symptom, never the cause, and on its own it sent
+  // operators to a log that stops mid-sentence. When the worker left anything
+  // on its crash stream, that text IS the cause - carry it into the claim so
+  // the run record answers "why" without a support round trip.
+  let crashDetail = null;
+  if (typeof options.resolveCrashDetail === "function") {
+    try {
+      crashDetail = options.resolveCrashDetail(workspaceRoot, job.id);
+    } catch {
+      crashDetail = null;
+    }
+  }
+  const base = "Run abandoned; process exited without a terminal claim.";
   return claimImpl(workspaceRoot, job.id, "failed", {
-    errorMessage: "Run abandoned; process exited without a terminal claim.",
+    errorMessage: crashDetail ? `${base} Worker output: ${crashDetail}` : base,
     phase: "failed",
     bridgePid: null,
     agentPid: null,
