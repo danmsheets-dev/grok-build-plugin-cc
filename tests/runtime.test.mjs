@@ -846,6 +846,37 @@ process.exit(1);
   }
 });
 
+test("a trusted auto-derived test script that is red at baseline is dropped as pre-existing noise", () => {
+  const repo = makeTempDir("grok-auto-drop-");
+  const binDir = makeTempDir("grok-auto-drop-bin-");
+  const pluginDataDir = makeTempDir("grok-auto-drop-data-");
+  installFakeGrok(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(
+    path.join(repo, "package.json"),
+    JSON.stringify({ name: "red-on-arrival", scripts: { test: "node -e process.exit(1)" } })
+  );
+  run("git", ["add", "package.json"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const env = pluginDataEnv(pluginDataDir, binDir);
+  const trusted = run("node", [SCRIPT, "trust-config"], { cwd: repo, env });
+  assert.equal(trusted.status, 0, trusted.stderr || trusted.stdout);
+
+  const result = run("node", [SCRIPT, "run", "--write", "--json", "do work"], {
+    cwd: repo,
+    env
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(payload.verify.commands, []);
+  assert.equal(payload.verify.dropped.length, 1);
+  assert.match(payload.verify.dropped[0].command, /npm test/);
+  assert.match(
+    (payload.statusLines ?? []).join("\n"),
+    /dropped .*auto-derived command/i
+  );
+});
+
 test("bogus --verify-attempts still yields a definite verified boolean", () => {
   const repo = makeTempDir("grok-verify-attempts-");
   const binDir = makeTempDir("grok-verify-attempts-bin-");
@@ -1869,8 +1900,10 @@ test("a project config can trade the shared Godot cache for a private copy", () 
     `expected a seeded uid_cache.bin, got ${JSON.stringify(payload.provision)}`
   );
   assert.ok(
-    !payload.provision.provisioned.some((entry) => entry.name === ".godot"),
-    "the .godot junction must not have been created at all"
+    !payload.provision.provisioned.some(
+      (entry) => entry.name === ".godot" && entry.kind !== "mkdir"
+    ),
+    "the private .godot cache must not be linked into the working copy"
   );
 
   const worktreeGodot = path.join(payload.worktree.path, ".godot");
@@ -1990,6 +2023,32 @@ test("a write run that produced only build artifacts says so, rather than going 
   assert.match(
     result.stdout,
     /Changed files \(worktree\): none \((?:run produced only excluded build artifacts|nothing was written)\)/
+  );
+});
+
+test("a non-isolated write run reports agent debris prominently", () => {
+  const repo = makeTempDir("grok-debris-");
+  const binDir = makeTempDir("grok-debris-bin-");
+  const pluginDataDir = makeTempDir("grok-debris-data-");
+  installFakeGrok(binDir, "writes-files");
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "# seed\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+
+  const result = run("node", [SCRIPT, "run", "--write", "--no-isolate", "--no-verify", "--json", "do work"], {
+    cwd: repo,
+    env: pluginDataEnv(pluginDataDir, binDir, {
+      FAKE_GROK_WRITE_FILES: JSON.stringify({ "import_title_screen.log": "log\n" })
+    })
+  });
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  const payload = JSON.parse(result.stdout);
+  assert.ok(payload.debris.total >= 1, JSON.stringify(payload.debris));
+  assert.ok(payload.debris.entries.some((entry) => String(entry).includes("import_title_screen")));
+  assert.match(
+    (payload.statusLines ?? []).join("\n"),
+    /Debris: .*import_title_screen/i
   );
 });
 

@@ -1,5 +1,6 @@
 import { test, describe, beforeEach, assert, mock } from "node:test";
 import assertModule from "node:assert";
+import { spawnSync } from "node:child_process";
 import path from "node:path";
 import fs from "node:fs";
 
@@ -39,6 +40,7 @@ import { makeTempDir } from "./helpers.mjs";
  */
 const realFs = {
   existsSync: fs.existsSync,
+  lstatSync: fs.lstatSync,
   statSync: fs.statSync,
   mkdirSync: fs.mkdirSync,
   readdirSync: fs.readdirSync,
@@ -131,7 +133,33 @@ describe("planWorktreeLinks", () => {
     assertModule.ok(!plan.sharedDirs.includes("node_modules"));
   });
 
-  test("includes PROVISION_LINK_DIRS entries when they exist as directories", () => {
+  test("an explicit CARGO_TARGET_DIR outranks the private provisioning default", () => {
+    const explicit = "H:\\gb-work\\cargo-target-c1";
+    const plan = planWorktreeLinks("/repo", "/wt", {
+      platform: "win32",
+      existsSync: (p) => String(p).endsWith("Cargo.toml"),
+      statSync: () => ({ isDirectory: () => false, isFile: () => true }),
+      env: { CARGO_TARGET_DIR: explicit }
+    });
+    assertModule.equal(plan.env.CARGO_TARGET_DIR, explicit);
+    assertModule.ok(
+      plan.notes.some((note) => /explicit CARGO_TARGET_DIR/i.test(note) && /default not used/i.test(note)),
+      JSON.stringify(plan.notes)
+    );
+  });
+
+  test("project-config CARGO_TARGET_DIR also outranks the provisioning default", () => {
+    const explicit = "/warm/cargo-target";
+    const plan = planWorktreeLinks("/repo", "/wt", {
+      platform: "linux",
+      existsSync: (p) => String(p).endsWith("Cargo.toml"),
+      statSync: () => ({ isDirectory: () => false, isFile: () => true }),
+      env: { CARGO_TARGET_DIR: explicit }
+    });
+    assertModule.equal(plan.env.CARGO_TARGET_DIR, explicit);
+  });
+
+test("includes PROVISION_LINK_DIRS entries when they exist as directories", () => {
     const existsSync = mock.method(fs, "existsSync", (p) => p.endsWith("node_modules") || p.endsWith("vendor"));
     const statSync = mock.method(fs, "statSync", () => ({ isDirectory: () => true }));
     const plan = planWorktreeLinks("/repo", "/wt", { platform: "linux", existsSync, statSync });
@@ -238,7 +266,11 @@ describe("Godot import cache tier", () => {
       env: {}
     });
 
-    assertModule.ok(!plan.links.some((link) => path.basename(link.from) === ".godot"));
+    assertModule.ok(
+      !plan.links.some(
+        (link) => path.basename(link.from) === ".godot" && link.kind !== "mkdir"
+      )
+    );
     assertModule.ok(
       plan.notes.some((note) => /Godot cache: private to this run/i.test(note)),
       `expected private-cache line, got: ${JSON.stringify(plan.notes)}`
@@ -296,7 +328,7 @@ describe("Godot import cache tier", () => {
     for (const link of plan.links) {
       // Private seed uses hardlink-seed (falls back to copy on EXDEV).
       assertModule.ok(
-        link.kind === "hardlink-seed" || link.kind === "copy",
+        link.kind === "mkdir" || link.kind === "hardlink-seed" || link.kind === "copy",
         `unexpected kind ${link.kind}`
       );
     }
@@ -342,6 +374,55 @@ describe("Godot import cache tier", () => {
       !result.failed.some((entry) => String(entry.reason).includes("unknown kind")),
       `got: ${JSON.stringify(result.failed)}`
     );
+  });
+
+  test("Godot 4.7 with a gitignored .godot cache provisions a real directory and git add stays clean", (t) => {
+    const godot = "C:/Godot/4.7/Godot_v4.7-stable_win64_console.exe";
+    if (process.platform !== "win32" || !realFs.existsSync(godot)) {
+      t.skip("Godot 4.7 console binary is not installed on this host");
+      return;
+    }
+    const repo = makeTempDir("grok-godot-real-repo-");
+    const wt = makeTempDir("grok-godot-real-wt-");
+    assertModule.equal(spawnSync("git", ["init", "-q"], { cwd: repo }).status, 0);
+    realFs.writeFileSync(
+      path.join(repo, "project.godot"),
+      "config_version=5\n\n[application]\nconfig/name=\"GrokGodotProbe\"\nrun/main_scene=\"res://Main.tscn\"\n"
+    );
+    realFs.writeFileSync(
+      path.join(repo, "Main.tscn"),
+      "[gd_scene format=3]\n\n[node name=\"Main\" type=\"Node\"]\n"
+    );
+    realFs.writeFileSync(path.join(repo, ".gitignore"), ".godot/\n");
+    realFs.mkdirSync(path.join(repo, ".godot"), { recursive: true });
+    assertModule.equal(spawnSync("git", ["config", "user.name", "Grok Build Plugin Tests"], { cwd: repo }).status, 0);
+    assertModule.equal(spawnSync("git", ["config", "user.email", "tests@example.com"], { cwd: repo }).status, 0);
+    assertModule.equal(spawnSync("git", ["add", "project.godot", "Main.tscn", ".gitignore"], { cwd: repo }).status, 0);
+    assertModule.equal(spawnSync("git", ["commit", "-qm", "probe"], { cwd: repo }).status, 0);
+    for (const name of ["project.godot", "Main.tscn", ".gitignore"]) {
+      realFs.copyFileSync(path.join(repo, name), path.join(wt, name));
+    }
+    const plan = planWorktreeLinks(repo, wt, {
+      platform: "win32",
+      env: {},
+      existsSync: realFs.existsSync,
+      statSync: realFs.statSync
+    });
+    const provisioned = provisionWorktree(plan, realFs);
+    assertModule.deepStrictEqual(provisioned.failed, []);
+    assertModule.equal(realFs.lstatSync(path.join(wt, ".godot")).isSymbolicLink(), false);
+
+    const godotRun = spawnSync(godot, ["--headless", "--editor", "--path", wt, "--import", "--quit"], {
+      encoding: "utf8",
+      timeout: 30_000,
+      windowsHide: true
+    });
+    assertModule.equal(godotRun.error?.code, undefined, godotRun.error?.message ?? "");
+    assertModule.ok(godotRun.status === 0, `${godotRun.stdout}\n${godotRun.stderr}`);
+
+    const gitAdd = spawnSync("git", ["add", "."], { cwd: repo, encoding: "utf8" });
+    assertModule.equal(gitAdd.status, 0, `${gitAdd.stdout}\n${gitAdd.stderr}`);
+    assertModule.equal(spawnSync("git", ["status", "--porcelain"], { cwd: repo, encoding: "utf8" }).stdout.trim(), "");
   });
 
   test("a copied cache is private: writes in the worktree never reach the repo", () => {

@@ -57,6 +57,106 @@ const GODOT_CONFIG_VERSION_PATTERN = /^\s*config_version\s*=\s*(\d+)\s*$/m;
 const GODOT_FEATURES_PATTERN =
   /^\s*config\/features\s*=\s*(?:Packed|Pool)StringArray\s*\(([^)]*)\)/m;
 
+const VERIFY_TARGET_NAMES = Object.freeze(["test", "check", "verify", "ci"]);
+const VERIFY_SCRIPT_NAMES = Object.freeze(["test", "check", "verify"]);
+
+function relativeEntryPath(projectDir, name) {
+  return projectDir && projectDir !== "." ? `${projectDir}/${name}` : name;
+}
+
+function parseNamedTarget(text, names) {
+  const wanted = new Set(names);
+  for (const rawLine of String(text ?? "").split(/\r?\n/)) {
+    const line = rawLine.replace(/^\s+/, "");
+    if (!line || line.startsWith("#") || line.startsWith(".")) {
+      continue;
+    }
+    const match = /^([A-Za-z0-9_.-]+)\s*:\s*(?:[^=].*)?$/.exec(line);
+    if (match && wanted.has(match[1])) {
+      return match[1];
+    }
+  }
+  return null;
+}
+
+/**
+ * Prefer a repository-owned test entry point over a guessed framework command.
+ * This is deliberately fs-only: the returned command is later run by the
+ * bridge, but detection itself must never execute a cloned repository.
+ */
+function detectRepositoryVerifyEntryPoint(projectAbs, projectDir, io, packageInfo = null) {
+  if (exists(io, path.join(projectAbs, "run_tests.ps1"))) {
+    return { kind: "run_tests.ps1", path: relativeEntryPath(projectDir, "run_tests.ps1") };
+  }
+
+  if (exists(io, path.join(projectAbs, "Makefile"))) {
+    const target = parseNamedTarget(
+      readText(io, path.join(projectAbs, "Makefile")),
+      VERIFY_TARGET_NAMES
+    );
+    if (target) {
+      return { kind: "make", target };
+    }
+  }
+
+  if (packageInfo?.scripts) {
+    for (const name of VERIFY_SCRIPT_NAMES) {
+      const value = packageInfo.scripts[name];
+      if (typeof value === "string" && value.trim() && !/no test specified/i.test(value)) {
+        return { kind: "npm-script", name };
+      }
+    }
+  }
+
+  if (exists(io, path.join(projectAbs, "justfile"))) {
+    const target = parseNamedTarget(
+      readText(io, path.join(projectAbs, "justfile")),
+      VERIFY_TARGET_NAMES
+    );
+    if (target) {
+      return { kind: "just", target };
+    }
+  }
+
+  if (exists(io, path.join(projectAbs, "tox.ini"))) {
+    return { kind: "tox.ini", path: relativeEntryPath(projectDir, "tox.ini") };
+  }
+
+  return null;
+}
+
+function verifyEntryPointCommand(entryPoint, descriptor, options = {}) {
+  if (!entryPoint) {
+    return null;
+  }
+  const projectDir = descriptor?.projectDir && descriptor.projectDir !== "."
+    ? descriptor.projectDir
+    : ".";
+  const platform = options.platform ?? process.platform;
+  switch (entryPoint.kind) {
+    case "run_tests.ps1":
+      return `${platform === "win32" ? "powershell" : "pwsh"} -NoProfile -ExecutionPolicy Bypass -File ${quoteCommandPath(entryPoint.path)}`;
+    case "make":
+      return `make ${entryPoint.target}`;
+    case "just":
+      return `just ${entryPoint.target}`;
+    case "tox.ini":
+      return projectDir === "." ? "tox" : `tox -c ${quoteCommandPath(entryPoint.path)}`;
+    case "npm-script": {
+      const pm = descriptor?.packageManager || "npm";
+      const prefix = nodePrefixFlag(pm, projectDir);
+      if (entryPoint.name === "test") {
+        return prefix ? `${pm} ${prefix} test` : `${pm} test`;
+      }
+      return prefix
+        ? `${pm} ${prefix} run ${entryPoint.name}`
+        : `${pm} run ${entryPoint.name}`;
+    }
+    default:
+      return null;
+  }
+}
+
 /**
  * Order used by `detectPrimaryEcosystem`.
  *
@@ -360,6 +460,7 @@ function detectGodot(root, io) {
     : null;
   const exportPresetName = exportPreset?.name ?? null;
   const exportPresetPlatform = exportPreset?.platform ?? null;
+  const verifyEntryPoint = detectRepositoryVerifyEntryPoint(projectAbs, projectDir, io);
 
   return {
     id: "godot",
@@ -380,6 +481,7 @@ function detectGodot(root, io) {
     hasExportPresets,
     exportPresetName,
     exportPresetPlatform,
+    verifyEntryPoint,
     // Historical flag: bare `--check-only` without `--script` never exits on
     // Godot 4 (it boots main_scene forever). The default plan no longer emits
     // that form; whole-project check uses runtime-plugin/tools/grok_check.gd.
@@ -556,10 +658,13 @@ function detectBlender(root, io) {
     }
   }
 
+  const verifyEntryPoint = detectRepositoryVerifyEntryPoint(root, ".", io);
+
   return {
     id: "blender",
     root,
     projectDir,
+    verifyEntryPoint,
     detectedBy: hit.detectedBy,
     manifestPath: hit.manifestPath,
     addonInitPath: hit.addonInitPath,
@@ -654,6 +759,7 @@ function detectNode(root, io) {
     packageManager !== "npm" || projectDir === "."
       ? packageManager
       : packageManagerAtRoot;
+  const verifyEntryPoint = detectRepositoryVerifyEntryPoint(projectAbs, projectDir, io, { scripts });
 
   // When scripts.test is absent, call the runner directly only when a real
   // config file says the project uses it. Guessing `npx jest` on every repo
@@ -703,6 +809,7 @@ function detectNode(root, io) {
     // simply never added tests.
     hasTestScript,
     packageManager: resolvedPm,
+    verifyEntryPoint,
     directTestRunner,
     hasTypeScript,
     isWorkspace
@@ -884,9 +991,11 @@ function detectPython(root, io) {
     pyproject,
     `${requirements}\n${rootRequirements}`
   );
+  const verifyEntryPoint = detectRepositoryVerifyEntryPoint(projectAbs, projectDir, io);
 
   return {
     id: "python",
+    verifyEntryPoint,
     root,
     projectDir,
     framework: django?.framework ?? null,
@@ -905,7 +1014,12 @@ function detectRust(root, io) {
   if (!hit) {
     return null;
   }
-  return { id: "rust", root, projectDir: hit.projectDir };
+  return {
+    id: "rust",
+    root,
+    projectDir: hit.projectDir,
+    verifyEntryPoint: detectRepositoryVerifyEntryPoint(hit.projectAbs, hit.projectDir, io)
+  };
 }
 
 const DETECTORS = Object.freeze({
@@ -1126,7 +1240,10 @@ function godotVerifyCommands(exe, descriptor, options = {}) {
     commands.push(`${exe} --headless --path ${pathArg} --quit-after 1`);
   }
 
-  if (descriptor.testRunner === "gut") {
+  const repositoryEntryPoint = verifyEntryPointCommand(descriptor.verifyEntryPoint, descriptor, options);
+  if (repositoryEntryPoint) {
+    commands.push(repositoryEntryPoint);
+  } else if (descriptor.testRunner === "gut") {
     commands.push(`${exe} ${headless} --path ${pathArg} -s addons/gut/gut_cmdln.gd -gexit`);
   } else if (descriptor.testRunner === "gdunit4" && descriptor.testDir) {
     const testDir =
@@ -1195,7 +1312,7 @@ function godotVerifyCommands(exe, descriptor, options = {}) {
 /** Relative path of the bridge-owned Blender verify shim (written by provision). */
 export const BLENDER_VERIFY_SHIM_RELATIVE = ".grok-build/blender/grok_verify_shim.py";
 
-function blenderVerifyCommands(exe, descriptor) {
+function blenderVerifyCommands(exe, descriptor, options = {}) {
   const commands = [];
 
   // Refuse outright rather than emit an injectable command. Falling through
@@ -1223,11 +1340,19 @@ function blenderVerifyCommands(exe, descriptor) {
       ? descriptor.moduleName
       : null;
 
+  const repositoryEntryPoint = verifyEntryPointCommand(descriptor.verifyEntryPoint, descriptor, options);
+  // A repository-owned runner is authoritative. Do not also guess at a second
+  // framework invocation when it exists; the real runner may select a suite,
+  // environment, or wrapper that the bridge cannot safely infer.
+  if (repositoryEntryPoint) {
+    commands.push(repositoryEntryPoint);
+  }
+
   // testScript needs no such guard: `detectBlender` only ever assigns it one of
   // two hardcoded candidates, so no repo-controlled bytes reach it.
   // Run through the bridge shim so a unittest suite that reports FAILED
   // without sys.exit(1) still fails verification (false-green fix).
-  if (descriptor.testScript) {
+  if (descriptor.testScript && !repositoryEntryPoint) {
     commands.push(
       `${exe} --background --factory-startup --python-exit-code 1 --python ${shim} -- ${descriptor.testScript}`
     );
@@ -1281,12 +1406,15 @@ function nodePrefixFlag(pm, projectDir) {
   return `--prefix ${dir}`;
 }
 
-function nodeVerifyCommands(descriptor) {
+function nodeVerifyCommands(descriptor, options = {}) {
   const commands = [];
   const pm = descriptor.packageManager || "npm";
   const prefix = nodePrefixFlag(pm, descriptor.projectDir);
+  const repositoryEntryPoint = verifyEntryPointCommand(descriptor.verifyEntryPoint, descriptor, options);
 
-  if (descriptor.hasTestScript) {
+  if (repositoryEntryPoint) {
+    commands.push(repositoryEntryPoint);
+  } else if (descriptor.hasTestScript) {
     // Always at the project (or workspace) root. `pnpm -r test` / per-package
     // descent is never the default: it multiplies wall-clock by the package
     // count and is not what a monorepo's root scripts.test is for.
@@ -1318,6 +1446,9 @@ function nodeVerifyCommands(descriptor) {
     }
   }
 
+  // A repository-owned test entry point replaces guessed test runners, but a
+  // configured TypeScript typecheck is an independent safety signal and still
+  // belongs in the default plan.
   if (descriptor.hasTypeScript) {
     // tsc --noEmit is the cheap typecheck; only when TypeScript is actually a
     // dependency AND tsconfig.json exists (both gated at detection time).
@@ -1364,6 +1495,10 @@ function pythonVerifyCommands(descriptor, options = {}) {
       : descriptor.managePy && descriptor.managePy === "manage.py"
         ? "manage.py"
         : null;
+  const repositoryEntryPoint = verifyEntryPointCommand(descriptor.verifyEntryPoint, descriptor, options);
+  if (repositoryEntryPoint) {
+    return [repositoryEntryPoint];
+  }
 
   if (descriptor.framework === "django" && managePy) {
     // Order matters: `check` is seconds, `makemigrations --check` is the
@@ -1469,13 +1604,18 @@ export function defaultVerifyCommands(descriptor, options = {}) {
     case "blender":
       return blenderVerifyCommands(
         resolveEcosystemBinary(descriptor, resolvedOptions),
-        descriptor
+        descriptor,
+        resolvedOptions
       );
     case "node":
-      return nodeVerifyCommands(descriptor);
+      return nodeVerifyCommands(descriptor, resolvedOptions);
     case "python":
       return pythonVerifyCommands(descriptor, resolvedOptions);
     case "rust": {
+      const repositoryEntryPoint = verifyEntryPointCommand(descriptor.verifyEntryPoint, descriptor, options);
+      if (repositoryEntryPoint) {
+        return [repositoryEntryPoint];
+      }
       if (
         descriptor.projectDir &&
         descriptor.projectDir !== "." &&

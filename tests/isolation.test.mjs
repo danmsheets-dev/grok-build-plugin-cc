@@ -36,7 +36,8 @@ import {
 } from "../plugins/grok-build/scripts/lib/worktree.mjs";
 import {
   formatIsolationHeaderLine,
-  loadRunRules
+  loadRunRules,
+  runHeadlessAgentWithDurationBudget
 } from "../plugins/grok-build/scripts/grok-bridge.mjs";
 import { buildEnv, installFakeGrok } from "./fake-grok-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
@@ -781,6 +782,32 @@ test("orphan reconciler finds a directory with no job record (R6-7)", () => {
 /* -------------------------------------------------------------------------
  * terminateProcessTree never throws; win32 escalation
  * ---------------------------------------------------------------------- */
+
+test("max-duration returns after a bounded kill wait and reports a surviving tree", async () => {
+  let terminated = false;
+  const started = Date.now();
+  const outcome = await runHeadlessAgentWithDurationBudget(
+    "/tmp/worktree",
+    { onProgress() {} },
+    0.01,
+    {
+      runAgentImpl: (_cwd, options) => {
+        options.onProgress?.({ agentPid: 12345 });
+        return new Promise(() => {});
+      },
+      terminateProcessTreeImpl: () => {
+        terminated = true;
+        return { attempted: true, delivered: false, method: "test-kill" };
+      },
+      terminationGraceMs: 25
+    }
+  );
+  assert.equal(outcome.timedOut, true);
+  assert.equal(terminated, true);
+  assert.equal(outcome.termination.treeOutlivedKill, true);
+  assert.ok(Date.now() - started < 1000, "duration watchdog must not await the agent forever");
+  assert.match(outcome.result.stderr, /could not be terminated|still running/i);
+});
 
 test("terminateProcessTree never throws on taskkill failure", () => {
   const calls = [];

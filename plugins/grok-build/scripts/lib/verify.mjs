@@ -612,6 +612,37 @@ export async function probeBaselines(commands, cwd, options = {}) {
   return baselines;
 }
 
+/**
+ * Remove only auto-derived commands that were already red before the agent.
+ * Explicit --verify and trusted project-config commands are never passed here:
+ * the operator asked for those commands and their baseline failure remains a
+ * useful pre-existing-failure result rather than standing noise to hide.
+ */
+export function dropBaselineFailingAutoCommands(commands, baselines, options = {}) {
+  if (options.source !== "ecosystem-default") {
+    return { commands: [...(commands ?? [])], dropped: [] };
+  }
+  const byCommand = new Map((baselines ?? []).map((entry) => [entry.command, entry]));
+  const kept = [];
+  const dropped = [];
+  for (const command of commands ?? []) {
+    const baseline = byCommand.get(command);
+    if (baseline && baseline.ok === false) {
+      dropped.push({
+        command,
+        reason: baseline.timedOut
+          ? "baseline timed out"
+          : baseline.commandNotFound
+            ? "command was not found at baseline"
+            : "command failed at baseline"
+      });
+    } else {
+      kept.push(command);
+    }
+  }
+  return { commands: kept, dropped };
+}
+
 /** Human duration for progress lines: ms under a second, else seconds. */
 function formatDurationMs(ms) {
   const value = Number(ms);

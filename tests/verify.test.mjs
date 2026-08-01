@@ -13,6 +13,7 @@ import {
   compileUserPatterns,
   deriveVerifyTimeoutMs,
   detectOutputFailures,
+  dropBaselineFailingAutoCommands,
   expectedExportSmokeArtifact,
   normalizeFailureText,
   probeBaselines,
@@ -102,6 +103,23 @@ test("summarizeFailures extracts only failure-looking lines and dedupes", () => 
   assert.ok(signature.some((id) => id.includes("error") || id.includes("typeerror")));
   assert.ok(!signature.some((id) => id.includes("ok 1 should pass")));
   assert.ok(!signature.some((id) => id === "exit_code: 1"));
+});
+
+test("auto-derived baseline failures are dropped, while explicit commands are kept", () => {
+  const commands = ["make test", "godot --headless --import"];
+  const baselines = [
+    { command: "make test", ok: false, timedOut: false, commandNotFound: false },
+    { command: "godot --headless --import", ok: true }
+  ];
+  const dropped = dropBaselineFailingAutoCommands(commands, baselines, {
+    source: "ecosystem-default"
+  });
+  assert.deepEqual(dropped.commands, ["godot --headless --import"]);
+  assert.deepEqual(dropped.dropped, [{ command: "make test", reason: "command failed at baseline" }]);
+
+  const explicit = dropBaselineFailingAutoCommands(commands, baselines, { source: "cli" });
+  assert.deepEqual(explicit.commands, commands);
+  assert.deepEqual(explicit.dropped, []);
 });
 
 test("compareFailureSignatures returns new-failures when current has an id absent from baseline", () => {

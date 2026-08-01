@@ -37,6 +37,8 @@ export const PROJECT_CONFIG_VERSION = 1;
 
 /** state.mjs config key holding the sha256 of the trusted config file. */
 export const TRUST_STATE_KEY = "verifyTrustHash";
+/** state.mjs config key holding the exact auto-derived verify plan hash. */
+export const AUTO_VERIFY_TRUST_STATE_KEY = "autoVerifyTrustHash";
 
 /**
  * Keys withheld until the file's hash is trusted.
@@ -281,6 +283,13 @@ export function hashProjectConfig(raw) {
   return createHash("sha256").update(String(raw ?? ""), "utf8").digest("hex");
 }
 
+/** Hash exact auto-derived command bytes, outside the repository. */
+export function hashVerifyCommands(commands) {
+  return createHash("sha256")
+    .update(JSON.stringify((commands ?? []).map((command) => String(command))), "utf8")
+    .digest("hex");
+}
+
 function emptyResult(filePath) {
   return {
     present: false,
@@ -440,20 +449,45 @@ export function loadWorkspaceProjectConfig(workspaceRoot, options = {}) {
 export function recordProjectConfigTrust(workspaceRoot, options = {}) {
   const setConfigImpl = options.setConfigImpl ?? setConfig;
   const loaded = loadProjectConfig(workspaceRoot, options);
+  const commands = normalizeStringArray(options.verifyCommands ?? []) ?? [];
+  const autoHash = commands.length > 0 ? hashVerifyCommands(commands) : null;
+
   if (!loaded.present) {
+    if (autoHash) {
+      setConfigImpl(workspaceRoot, AUTO_VERIFY_TRUST_STATE_KEY, autoHash);
+      return { recorded: true, reason: "auto-verify", hash: null, autoHash, loaded };
+    }
     return { recorded: false, reason: "no-config", loaded };
   }
   if (!loaded.hash) {
     return { recorded: false, reason: "unreadable", loaded };
   }
   setConfigImpl(workspaceRoot, TRUST_STATE_KEY, loaded.hash);
-  return { recorded: true, hash: loaded.hash, loaded };
+  if (autoHash) {
+    setConfigImpl(workspaceRoot, AUTO_VERIFY_TRUST_STATE_KEY, autoHash);
+  }
+  return { recorded: true, hash: loaded.hash, autoHash, loaded };
+}
+
+/** True only when the exact current auto-derived command list was trusted. */
+export function isAutoVerifyTrusted(workspaceRoot, commands, options = {}) {
+  const list = normalizeStringArray(commands ?? []) ?? [];
+  if (list.length === 0) {
+    return true;
+  }
+  const getConfigImpl = options.getConfigImpl ?? getConfig;
+  try {
+    return getConfigImpl(workspaceRoot)?.[AUTO_VERIFY_TRUST_STATE_KEY] === hashVerifyCommands(list);
+  } catch {
+    return false;
+  }
 }
 
 /** Forget the recorded trust, so the executable keys are withheld again. */
 export function revokeProjectConfigTrust(workspaceRoot, options = {}) {
   const setConfigImpl = options.setConfigImpl ?? setConfig;
   setConfigImpl(workspaceRoot, TRUST_STATE_KEY, null);
+  setConfigImpl(workspaceRoot, AUTO_VERIFY_TRUST_STATE_KEY, null);
   return { revoked: true };
 }
 

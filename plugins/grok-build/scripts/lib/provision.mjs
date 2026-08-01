@@ -476,15 +476,27 @@ export function planWorktreeLinks(repoRoot, worktreePath, options = {}) {
       if (!existsSync(from) && !hasCargoToml) {
         continue;
       }
-      const cargoTarget = path.join(wt, ...CARGO_TARGET_DIR_RELATIVE.split("/"));
+      const explicitCargoTarget =
+        typeof env.CARGO_TARGET_DIR === "string" && env.CARGO_TARGET_DIR.trim()
+          ? env.CARGO_TARGET_DIR.trim()
+          : null;
+      const cargoTarget = explicitCargoTarget
+        ? explicitCargoTarget
+        : path.join(wt, ...CARGO_TARGET_DIR_RELATIVE.split("/"));
       planEnv.CARGO_TARGET_DIR = cargoTarget;
       privateDirs.push(name);
-      notes.push(
-        `target: private via CARGO_TARGET_DIR=${CARGO_TARGET_DIR_RELATIVE} (main checkout target/ is not linked)`
-      );
-      // Materialise an empty dir so cargo never has to create the parent alone;
-      // kind "mkdir" is handled by provisionWorktree without reading a source.
-      links.push({ from: cargoTarget, to: cargoTarget, kind: "mkdir", name: "cargo-target" });
+      if (explicitCargoTarget) {
+        notes.push(
+          `target: using explicit CARGO_TARGET_DIR=${explicitCargoTarget} (provisioning default not used; main checkout target/ is not linked)`
+        );
+      } else {
+        notes.push(
+          `target: private via CARGO_TARGET_DIR=${CARGO_TARGET_DIR_RELATIVE} (main checkout target/ is not linked)`
+        );
+        // Materialise an empty dir so cargo never has to create the parent alone;
+        // kind "mkdir" is handled by provisionWorktree without reading a source.
+        links.push({ from: cargoTarget, to: cargoTarget, kind: "mkdir", name: "cargo-target" });
+      }
       continue;
     }
 
@@ -523,7 +535,15 @@ export function planWorktreeLinks(repoRoot, worktreePath, options = {}) {
     // tier === "copy" (private). Godot keeps its partial seed; everything else
     // hardlink-seeds the whole tree.
     if (GODOT_CACHE_DIRS.includes(name)) {
-      // No entry for the directory itself — partial seed via PROVISION_COPY_PATHS.
+      // Keep the cache private even when it is empty. A mkdir entry gives the
+      // engine a real directory to import into instead of leaving a missing
+      // path behind and silently falling back to the main checkout.
+      links.push({
+        from: path.join(wt, name),
+        to: path.join(wt, name),
+        kind: "mkdir",
+        name
+      });
       privateDirs.push(name);
       continue;
     }

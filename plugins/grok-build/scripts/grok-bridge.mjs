@@ -72,6 +72,7 @@ import {
 import { binaryAvailable, runCommand, terminateProcessTree } from "./lib/process.mjs";
 import {
   describeVerifySource,
+  isAutoVerifyTrusted,
   loadWorkspaceProjectConfig,
   PROJECT_CONFIG_FILENAME,
   recordProjectConfigTrust,
@@ -152,6 +153,7 @@ import {
   classifyVerifyFailure,
   compileUserPatterns,
   deriveVerifyTimeoutMs,
+  dropBaselineFailingAutoCommands,
   probeBaselines,
   resolveOutputFailurePatterns,
   resolveVerifyMaxBufferBytes,
@@ -431,8 +433,19 @@ function resolveProjectRunPlan(workspaceRoot, cli = {}) {
     config: projectConfig.config,
     ecosystemDefaults: { verify: ecosystemVerify }
   });
+  const autoVerify = settings.sources.verify === "ecosystem-default" && settings.verify.length > 0;
+  const autoVerifyTrusted = !autoVerify || isAutoVerifyTrusted(workspaceRoot, settings.verify);
 
-  return { projectConfig, ecosystem, ecosystems, settings, exportSmoke };
+  return {
+    projectConfig,
+    ecosystem,
+    ecosystems,
+    settings,
+    exportSmoke,
+    autoVerify,
+    autoVerifyTrusted,
+    autoVerifyCommands: ecosystemVerify
+  };
 }
 
 /**
@@ -581,7 +594,14 @@ export function redactEnvForRecord(overrides) {
  * The resolved verify plan, as reported by `verify-plan` and echoed in the run
  * header. Spawns nothing and reads nothing but the project's own files.
  */
-function buildVerifyPlanPayload({ projectConfig, ecosystem, ecosystems, settings }) {
+function buildVerifyPlanPayload({
+  projectConfig,
+  ecosystem,
+  ecosystems,
+  settings,
+  autoVerify = false,
+  autoVerifyTrusted = true
+}) {
   const ecosystemList = Array.isArray(ecosystems) ? ecosystems : ecosystem ? [ecosystem] : [];
   return {
     ecosystem: ecosystem
@@ -623,7 +643,13 @@ function buildVerifyPlanPayload({ projectConfig, ecosystem, ecosystems, settings
       errors: projectConfig.errors,
       warnings: projectConfig.warnings
     },
-    trustCommand: Object.keys(projectConfig.untrusted).length > 0 ? TRUST_CONFIG_COMMAND : null
+    trustCommand:
+      Object.keys(projectConfig.untrusted).length > 0 || (autoVerify && !autoVerifyTrusted)
+        ? TRUST_CONFIG_COMMAND
+        : null,
+    autoVerify,
+    autoVerifyTrusted,
+    autoVerifyWithheld: autoVerify && !autoVerifyTrusted
   };
 }
 
@@ -742,9 +768,19 @@ function resolveMaxCostUsd(raw) {
  * Run the headless agent, optionally racing a wall-clock duration budget.
  * Captures agentPid from onProgress so the watchdog can terminate the tree.
  */
-async function runHeadlessAgentWithDurationBudget(runCwd, agentOptions, maxDurationSeconds) {
+export async function runHeadlessAgentWithDurationBudget(
+  runCwd,
+  agentOptions,
+  maxDurationSeconds,
+  testOptions = {}
+) {
   let agentPid = null;
   const originalOnProgress = agentOptions.onProgress;
+  const runAgent = testOptions.runAgentImpl ?? runHeadlessAgent;
+  const terminate = testOptions.terminateProcessTreeImpl ?? terminateProcessTree;
+  const terminationGraceMs = Number.isFinite(Number(testOptions.terminationGraceMs))
+    ? Math.max(0, Number(testOptions.terminationGraceMs))
+    : 2000;
   const wrappedOptions = {
     ...agentOptions,
     onProgress: (event) => {
@@ -759,16 +795,21 @@ async function runHeadlessAgentWithDurationBudget(runCwd, agentOptions, maxDurat
   };
 
   if (maxDurationSeconds == null) {
-    const result = await runHeadlessAgent(runCwd, wrappedOptions);
-    return { result, timedOut: false };
+    const result = await runAgent(runCwd, wrappedOptions);
+    return { result, timedOut: false, termination: null };
   }
 
-  const agentPromise = runHeadlessAgent(runCwd, wrappedOptions);
+  const agentPromise = runAgent(runCwd, wrappedOptions);
   let timer = null;
+  let termination = { attempted: false, delivered: false, method: null };
   const timeoutPromise = new Promise((resolve) => {
     timer = setTimeout(() => {
       if (agentPid != null) {
-        terminateProcessTree(agentPid);
+        try {
+          termination = terminate(agentPid) ?? termination;
+        } catch {
+          termination = { attempted: true, delivered: false, method: null };
+        }
       }
       resolve({ timedOut: true });
     }, Math.max(1, Math.round(maxDurationSeconds * 1000)));
@@ -785,10 +826,13 @@ async function runHeadlessAgentWithDurationBudget(runCwd, agentOptions, maxDurat
   }
 
   if (raced.timedOut) {
-    let result;
-    try {
-      result = await agentPromise;
-    } catch {
+    const afterKill = await Promise.race([
+      agentPromise.then((result) => ({ result, settled: true }), () => ({ settled: true })),
+      sleep(terminationGraceMs).then(() => ({ settled: false }))
+    ]);
+    const treeOutlivedKill = termination.delivered === false || afterKill.settled === false;
+    let result = afterKill.settled && afterKill.result ? afterKill.result : null;
+    if (!result) {
       result = {
         status: 1,
         stdout: "",
@@ -801,16 +845,21 @@ async function runHeadlessAgentWithDurationBudget(runCwd, agentOptions, maxDurat
         stopReason: "max-duration"
       };
     }
+    const survivalNote = treeOutlivedKill
+      ? " The agent process tree could not be terminated and may still be running."
+      : "";
     return {
       result: {
         ...result,
-        status: 1
+        status: 1,
+        stderr: `${result.stderr ?? ""}${survivalNote}`.trim()
       },
-      timedOut: true
+      timedOut: true,
+      termination: { ...termination, treeOutlivedKill }
     };
   }
 
-  return { result: raced.result, timedOut: false };
+  return { result: raced.result, timedOut: false, termination: null };
 }
 
 // configIsolate is the project config's `isolate`, and sits between the two
@@ -2293,20 +2342,28 @@ function renderVerifyPlan(payload) {
 
   if (payload.disabled) {
     lines.push("Verification is disabled for this run (--no-verify).");
-  } else if (payload.commands.length === 0) {
-    lines.push("No verify commands resolved; a run would not verify anything.");
   } else {
-    // describeVerifySource is deliberately not reused here: its "cli" label is
-    // the string "--verify", which is the wrong flag to name for a timeout.
-    const timeoutOrigin =
-      payload.timeoutSource === "config"
-        ? ` (set by ${PROJECT_CONFIG_FILENAME})`
-        : payload.timeoutSource === "derived"
-          ? " (no baseline)"
-          : " (set by --verify-timeout)";
-    lines.push(`Timeout per command${timeoutOrigin}: ${payload.timeoutSeconds}s`, "", "Commands:");
-    for (const command of payload.commands) {
-      lines.push(`  ${command}`);
+    if (payload.autoVerifyWithheld) {
+      lines.push(
+        "Auto-derived verify commands are withheld until trust-on-first-use; they will not run at baseline.",
+        `Review them above, then run: ${payload.trustCommand}`
+      );
+    }
+    if (payload.commands.length === 0) {
+      lines.push("No verify commands resolved; a run would not verify anything.");
+    } else {
+      // describeVerifySource is deliberately not reused here: its "cli" label is
+      // the string "--verify", which is the wrong flag to name for a timeout.
+      const timeoutOrigin =
+        payload.timeoutSource === "config"
+          ? ` (set by ${PROJECT_CONFIG_FILENAME})`
+          : payload.timeoutSource === "derived"
+            ? " (no baseline)"
+            : " (set by --verify-timeout)";
+      lines.push(`Timeout per command${timeoutOrigin}: ${payload.timeoutSeconds}s`, "", "Commands:");
+      for (const command of payload.commands) {
+        lines.push(`  ${command}`);
+      }
     }
   }
 
@@ -2361,7 +2418,11 @@ function renderTrustConfigResult(payload) {
     return `Nothing to trust: ${payload.detail}\n`;
   }
 
-  const lines = [`Trusted ${payload.path} (sha256 ${payload.hash.slice(0, 12)}).`];
+  const lines = [
+    payload.hash
+      ? `Trusted ${payload.path} (sha256 ${payload.hash.slice(0, 12)}).`
+      : "Trusted the current auto-derived verify plan (recorded outside the repository)."
+  ];
   // verify/tools/env are ALL executable keys (EXECUTABLE_KEYS in
   // project-config.mjs) - a config whose only executable keys are `tools`/
   // `env` used to fall through this branch entirely and receive a receipt
@@ -2405,7 +2466,10 @@ async function handleTrustConfig(argv) {
     return;
   }
 
-  const result = recordProjectConfigTrust(workspaceRoot);
+  const plan = resolveProjectRunPlan(workspaceRoot, {});
+  const result = recordProjectConfigTrust(workspaceRoot, {
+    verifyCommands: plan.autoVerifyCommands ?? []
+  });
   const payload = {
     revoked: false,
     recorded: result.recorded,
@@ -2423,6 +2487,7 @@ async function handleTrustConfig(argv) {
     verify: result.loaded.untrusted.verify ?? [],
     tools: result.loaded.untrusted.tools ?? {},
     env: result.loaded.untrusted.env ?? {},
+    autoVerify: plan.autoVerifyCommands ?? [],
     errors: result.loaded.errors
   };
   outputCommandResult(payload, renderTrustConfigResult(payload), options.json);
@@ -3269,7 +3334,7 @@ async function executeTaskRun(request) {
   const write = Boolean(request.write);
   const isolate = Boolean(request.isolate);
   const isolateSource = request.isolateSource ?? (isolate ? "write-default" : "read-only");
-  const verifyCommands = normalizeVerifyCommands(request.verifyCommands);
+  let verifyCommands = normalizeVerifyCommands(request.verifyCommands);
   const verifyAttempts = resolveVerifyAttempts(request.verifyAttempts);
   // Resolved by handleTask (or absent, for a caller that passed an explicit
   // command list of its own). Purely descriptive - the plan is already baked
@@ -3326,6 +3391,8 @@ async function executeTaskRun(request) {
   let runCwd = workspaceRoot;
   /** @type {{provisioned: Array<{name: string, kind: string}>, failed: Array<{name: string, reason: string}>, notes: string[]}|null} */
   let provisionSummary = null;
+  /** @type {{ command: string, reason: string }[]} */
+  let verifyDropped = [];
   /** @type {Record<string, string>|null} */
   let blenderSandboxEnv = null;
   /** @type {Record<string, string|boolean|null>|null} */
@@ -3426,6 +3493,7 @@ async function executeTaskRun(request) {
         provisionFiles: request.provisionFiles,
         dirPolicy: request.provisionLink,
         linkDirs: request.linkDirs,
+        env: { ...process.env, ...envOverrides },
         nestedProjectDirs,
         isWorkspace: Boolean(nodeDescriptor?.isWorkspace)
       });
@@ -3828,6 +3896,20 @@ async function executeTaskRun(request) {
       phase: "verifying",
       message: `Verify baseline: measured in ${baselineProbeMs}ms (${baselines.filter((entry) => entry.ok).length}/${baselines.length} already passing)`
     });
+
+    const dropped = dropBaselineFailingAutoCommands(verifyCommands, baselines, {
+      source: verifyPlan?.source
+    });
+    if (dropped.dropped.length > 0) {
+      verifyDropped = dropped.dropped;
+      verifyCommands = dropped.commands;
+      request.onProgress?.({
+        phase: "verifying",
+        message:
+          `Verify baseline: dropped ${verifyDropped.length} auto-derived command${verifyDropped.length === 1 ? "" : "s"} already failing at baseline (pre-existing noise):\n` +
+          verifyDropped.map((entry) => `  ${entry.command} — ${entry.reason}`).join("\n")
+      });
+    }
   }
 
   // Snapshotted BEFORE the agent runs, and only where it is needed: an isolated
@@ -4027,6 +4109,12 @@ async function executeTaskRun(request) {
     maxDurationSeconds
   );
   let result = firstAgent.result;
+  if (firstAgent.termination?.treeOutlivedKill) {
+    request.onProgress?.({
+      phase: "finalizing",
+      message: "Max duration expired; the agent process tree outlived the kill attempt and may still be running."
+    });
+  }
   // Every agent turn this run makes, in order. `result` keeps tracking only the
   // LAST one, because status, threadId, stopReason and the stop condition all
   // belong to it - but the text channel must accumulate, which is what this is
@@ -4034,6 +4122,7 @@ async function executeTaskRun(request) {
   // verify commands takes exactly the same path.
   const agentResults = [firstAgent.result];
   let timedOut = firstAgent.timedOut;
+  let durationTermination = firstAgent.termination ?? null;
   let cumulativeUsage = result.usage ? { ...result.usage } : null;
   // HYPER-1: one auto-continue when the agent spent its turn asking a question
   // nobody will answer. Bound to exactly one retry — never loop.
@@ -4075,6 +4164,7 @@ async function executeTaskRun(request) {
     cumulativeUsage = addUsage(cumulativeUsage, continueAgent.result.usage);
     if (continueAgent.timedOut) {
       timedOut = true;
+      durationTermination = continueAgent.termination ?? durationTermination;
     }
   }
 
@@ -4133,7 +4223,10 @@ async function executeTaskRun(request) {
     status: result.status
   };
 
-  if (verifySkippedReadOnly) {
+  if (verifyDropped.length > 0 && verifyCommands.length === 0) {
+    verified = true;
+    verifyNote = "all auto-derived verify commands were already failing at baseline and were dropped as pre-existing-failure";
+  } else if (verifySkippedReadOnly) {
     verified = null;
     verifyNote = "skipped (read-only run)";
   } else if (!timedOut && verifyCommands.length > 0) {
@@ -4389,6 +4482,7 @@ async function executeTaskRun(request) {
       cumulativeUsage = addUsage(cumulativeUsage, fixAgent.result.usage);
       if (fixAgent.timedOut) {
         timedOut = true;
+        durationTermination = fixAgent.termination ?? durationTermination;
         break;
       }
       if (
@@ -4818,7 +4912,7 @@ async function executeTaskRun(request) {
           ? null
           : null;
   const failureMessage = timedOut
-    ? `Run timed out after ${maxDurationSeconds}s (--max-duration).`
+    ? `Run timed out after ${maxDurationSeconds}s (--max-duration).${result.stderr ? ` ${result.stderr}` : ""}`
     : result.status === 0
       ? ""
       : result.stderr || "";
@@ -4958,6 +5052,10 @@ async function executeTaskRun(request) {
     verifyMatchedLines: verifyResults
       .filter((entry) => Array.isArray(entry.matchedLines) && entry.matchedLines.length > 0)
       .map((entry) => ({ command: entry.command, matchedLines: entry.matchedLines })),
+    // R7-3: commands the ecosystem default proposed and then dropped because
+    // they were already failing at baseline. Reported so a dropped command is
+    // visible rather than silently absent.
+    verifyDropped,
     // R7-4: per-command results + baselines so the status line can say
     // `verify 2/3 (baseline 2/3)` instead of a boolean Verified: yes.
     verifyResults,
@@ -4975,6 +5073,7 @@ async function executeTaskRun(request) {
     worktree,
     provision: provisionSummary,
     budgetStopped,
+    durationTermination,
     children,
     usageBreakdown
   };
@@ -4982,6 +5081,11 @@ async function executeTaskRun(request) {
   // string-surgery on the full rendered body (and without losing it when the
   // answer is preferred over rendered).
   const statusLines = buildTaskStatusLines(statusMeta, rawOutput);
+  if (verifyDropped.length > 0) {
+    statusLines.push(
+      `Verify baseline: dropped ${verifyDropped.length} auto-derived command${verifyDropped.length === 1 ? "" : "s"} already failing at baseline (pre-existing noise).`
+    );
+  }
 
   const rendered = timedOut
     ? `${failureMessage}\n${rawOutput ? `\n${rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`}` : ""}${
@@ -5007,6 +5111,7 @@ async function executeTaskRun(request) {
     plan: verifyPlan,
     attempts: attempt,
     note: verifyNote,
+    dropped: verifyDropped,
     // Read-only runs skip baseline + verify entirely (FIELD-3).
     skippedReadOnly: Boolean(verifySkippedReadOnly),
     // Fix-turn reports only — never the task deliverable (FIELD-2).
@@ -5054,7 +5159,8 @@ async function executeTaskRun(request) {
     maxTurns,
     maxCostUsd,
     timedOut,
-    budgetStopped
+    budgetStopped,
+    durationTermination
   };
 
   const exitStatus = timedOut ? 1 : result.status;
@@ -5898,10 +6004,15 @@ async function handleTask(argv) {
   const cliSettings = cliSettingsFromTaskOptions(options);
   // exportSmoke is resolved inside resolveProjectRunPlan (CLI flag or config).
   cliSettings.exportSmoke = Boolean(options["godot-export-smoke"]);
-  const { projectConfig, ecosystem, ecosystems, settings, exportSmoke } = resolveProjectRunPlan(
-    workspaceRoot,
-    cliSettings
-  );
+  const {
+    projectConfig,
+    ecosystem,
+    ecosystems,
+    settings,
+    exportSmoke,
+    autoVerify,
+    autoVerifyTrusted
+  } = resolveProjectRunPlan(workspaceRoot, cliSettings);
 
   // Effort: full Hyper ladder accepted; unknown values warn and pass through
   // (HYPER-2). The config value is already schema-checked when present.
@@ -5924,7 +6035,7 @@ async function handleTask(argv) {
   });
   const isolate = isolateDecision.isolate;
   const isolateSource = isolateDecision.source;
-  const verifyCommands = settings.verify;
+  const verifyCommands = autoVerify && !autoVerifyTrusted ? [] : settings.verify;
   const verifyPlan = {
     source: settings.sources.verify,
     disabled: Boolean(settings.verifyDisabled),
@@ -5932,7 +6043,10 @@ async function handleTask(argv) {
     ecosystems: Array.isArray(ecosystems) ? ecosystems.map((e) => e.id) : ecosystem ? [ecosystem.id] : [],
     configPresent: projectConfig.present,
     configTrusted: projectConfig.trusted,
-    configWithheld: Object.keys(projectConfig.untrusted)
+    configWithheld: Object.keys(projectConfig.untrusted),
+    autoVerify,
+    autoVerifyTrusted,
+    autoVerifyWithheld: autoVerify && !autoVerifyTrusted
   };
   // Already precedence-resolved (CLI flag > .grok-build.json), in the runner's
   // units. `sources` is carried so the run record can say which layer set each
@@ -6130,10 +6244,15 @@ async function handleNestRun(argv) {
 
   const cliSettings = cliSettingsFromTaskOptions(options);
   cliSettings.exportSmoke = Boolean(options["godot-export-smoke"]);
-  const { projectConfig, ecosystem, ecosystems, settings, exportSmoke } = resolveProjectRunPlan(
-    workspaceRoot,
-    cliSettings
-  );
+  const {
+    projectConfig,
+    ecosystem,
+    ecosystems,
+    settings,
+    exportSmoke,
+    autoVerify,
+    autoVerifyTrusted
+  } = resolveProjectRunPlan(workspaceRoot, cliSettings);
 
   const model = options.model ? String(options.model).trim() : (settings.model ?? null);
   // Same destructure as handleTask: normalizeReasoningEffort always returns
@@ -6219,7 +6338,10 @@ async function handleNestRun(argv) {
   });
 
   // Agent-originated nest-run: never honour CLI verify overrides.
-  const verifyCommands = nestedAgentCaller ? (settings.verifyDisabled ? [] : settings.verify) : settings.verify;
+  const trustedVerifyCommands = autoVerify && !autoVerifyTrusted ? [] : settings.verify;
+  const verifyCommands = nestedAgentCaller
+    ? (settings.verifyDisabled ? [] : trustedVerifyCommands)
+    : trustedVerifyCommands;
   const verifyPlan = {
     source: settings.sources.verify,
     disabled: Boolean(settings.verifyDisabled),
@@ -6227,7 +6349,10 @@ async function handleNestRun(argv) {
     ecosystems: Array.isArray(ecosystems) ? ecosystems.map((e) => e.id) : ecosystem ? [ecosystem.id] : [],
     configPresent: projectConfig.present,
     configTrusted: projectConfig.trusted,
-    configWithheld: Object.keys(projectConfig.untrusted)
+    configWithheld: Object.keys(projectConfig.untrusted),
+    autoVerify,
+    autoVerifyTrusted,
+    autoVerifyWithheld: autoVerify && !autoVerifyTrusted
   };
   const verifyTiming = {
     timeoutMs: settings.verifyTimeoutMs ?? null,

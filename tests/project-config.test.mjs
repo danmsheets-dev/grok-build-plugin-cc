@@ -6,6 +6,8 @@ import test from "node:test";
 import {
   describeVerifySource,
   hashProjectConfig,
+  hashVerifyCommands,
+  isAutoVerifyTrusted,
   loadProjectConfig,
   PROJECT_CONFIG_FILENAME,
   readProjectConfigTrust,
@@ -14,6 +16,7 @@ import {
   resolveRunSettings,
   resolveVerifyCommands,
   revokeProjectConfigTrust,
+  AUTO_VERIFY_TRUST_STATE_KEY,
   TRUST_STATE_KEY
 } from "../plugins/grok-build/scripts/lib/project-config.mjs";
 import { makeTempDir } from "./helpers.mjs";
@@ -246,7 +249,19 @@ test("trust can be revoked, and reading a broken trust store means untrusted", (
   );
 });
 
-test("there is nothing to trust when no config file exists", () => {
+test("auto-derived verify commands have an external trust-on-first-use record", () => {
+  const root = makeWorkspace();
+  const trust = makeTrustStore();
+  const commands = ["powershell -File run_tests.ps1"];
+  const result = recordProjectConfigTrust(root, { ...trust, verifyCommands: commands });
+
+  assert.equal(result.recorded, true);
+  assert.equal(trust.store[AUTO_VERIFY_TRUST_STATE_KEY], hashVerifyCommands(commands));
+  assert.equal(isAutoVerifyTrusted(root, commands, trust), true);
+  assert.equal(isAutoVerifyTrusted(root, ["powershell -File changed.ps1"], trust), false);
+});
+
+test("there is nothing to trust when no config or auto verify plan exists", () => {
   const trust = makeTrustStore();
   const result = recordProjectConfigTrust(makeWorkspace(), trust);
 

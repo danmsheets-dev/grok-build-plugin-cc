@@ -121,6 +121,39 @@ test("a Godot project with no test addon reports no test runner", () => {
   assert.equal(godot.testDir, null);
 });
 
+test("detects run_tests.ps1 as the repository test entry point before GUT", () => {
+  const root = makeProject({
+    "project.godot": "config_version=5\n",
+    "run_tests.ps1": "& .\\tests\\run.ps1\n",
+    "addons/gut/gut_cmdln.gd": "extends SceneTree\n"
+  });
+  const godot = findDescriptor(root, "godot", { env: {} });
+  assert.deepEqual(godot.verifyEntryPoint, { kind: "run_tests.ps1", path: "run_tests.ps1" });
+  const commands = defaultVerifyCommands(godot, { env: {}, platform: "win32" });
+  assert.ok(commands.some((command) => /powershell .* -File run_tests\.ps1/.test(command)), commands.join("\n"));
+  assert.ok(commands.every((command) => !command.includes("gut_cmdln.gd")), commands.join("\n"));
+});
+
+test("prefers a real Makefile test target over a guessed framework command", () => {
+  const root = makeProject({
+    "Cargo.toml": "[package]\nname='demo'\nversion='0.1.0'\n",
+    "Makefile": "\.PHONY: test\ntest:\n\t cargo test --all\n"
+  });
+  const rust = findDescriptor(root, "rust", { env: {} });
+  assert.deepEqual(rust.verifyEntryPoint, { kind: "make", target: "test" });
+  assert.deepEqual(defaultVerifyCommands(rust, { platform: "linux", env: {} }), ["make test"]);
+});
+
+test("detects a tox.ini entry point for Python instead of inventing pytest", () => {
+  const root = makeProject({
+    "pyproject.toml": "[project]\nname='demo'\n",
+    "tox.ini": "[tox]\nenvlist = py\n"
+  });
+  const python = findDescriptor(root, "python", { env: {} });
+  assert.deepEqual(python.verifyEntryPoint, { kind: "tox.ini", path: "tox.ini" });
+  assert.deepEqual(defaultVerifyCommands(python, { platform: "linux", env: {} }), ["tox"]);
+});
+
 test("blender_manifest.toml at the root detects blender", () => {
   const root = makeProject({ "blender_manifest.toml": 'schema_version = "1.0.0"\nid = "demo"\n' });
   const blender = findDescriptor(root, "blender", { env: {} });

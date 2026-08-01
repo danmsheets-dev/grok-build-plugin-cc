@@ -99,6 +99,27 @@ test("verify-plan resolves a Godot project's default plan without running anythi
   }
 });
 
+test("auto-derived repository runners require first-use trust before baseline execution", async () => {
+  const root = makeProject({
+    "project.godot": GODOT_PROJECT,
+    "run_tests.ps1": "Write-Output tests\n"
+  });
+  const pluginDataDir = makeTempDir("grok-build-auto-trust-data-");
+  const before = await runBridgeJson(["verify-plan", "--cwd", root], { pluginDataDir });
+  assert.equal(before.autoVerify, true);
+  assert.equal(before.autoVerifyWithheld, true);
+  assert.ok(before.commands.some((command) => command.includes("run_tests.ps1")));
+  assert.match(before.trustCommand, /trust-config/);
+
+  const trusted = await runBridgeJson(["trust-config", "--cwd", root], { pluginDataDir });
+  assert.equal(trusted.recorded, true);
+  assert.ok(trusted.autoVerify.some((command) => command.includes("run_tests.ps1")));
+
+  const after = await runBridgeJson(["verify-plan", "--cwd", root], { pluginDataDir });
+  assert.equal(after.autoVerifyTrusted, true);
+  assert.equal(after.autoVerifyWithheld, false);
+});
+
 test("verify-plan reports no plan for a directory with no ecosystem", async () => {
   const payload = await runBridgeJson(["verify-plan", "--cwd", makeProject()]);
 
