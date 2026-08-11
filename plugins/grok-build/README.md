@@ -21,7 +21,7 @@ What isolation **does not** guarantee:
 - **`--no-isolate` turns it off**, and then the agent edits your tree directly, as before.
 - **Read-only runs are not isolated** and do not need to be — they cannot write.
   As of 0.5.0 they keep `--permission-mode plan` and `--sandbox read-only` **and** add
-  `--deny Edit(**)` / `Write(**)` / `NotebookEdit(**)`. The sandbox is kernel-enforced
+  `--deny Edit(**)` / `Write(**)`. The sandbox is kernel-enforced
   only on unix (Hyper compiles it out on Windows), so the deny rules are the half that
   holds everywhere — measured, they are evaluated before `--always-approve` and they
   also refuse a shell command that writes to a denied path.
@@ -321,10 +321,21 @@ A run also reports what it did to the disk and how it was captured:
   named, and if *nothing* in the stream was recognized the raw stdout is shown (last 200 lines)
   under an explicit `showing raw stdout` note rather than being silently discarded.
 
+## Changelog (0.6.7)
+
+- **Critique structuredOutput (H1):** structured critique prefers Turbo `structuredOutput` / `structuredOutputError` over free-form `text`.
+- **Integer `toolCalls` (H2):** JSON envelope parse accepts Turbo's `u32` tool call count (not only arrays).
+- **Stop / session-end claim-before-kill (H3/M7):** cancel root and descendants before process kill so a finishing runner cannot win `completed` over stop.
+- **Max-duration kill fallbacks (H4):** production path supplies bridge/worker/job PIDs when progress never carried `agentPid`.
+- **Porcelain fail-closed isolation (H5):** unreadable main-checkout `git status` is treated as an isolation breach, not a clean run.
+- **CLI identity:** `version --json` → `agentCompatible` / `cliFamily`; no fail-open to Vercel Turborepo; `permissionToolPrefixes` probe drives deny/allow filtering; Windows headless passes `--job-object` (opt out with `GROK_BUILD_JOB_OBJECT=0`).
+- **NDJSON honesty (C13):** malformed stream lines keep parse reasons (`json-parse-failed` / `not-a-json-object`) on the run record.
+- **Nested Godot (M9):** nested worktrees mirror root private Godot cache policy (mkdir + partial seed).
+
 ## Changelog (0.5.0)
 
 - Honest terminal statuses: `completed-truncated`, `completed-noop`, `completed-blind`, plus existing `completed-unverified` / `timed-out`.
-- Read-only runs add `--deny Edit/Write/NotebookEdit` on top of plan + read-only sandbox, so writes are refused on Windows too.
+- Read-only runs add `--deny Edit(*)` on top of plan + read-only sandbox, so writes are refused on Windows too. Turbo **1.0.0-rc.2+** accepts Claude-compat aliases (`NotebookEdit` / `MultiEdit` → Edit, `NotebookRead` → Read); the bridge probes `turbo version --json` → `permissionToolPrefixes` and filters unknown prefixes so older CLIs do not hard-abort.
 - Usage, served model, stopReason, and tool/file counts mirrored into the run index; `runs --json` is schemaVersion 2.
 - `show` always appends `===BRIDGE-RESULT===`; run header prints CLI, model, isolation, verify plan.
 - New `models [--json]` subcommand; pay-per-token models need `GROK_BUILD_ALLOW_PAY_PER_TOKEN=1`.
@@ -339,8 +350,8 @@ A run also reports what it did to the disk and how it was captured:
 ## Requirements
 
 - Node.js >= 18.18
-- The `grok` CLI on `PATH`, or `GROK_BINARY` pointing at a compatible CLI (see [Alternate CLIs](#alternate-clis))
-- A logged-in Grok session — `grok models` must succeed (Hyper may exit non-zero on a successful listing; the bridge treats a model list as success)
+- `turbo` (preferred) or `grok` on `PATH`, or `GROK_BINARY` pointing at a compatible CLI (see [Alternate CLIs](#alternate-clis))
+- A logged-in Grok session — `turbo models` / `grok models` must succeed (some forks exit non-zero on a successful listing; the bridge treats a model list as success)
 - `HOME` or `GROK_HOME` must be set. On Windows neither is set by default; the bridge's core paths work without it, but `grok` subcommands such as `grok worktree` fail with `neither $GROK_HOME nor $HOME is set`.
 
 ## Commands
@@ -391,32 +402,40 @@ Finished runs report token usage and cost, for example:
 
     Tokens: 22,962 in (33,408 cached) / 163 out · 2 turns · $0.0569
 
-Every run surfaces its Grok session id and a `grok -r <id>` resume line, so a run is never a dead end.
+Every run surfaces its Grok session id and a `<cli> -r <id>` resume line (using the resolved binary, usually `turbo`), so a run is never a dead end.
 
 Terminal status is claimed under a lock, and `cancelled` always wins: a run you stopped can never be reported as completed by a worker that finishes moments later.
 
 ## Alternate CLIs
 
-`GROK_BINARY` accepts any CLI that speaks the Grok Build command surface, not
-just the first-party `grok`. The bridge only ever calls `version` / `--version`,
-`models`, and the headless flags (`-p`, `-c`, `-r`, `--session-id`), so
-community builds work unmodified.
+When `GROK_BINARY` is unset, the bridge resolves the CLI in this order:
 
-The common case is [Hyper](https://github.com/DaviRain-Su/hyper-grok-build), a
-multi-provider community build that keeps the same `~/.grok` config, auth, and
-session state — so credentials and sessions are shared with an existing `grok`
-install rather than duplicated.
+1. **`turbo`** — preferred (local Grok Build fork, kept in sync with upstream)
+2. **`grok`** — stock Grok Build CLI
+
+Hyper is **not** selected — neither from PATH nor via `GROK_BINARY=hyper` (a
+leftover Hyper override is ignored so Turbo can take over).
+
+`GROK_BINARY` accepts any CLI that speaks the Grok Build command surface. The
+bridge calls `version` / `version --json` / `--version`, `models`, and the
+headless flags (`-p`, `--prompt-file`, `-c`, `-r`, `--session-id`, `--confine`,
+`--job-object` on Windows, permission deny/allow). Compatible forks work
+unmodified and share the same `~/.grok` config, auth, and session state.
+
+On **Turbo 1.0.0-rc.2+**, prefer `turbo version --json` for harness identity
+(`agentCompatible`, `cliFamily`, `permissionToolPrefixes`, `features.jobObject`).
+Isolated write runs require `--confine` unless `GROK_BUILD_ALLOW_WEAK_ISOLATE=1`.
 
 ```bash
-# per shell
-export GROK_BINARY=hyper
+# force a specific binary (optional — turbo is already preferred on PATH)
+export GROK_BINARY=turbo
 
 # or, for every Claude Code session, in ~/.claude/settings.json:
-#   "env": { "GROK_BINARY": "hyper" }
+#   "env": { "GROK_BINARY": "turbo" }
 ```
 
 `/grok-build:check` reports which CLI it resolved and adds a `brand` field, so
-the `grok` entry reading `hyper <version>` is expected and correct rather than a
+an entry reading `turbo <version>` is expected and correct rather than a
 misconfiguration. When the configured binary cannot be run, the failure hint
 names *that* binary instead of telling you to install Grok Build.
 
@@ -429,13 +448,13 @@ hooks, LSP servers, MCP servers — lives in `~/.grok` and is configured there,
 independent of this plugin. Ecosystem support in this repo (Godot, Blender)
 concerns how the bridge *verifies* a run, not how the agent writes code.
 
-## Nested delegation (Hyper → Hyper)
+## Nested delegation (CLI → CLI)
 
-A Hyper agent inside an isolated write run can hand a **sub-task** to another
-Hyper instance — its own sibling worktree, bridge-side verify, tracked run,
+A Turbo/Grok agent inside an isolated write run can hand a **sub-task** to
+another CLI instance — its own sibling worktree, bridge-side verify, tracked run,
 structured result, and an explicit land into the parent worktree.
 
-This is **not** Hyper's in-process subagents. Those share the parent's
+This is **not** the CLI's in-process subagents. Those share the parent's
 filesystem and default to max nesting depth 1; they fan out work, they do not
 isolate it. Nested delegation uses MCP (`delegate_run` / `delegate_status` /
 `delegate_wait` / `delegate_result` / `delegate_land` / `delegate_stop`) and the
@@ -493,7 +512,7 @@ from the run commit the same way `.grok-build/` is.
 | `GROK_BUILD_LINK_GODOT_CACHE=0` | Copy Godot's small cache state files into the worktree instead of linking `.godot`/`.import` — see "What isolation does and does not guarantee" |
 | `GROK_BUILD_MIN_FREE_BYTES` | Moves the 512 MB free-space floor a checkout refuses to start under; `0` disables the check |
 | `GROK_VERIFY_MAX_OUTPUT_BYTES` | Overrides the default 32 MB verify-output ring (see `--verify-max-buffer`, which is the per-run form of this) |
-| `GROK_BUILD_NESTED_DELEGATION` | Nested Hyper→Hyper MCP offer; default on, `0` disables — see [Nested delegation](#nested-delegation-hyper--hyper) |
+| `GROK_BUILD_NESTED_DELEGATION` | Nested CLI→CLI MCP offer; default on, `0` disables — see [Nested delegation](#nested-delegation-cli--cli) |
 | `GROK_BUILD_MAX_NEST_DEPTH` | Max nest depth (default 2) |
 | `GROK_BUILD_MAX_NEST_CONCURRENCY` | Max live children per parent (default 2) |
 

@@ -115,7 +115,8 @@ function formatGrokResumeCommand(job) {
   if (!job?.threadId) {
     return null;
   }
-  return `grok -r ${job.threadId}`;
+  const binary = String(job.binary ?? job.cliBinary ?? "turbo").trim() || "turbo";
+  return `${binary} -r ${job.threadId}`;
 }
 
 function appendActiveJobsTable(lines, jobs) {
@@ -1708,7 +1709,10 @@ export function resolveStoredStatusTrailer(storedJob, answer) {
 
 export function renderStoredJobResult(job, storedJob) {
   const threadId = storedJob?.threadId ?? job.threadId ?? null;
-  const resumeCommand = threadId ? `grok -r ${threadId}` : null;
+  const resumeCommand = formatGrokResumeCommand({
+    threadId,
+    binary: storedJob?.binary ?? job?.binary ?? storedJob?.cliBinary ?? job?.cliBinary
+  });
   if (isStructuredReviewStoredResult(storedJob) && storedJob?.rendered) {
     const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
     const withSession = threadId

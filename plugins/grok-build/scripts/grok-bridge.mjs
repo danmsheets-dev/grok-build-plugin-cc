@@ -145,6 +145,7 @@ import {
   resolveJobKillTargets,
   resolveJobTreeKillTargets,
   collectJobTreeLeafFirst,
+  claimJobTreeDescendantsCancelled,
   runTrackedJob,
   SESSION_ID_ENV,
   writeRunLogHeader
@@ -767,6 +768,9 @@ function resolveMaxCostUsd(raw) {
 /**
  * Run the headless agent, optionally racing a wall-clock duration budget.
  * Captures agentPid from onProgress so the watchdog can terminate the tree.
+ * C23: if agentPid never arrives, still attempts terminate via bridge/worker
+ * pid hooks when provided (testOptions.getFallbackPids) or a late agentPid
+ * from the settled result.
  */
 export async function runHeadlessAgentWithDurationBudget(
   runCwd,
@@ -781,6 +785,8 @@ export async function runHeadlessAgentWithDurationBudget(
   const terminationGraceMs = Number.isFinite(Number(testOptions.terminationGraceMs))
     ? Math.max(0, Number(testOptions.terminationGraceMs))
     : 2000;
+  const getFallbackPids =
+    typeof testOptions.getFallbackPids === "function" ? testOptions.getFallbackPids : null;
   const wrappedOptions = {
     ...agentOptions,
     onProgress: (event) => {
@@ -801,16 +807,58 @@ export async function runHeadlessAgentWithDurationBudget(
 
   const agentPromise = runAgent(runCwd, wrappedOptions);
   let timer = null;
-  let termination = { attempted: false, delivered: false, method: null };
+  let termination = { attempted: false, delivered: false, method: null, killTargets: [] };
   const timeoutPromise = new Promise((resolve) => {
     timer = setTimeout(() => {
+      const targets = [];
       if (agentPid != null) {
+        targets.push(agentPid);
+      }
+      // C23: progress may not have carried agentPid yet (race before first
+      // emit). Optional fallbacks: bridge worker pid, job record, etc.
+      if (getFallbackPids) {
         try {
-          termination = terminate(agentPid) ?? termination;
+          for (const pid of getFallbackPids() ?? []) {
+            const n = Number(pid);
+            if (Number.isFinite(n) && n > 0 && !targets.includes(n)) {
+              targets.push(n);
+            }
+          }
         } catch {
-          termination = { attempted: true, delivered: false, method: null };
+          // ignore fallback errors
         }
       }
+      if (targets.length === 0) {
+        termination = {
+          attempted: false,
+          delivered: false,
+          method: null,
+          killTargets: [],
+          reason: "no-agent-pid"
+        };
+        resolve({ timedOut: true });
+        return;
+      }
+      const results = [];
+      let anyDelivered = false;
+      for (const pid of targets) {
+        try {
+          const outcome = terminate(pid) ?? { attempted: true, delivered: false };
+          results.push({ pid, ...outcome });
+          if (outcome.delivered) {
+            anyDelivered = true;
+          }
+        } catch {
+          results.push({ pid, attempted: true, delivered: false });
+        }
+      }
+      termination = {
+        attempted: true,
+        delivered: anyDelivered,
+        method: results.map((r) => r.method).filter(Boolean).join("+") || null,
+        killTargets: targets,
+        results
+      };
       resolve({ timedOut: true });
     }, Math.max(1, Math.round(maxDurationSeconds * 1000)));
     timer.unref?.();
@@ -826,11 +874,53 @@ export async function runHeadlessAgentWithDurationBudget(
   }
 
   if (raced.timedOut) {
-    const afterKill = await Promise.race([
+    // Late agentPid on the promise result: try one more kill if we never fired.
+    if ((!termination.attempted || termination.reason === "no-agent-pid") && agentPid == null) {
+      try {
+        const early = await Promise.race([
+          agentPromise.then((r) => r, () => null),
+          sleep(50).then(() => null)
+        ]);
+        const latePid = Number(early?.agentPid);
+        if (Number.isFinite(latePid) && latePid > 0) {
+          agentPid = latePid;
+          try {
+            termination = {
+              ...(terminate(latePid) ?? { attempted: true, delivered: false }),
+              killTargets: [latePid]
+            };
+          } catch {
+            termination = { attempted: true, delivered: false, killTargets: [latePid] };
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+    // C15: prefer partial stream from the agent promise. Give a longer secondary
+    // wait when the kill was not confirmed delivered — inventing an empty shell
+    // discards work already parsed on stdout. Keep short graces short so unit
+    // tests (and intentional tight budgets) do not stall for 5s.
+    const secondaryGraceMs = termination.delivered
+      ? terminationGraceMs
+      : terminationGraceMs >= 1000
+        ? Math.max(terminationGraceMs, 5000)
+        : terminationGraceMs;
+    let afterKill = await Promise.race([
       agentPromise.then((result) => ({ result, settled: true }), () => ({ settled: true })),
-      sleep(terminationGraceMs).then(() => ({ settled: false }))
+      sleep(secondaryGraceMs).then(() => ({ settled: false }))
     ]);
-    const treeOutlivedKill = termination.delivered === false || afterKill.settled === false;
+    if (!afterKill.settled) {
+      // One last short wait for a late close after taskkill.
+      afterKill = await Promise.race([
+        agentPromise.then((result) => ({ result, settled: true }), () => ({ settled: true })),
+        sleep(Math.min(2000, secondaryGraceMs)).then(() => ({ settled: false }))
+      ]);
+    }
+    const treeOutlivedKill =
+      !termination.attempted ||
+      termination.delivered === false ||
+      afterKill.settled === false;
     let result = afterKill.settled && afterKill.result ? afterKill.result : null;
     if (!result) {
       result = {
@@ -842,7 +932,16 @@ export async function runHeadlessAgentWithDurationBudget(
         agentPid,
         finalMessage: "",
         usage: null,
-        stopReason: "max-duration"
+        stopReason: "max-duration",
+        toolVisibility: "unavailable",
+        partialTimeout: true
+      };
+    } else {
+      // Keep partial transcript/usage; mark timeout on top (C15).
+      result = {
+        ...result,
+        stopReason: result.stopReason ?? "max-duration",
+        partialTimeout: true
       };
     }
     const survivalNote = treeOutlivedKill
@@ -852,7 +951,7 @@ export async function runHeadlessAgentWithDurationBudget(
       result: {
         ...result,
         status: 1,
-        stderr: `${result.stderr ?? ""}${survivalNote}`.trim()
+        stderr: `${result.stderr ?? ""}${result.stderr ? "\n" : ""}Run exceeded --max-duration.${survivalNote}`.trim()
       },
       timedOut: true,
       termination: { ...termination, treeOutlivedKill }
@@ -2747,10 +2846,16 @@ function buildCritiquePrompt(context, focusText) {
 function ensureGrokAvailable(cwd) {
   const availability = getGrokAvailability(cwd);
   if (!availability.available) {
-    throw new Error(
-      `${describeMissingBinary(availability.binary)} Then rerun \`/grok-build:check\`.`
-    );
+    // M2: keep the probe's explanatory detail (wrong product / Turborepo) when
+    // present; fall back to install/PATH remediation only when detail is empty.
+    const detail = String(availability.detail ?? "").trim();
+    const install = describeMissingBinary(availability.binary);
+    const message = detail
+      ? `${detail} ${install} Then rerun \`/grok-build:check\`.`
+      : `${install} Then rerun \`/grok-build:check\`.`;
+    throw new Error(message);
   }
+  return availability;
 }
 
 /**
@@ -3056,10 +3161,35 @@ async function executeReviewRun(request) {
   });
 
   if (structured) {
-    const parsed = parseStructuredOutput(result.finalMessage, {
-      status: result.status,
-      failureMessage: result.stderr
-    });
+    // H1: Turbo --json-schema puts the validated body on structuredOutput and
+    // free-form narration on text. runHeadlessAgent splits those so finalMessage
+    // is often just envelope.text — parse that only after structuredOutput.
+    let parsed;
+    if (result.structuredOutput != null && typeof result.structuredOutput === "object") {
+      parsed = {
+        parsed: result.structuredOutput,
+        parseError: null,
+        rawOutput: result.stdout ?? result.finalMessage ?? "",
+        envelope: null
+      };
+    } else if (result.structuredOutputError) {
+      parsed = {
+        parsed: null,
+        parseError: String(result.structuredOutputError),
+        rawOutput: result.stdout ?? result.finalMessage ?? "",
+        envelope: null
+      };
+    } else {
+      // Prefer raw stdout (full envelope) over finalMessage (text only) so C12 unwrap works.
+      const source =
+        result.stdout && String(result.stdout).trim().startsWith("{")
+          ? result.stdout
+          : result.finalMessage;
+      parsed = parseStructuredOutput(source, {
+        status: result.status,
+        failureMessage: result.stderr
+      });
+    }
     const payload = {
       review: reviewName,
       target,
@@ -3072,7 +3202,10 @@ async function executeReviewRun(request) {
       grok: {
         status: result.status,
         stderr: result.stderr,
-        stdout: result.finalMessage
+        stdout: result.finalMessage,
+        structuredOutput: result.structuredOutput ?? null,
+        structuredOutputError: result.structuredOutputError ?? null,
+        toolCallCount: result.toolCallCount ?? null
       },
       result: parsed.parsed,
       rawOutput: parsed.rawOutput,
@@ -3752,7 +3885,7 @@ async function executeTaskRun(request) {
   /** @type {Awaited<ReturnType<typeof probeBaselines>>} */
   let baselines = [];
   let baselineProbeMs = null;
-  // Read-only runs deny Edit/Write/NotebookEdit. A run that cannot write cannot
+  // Read-only runs deny Edit/Write. A run that cannot write cannot
   // break a test, so baseline + verify-agent verify are pure dead wall-clock
   // (FIELD-3: measured 15+ minutes wasted on audit runs). Skip entirely.
   const verifySkippedReadOnly = write === false && verifyCommands.length > 0;
@@ -3923,8 +4056,17 @@ async function executeTaskRun(request) {
   // (workspaceRoot), not the worktree. Newly dirty paths there after the agent
   // finishes are an isolation breach — the agent obeyed an absolute path in the
   // brief. Same post-baseline timing as the non-isolated snapshot above.
+  // H5: null porcelain is fail-closed (cannot prove main stayed clean).
   const mainDirtyBeforeRun = created ? porcelainChangeEntries(workspaceRoot) : null;
   const mainDirtyBeforeRunPaths = mainDirtyBeforeRun ? new Set(mainDirtyBeforeRun.keys()) : null;
+  let mainPorcelainUnreliable = Boolean(created && !mainDirtyBeforeRun);
+  if (mainPorcelainUnreliable) {
+    request.onProgress?.({
+      message:
+        "Warning: could not snapshot main-checkout git status before the run; isolation breach detection will fail closed if status remains unreadable.",
+      phase: "starting"
+    });
+  }
 
   // Isolation header line only on this branch (WP-P1 owns CLI/model/verify plan
   // lines). Emitted through the existing progress channel so it lands in the
@@ -4024,8 +4166,10 @@ async function executeTaskRun(request) {
   }
 
   // Permission shape: write runs approve every tool; read-only runs get plan +
-  // read-only sandbox AND deny rules on Edit/Write/NotebookEdit, because the
-  // sandbox is inert on Windows (see buildHeadlessPermissionOptions).
+  // read-only sandbox AND deny rules on Edit/Write, because the sandbox is
+  // inert on Windows (see buildHeadlessPermissionOptions). NotebookEdit is
+  // intentionally omitted: Turbo 1.0 rejects it as an unsupported --deny
+  // prefix and aborts the whole run; Edit already covers that tool family.
   //
   // Isolated runs ADD deny rules on the main checkout so absolute paths in the
   // task brief cannot edit it (write: even under --always-approve; read-only:
@@ -4050,9 +4194,25 @@ async function executeTaskRun(request) {
         phase: "starting"
       });
     }
+    // C19: worktree under main root cannot apply main-checkout deny rules.
+    // Fail closed unless the operator opts into weak isolation.
     if (denyPlan.skipped) {
+      const allowWeak =
+        String(process.env.GROK_BUILD_ALLOW_WEAK_ISOLATE ?? "").trim() === "1" ||
+        String(process.env.GROK_BUILD_ALLOW_WEAK_ISOLATE ?? "")
+          .trim()
+          .toLowerCase() === "true";
+      const message =
+        `Isolation deny rules skipped (${denyPlan.reason}): worktree sits inside the main checkout path, ` +
+        "so Edit/Write main-root denials cannot be applied safely.";
+      if (!allowWeak) {
+        throw new Error(
+          `${message} Move GROK_BUILD_WORKTREE_ROOT / worktree data outside the repo, ` +
+            "or set GROK_BUILD_ALLOW_WEAK_ISOLATE=1 to proceed with weaker isolation."
+        );
+      }
       request.onProgress?.({
-        message: `Warning: isolation deny rules skipped (${denyPlan.reason}); worktree sits inside the main checkout path.`,
+        message: `Warning: ${message} Continuing because GROK_BUILD_ALLOW_WEAK_ISOLATE=1.`,
         phase: "starting"
       });
     } else {
@@ -4061,15 +4221,62 @@ async function executeTaskRun(request) {
         ...denyPlan.rules
       ];
     }
-    // Optional Hyper --confine when the CLI advertises it and the feature
-    // switch is on (default on). Omitted silently on older CLIs.
+    // Turbo/Grok --confine when the feature switch is on (default on).
+    // C6/C9/C20: MCP out-of-tree writes are only gated by --confine. Isolated
+    // runs fail closed when confine cannot be applied (unless weak isolate).
     if (confineFeatureEnabled(process.env)) {
       const binary = resolveGrokBinary(process.env);
       if (cliSupportsConfine(binary, { env: process.env })) {
         permissionOptions.confine = created.worktreePath;
+      } else {
+        const allowWeak =
+          String(process.env.GROK_BUILD_ALLOW_WEAK_ISOLATE ?? "").trim() === "1" ||
+          String(process.env.GROK_BUILD_ALLOW_WEAK_ISOLATE ?? "")
+            .trim()
+            .toLowerCase() === "true";
+        const message =
+          `--confine not applied (CLI probe did not advertise --confine on \`${binary}\`); ` +
+          "MCP path writes would not be path-jailed.";
+        if (!allowWeak) {
+          throw new Error(
+            `Isolated run requires --confine. ${message} ` +
+              "Use a Turbo/Grok agent CLI that supports --confine, or set GROK_BUILD_ALLOW_WEAK_ISOLATE=1."
+          );
+        }
+        request.onProgress?.({
+          message: `Warning: ${message} Continuing because GROK_BUILD_ALLOW_WEAK_ISOLATE=1.`,
+          phase: "starting"
+        });
       }
     }
   }
+
+  // H4: production max-duration kill fallbacks — bridge/worker/job pids when
+  // progress never carried agentPid.
+  const durationKillOptions = {
+    getFallbackPids: () => {
+      const pids = [];
+      try {
+        const stored = request.jobId ? readStoredJob(workspaceRoot, request.jobId) : null;
+        for (const value of [
+          stored?.agentPid,
+          stored?.bridgePid,
+          stored?.companionPid,
+          stored?.pid,
+          request.bridgePid,
+          request.agentPid
+        ]) {
+          const n = Number(value);
+          if (Number.isFinite(n) && n > 0 && !pids.includes(n)) {
+            pids.push(n);
+          }
+        }
+      } catch {
+        // ignore
+      }
+      return pids;
+    }
+  };
 
   const firstAgent = await runHeadlessAgentWithDurationBudget(
     runCwd,
@@ -4106,7 +4313,8 @@ async function executeTaskRun(request) {
       promptFileDir: resolveStateDir(workspaceRoot),
       cwd: runCwd
     },
-    maxDurationSeconds
+    maxDurationSeconds,
+    durationKillOptions
   );
   let result = firstAgent.result;
   if (firstAgent.termination?.treeOutlivedKill) {
@@ -4156,7 +4364,8 @@ async function executeTaskRun(request) {
         promptFileDir: resolveStateDir(workspaceRoot),
         cwd: runCwd
       },
-      maxDurationSeconds
+      maxDurationSeconds,
+      durationKillOptions
     );
     autoContinued = true;
     result = continueAgent.result;
@@ -4451,7 +4660,8 @@ async function executeTaskRun(request) {
           env: runEnv,
           onProgress: request.onProgress
         },
-        maxDurationSeconds
+        maxDurationSeconds,
+        durationKillOptions
       );
       // FIELD-2: accumulate, do not replace. Keep the task-turn deliverable on
       // `result`; record the fix turn separately so show renders the real
@@ -4539,42 +4749,74 @@ async function executeTaskRun(request) {
   // isolated run means the agent wrote outside the worktree. artifact excludes
   // are applied by porcelainChangeEntries. Separately, shared (junctioned)
   // read-mostly dirs are fingerprinted because git status never lists them.
+  // H5: if baseline or post porcelain is null, treat isolation as unreliable
+  // (fail closed) rather than silently non-breached.
   let mainTreeSide = null;
-  if (created && mainDirtyBeforeRunPaths) {
-    const mainAfter = porcelainChangeEntries(workspaceRoot);
-    if (mainAfter) {
-      const leaked = [];
-      for (const [filePath, letter] of mainAfter) {
-        if (mainDirtyBeforeRunPaths.has(filePath)) {
-          continue;
-        }
-        leaked.push(`${letter}\t${filePath}`);
-      }
-      const { work: mainWork, debris: mainDebris } = partitionWorkAndDebris(leaked);
-      if (mainDebris.length > 0) {
-        debris = capChangedFiles(mainDebris);
-      }
-      if (mainWork.length > 0) {
+  let isolationStatusUnreliable = false;
+  if (created) {
+    if (!mainDirtyBeforeRunPaths) {
+      isolationStatusUnreliable = true;
+      isolationBreached = true;
+      isolationLeak = {
+        entries: ["? git-status-unavailable-before-run"],
+        total: 1,
+        truncated: false
+      };
+      request.onProgress?.({
+        message:
+          "Isolation BREACHED (fail-closed): main-checkout git status was unreadable before the run; cannot prove the agent stayed in the worktree.",
+        phase: "finalizing"
+      });
+    } else {
+      const mainAfter = porcelainChangeEntries(workspaceRoot);
+      if (!mainAfter) {
+        isolationStatusUnreliable = true;
         isolationBreached = true;
-        isolationLeak = capChangedFiles(mainWork);
-        mainTreeSide = {
-          ...isolationLeak,
-          emptyReason: null
+        isolationLeak = {
+          entries: ["? git-status-unavailable-after-run"],
+          total: 1,
+          truncated: false
         };
         request.onProgress?.({
-          message: `Isolation BREACHED: ${isolationLeak.total} path(s) changed in the main checkout during this run (agent escape, or a concurrent edit of your own).`,
+          message:
+            "Isolation BREACHED (fail-closed): main-checkout git status was unreadable after the run; cannot prove the agent stayed in the worktree.",
           phase: "finalizing"
         });
       } else {
-        mainTreeSide = {
-          entries: [],
-          total: 0,
-          truncated: false,
-          emptyReason: emptyChangeReason(workspaceRoot, mainDirtyBeforeRunPaths)
-        };
+        const leaked = [];
+        for (const [filePath, letter] of mainAfter) {
+          if (mainDirtyBeforeRunPaths.has(filePath)) {
+            continue;
+          }
+          leaked.push(`${letter}\t${filePath}`);
+        }
+        const { work: mainWork, debris: mainDebris } = partitionWorkAndDebris(leaked);
+        if (mainDebris.length > 0) {
+          debris = capChangedFiles(mainDebris);
+        }
+        if (mainWork.length > 0) {
+          isolationBreached = true;
+          isolationLeak = capChangedFiles(mainWork);
+          mainTreeSide = {
+            ...isolationLeak,
+            emptyReason: null
+          };
+          request.onProgress?.({
+            message: `Isolation BREACHED: ${isolationLeak.total} path(s) changed in the main checkout during this run (agent escape, or a concurrent edit of your own).`,
+            phase: "finalizing"
+          });
+        } else {
+          mainTreeSide = {
+            entries: [],
+            total: 0,
+            truncated: false,
+            emptyReason: emptyChangeReason(workspaceRoot, mainDirtyBeforeRunPaths)
+          };
+        }
       }
     }
   }
+  void isolationStatusUnreliable;
 
   // Post-run assertion on SHARED (read-mostly) provision dirs in the main
   // checkout. A mutation here is an isolation leak that git porcelain cannot
@@ -5396,7 +5638,15 @@ async function drainNestedChildrenAtParentEnd(workspaceRoot, parentRunId, childr
         if (isTerminalJobStatus(record.status)) {
           continue;
         }
-        // Claim before kill so no child observes a cancelled parent and keeps going.
+        // C22: snapshot the full nested tree PIDs (grandchildren included), claim
+        // descendants cancelled, then kill — same order as cancelJobTree (C21).
+        // terminateJobProcessTrees(record) alone only killed the direct child's
+        // own PIDs and left deeper nest agents running.
+        const treeCancel = claimJobTreeDescendantsCancelled(workspaceRoot, record, {
+          childErrorMessage: "Cancelled by parent end-of-run drain (nested descendant)."
+        });
+        const ownPids = resolveJobKillTargets(record);
+        const killPids = [...new Set([...treeCancel.pids, ...ownPids])];
         claimJobTerminal(workspaceRoot, childId, "cancelled", {
           errorMessage: "Cancelled by parent end-of-run drain.",
           phase: "cancelled",
@@ -5404,7 +5654,7 @@ async function drainNestedChildrenAtParentEnd(workspaceRoot, parentRunId, childr
           agentPid: null,
           bridgePid: null
         });
-        terminateJobProcessTrees(record);
+        terminateJobProcessTrees(record, { pids: killPids });
         linkChildOutcomeToParent(workspaceRoot, parentRunId, {
           id: childId,
           status: "cancelled",
@@ -5632,7 +5882,9 @@ function renderTransferResult(payload) {
   const lines = [
     "Imported the Claude session into a Grok session.",
     payload.threadId ? `Grok session ID: ${payload.threadId}` : "Grok session ID: (not detected in import output)",
-    payload.resumeCommand ? `Resume in Grok: ${payload.resumeCommand}` : "Resume with: grok -r <session-id>"
+    payload.resumeCommand
+      ? `Resume in Grok: ${payload.resumeCommand}`
+      : `Resume with: ${resolveGrokBinary()} -r <session-id>`
   ];
   return `${lines.join("\n")}\n`;
 }
@@ -5643,9 +5895,11 @@ async function executeTransfer(cwd, options = {}) {
     source: options.source
   });
   const result = runImport(cwd, { sourcePath });
+  const cliBinary = resolveGrokBinary();
   const payload = {
     threadId: result.threadId,
-    resumeCommand: result.resumeCommand ?? (result.threadId ? `grok -r ${result.threadId}` : null),
+    resumeCommand:
+      result.resumeCommand ?? (result.threadId ? `${cliBinary} -r ${result.threadId}` : null),
     sourcePath,
     sessionId: path.basename(sourcePath, ".jsonl"),
     stdout: result.stdout
@@ -7580,57 +7834,58 @@ function terminateJobProcessTrees(job, options = {}) {
 }
 
 /**
- * Claim every nested descendant cancelled (leaf-first) before killing PIDs,
- * then kill the whole tree. Platform-symmetric: Windows job-object teardown
- * and Unix orphans both become an explicit cascade.
+ * Snapshot tree kill PIDs, claim every nested descendant cancelled (leaf-first),
+ * optionally claim the root cancelled, then kill the whole tree.
+ * PIDs must be resolved *before* claims null them on disk (C21).
+ * Root claim before kill is load-bearing (H3): otherwise a finishing runner can
+ * claim completed first and stop loses (cancelled-wins cannot overwrite).
  */
 function cancelJobTree(workspaceRoot, rootJob, options = {}) {
-  const tree = collectJobTreeLeafFirst(workspaceRoot, rootJob);
-  const childClaims = [];
-  // Leaf-first: claim descendants before the root so no child observes a
-  // cancelled parent and keeps going.
-  for (const node of tree) {
-    if (!node?.id || node.id === rootJob.id) {
-      continue;
+  // Snapshot + claim non-root descendants first (C21). PID snapshot is taken
+  // inside claimJobTreeDescendantsCancelled *before* any claim nulls fields.
+  const { pids, childClaims, treeJobIds } = claimJobTreeDescendantsCancelled(
+    workspaceRoot,
+    rootJob,
+    {
+      childErrorMessage: options.childErrorMessage ?? "Stopped because parent run was cancelled.",
+      onChildClaimed: (node) => {
+        if (rootJob.id && node.parentRunId === rootJob.id) {
+          linkChildOutcomeToParent(workspaceRoot, rootJob.id, {
+            id: node.id,
+            status: "cancelled",
+            changedFileCount: node.changedFileCount ?? null,
+            usage: node.usage ?? null,
+            worktree: node.worktree ?? null
+          });
+        }
+      }
     }
-    if (isTerminalJobStatus(node.status)) {
-      childClaims.push({ jobId: node.id, status: node.status, alreadyTerminal: true });
-      continue;
-    }
+  );
+
+  // H3: claim root cancelled *before* kill so a finishing runner cannot win
+  // completed over stop (cancelled-wins only blocks later completed if we claim first).
+  let rootClaim = null;
+  if (options.claimRoot !== false && rootJob?.id) {
     try {
-      const claim = claimJobTerminal(workspaceRoot, node.id, "cancelled", {
-        errorMessage: options.childErrorMessage ?? "Stopped because parent run was cancelled.",
+      rootClaim = claimJobTerminal(workspaceRoot, rootJob.id, "cancelled", {
+        errorMessage: options.rootErrorMessage ?? "Stopped by user.",
         phase: "cancelled",
         pid: null,
         agentPid: null,
         bridgePid: null,
-        logFile: node.logFile ?? null
+        logFile: rootJob.logFile ?? null
       });
-      childClaims.push({
-        jobId: node.id,
-        status: claim.status ?? "cancelled",
-        alreadyTerminal: !claim.claimed,
-        claimed: Boolean(claim.claimed)
-      });
-      if (rootJob.id && node.parentRunId === rootJob.id) {
-        linkChildOutcomeToParent(workspaceRoot, rootJob.id, {
-          id: node.id,
-          status: "cancelled",
-          changedFileCount: node.changedFileCount ?? null,
-          usage: node.usage ?? null,
-          worktree: node.worktree ?? null
-        });
-      }
     } catch (error) {
-      childClaims.push({
-        jobId: node.id,
+      rootClaim = {
+        claimed: false,
         error: error instanceof Error ? error.message : String(error)
-      });
+      };
     }
   }
-  const { pids } = resolveJobTreeKillTargets(workspaceRoot, rootJob);
+
+  // Kill uses pre-claim snapshot (includes root + descendant PIDs).
   const killResult = terminateJobProcessTrees(rootJob, { pids });
-  return { childClaims, killResult, treeJobIds: tree.map((n) => n.id) };
+  return { childClaims, killResult, treeJobIds, rootClaim, pids };
 }
 
 async function handleCancel(argv) {
@@ -7646,20 +7901,18 @@ async function handleCancel(argv) {
   const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
   const existing = readStoredJob(workspaceRoot, job.id) ?? job;
   const preClaimRecord = { ...job, ...existing };
-  // Cascade: claim descendants leaf-first, then kill the whole tree.
+  // H3: claim descendants + root first (with pre-claim PID snapshot), then kill.
   const treeCancel = cancelJobTree(workspaceRoot, preClaimRecord, {
-    childErrorMessage: "Stopped because parent run was cancelled by user."
+    childErrorMessage: "Stopped because parent run was cancelled by user.",
+    rootErrorMessage: "Stopped by user.",
+    claimRoot: true
   });
-  const killTargets = treeCancel.killResult.killTargets ?? resolveJobTreeKillTargets(workspaceRoot, preClaimRecord).pids;
-
-  const claim = claimJobTerminal(workspaceRoot, job.id, "cancelled", {
-    errorMessage: "Stopped by user.",
-    phase: "cancelled",
-    pid: null,
-    agentPid: null,
-    bridgePid: null,
-    logFile: existing.logFile ?? job.logFile ?? null
-  });
+  const killTargets = treeCancel.killResult.killTargets ?? treeCancel.pids ?? [];
+  const claim = treeCancel.rootClaim ?? {
+    claimed: false,
+    status: existing.status,
+    job: existing
+  };
 
   const killResult = treeCancel.killResult;
 

@@ -17,8 +17,12 @@ export function createNdjsonDecoder() {
   };
 }
 
-/** Parse one NDJSON line. Returns null for anything that is not a JSON object. */
-export function parseStreamEvent(line) {
+/**
+ * Parse one NDJSON line.
+ * @returns {{ ok: true, event: object } | { ok: false, reason: string, line: string } | null}
+ *   null = empty line (not an error). ok:false = malformed / non-object (C13).
+ */
+export function parseStreamEventDetailed(line) {
   const text = String(line ?? "").trim();
   if (!text) {
     return null;
@@ -26,12 +30,25 @@ export function parseStreamEvent(line) {
   try {
     const value = JSON.parse(text);
     if (!value || typeof value !== "object" || Array.isArray(value)) {
-      return null;
+      return { ok: false, reason: "not-a-json-object", line: text };
     }
-    return value;
-  } catch {
+    return { ok: true, event: value };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: error instanceof Error ? error.message : "json-parse-failed",
+      line: text.length > 200 ? `${text.slice(0, 200)}…` : text
+    };
+  }
+}
+
+/** Parse one NDJSON line. Returns null for empty, malformed, or non-object values. */
+export function parseStreamEvent(line) {
+  const detailed = parseStreamEventDetailed(line);
+  if (!detailed || !detailed.ok) {
     return null;
   }
+  return detailed.event;
 }
 
 export const MESSAGE_SEPARATOR = "\n\n";
@@ -636,6 +653,11 @@ export function createStreamTranscript() {
   let subagentsRollup = null;
   let autoContinueCount = 0;
   let streamSchemaVersion = null;
+  // Turbo --json-schema payload on streaming-json end (C11).
+  let structuredOutput = null;
+  let structuredOutputError = null;
+  // C13: lines that failed JSON parse or were non-objects.
+  const malformedLines = [];
 
   function closeCurrentMessage() {
     const completed = current.trim();
@@ -754,6 +776,21 @@ export function createStreamTranscript() {
         cancelled: finiteOrNull(sa.cancelled) ?? 0
       };
       result.subagents = subagentsRollup;
+    }
+    // Turbo attaches validated --json-schema payload on the end event (C11).
+    if ("structuredOutput" in event || "structured_output" in event) {
+      structuredOutput = event.structuredOutput ?? event.structured_output ?? null;
+      result.structuredOutput = structuredOutput;
+    }
+    if ("structuredOutputError" in event || "structured_output_error" in event) {
+      const err = event.structuredOutputError ?? event.structured_output_error;
+      structuredOutputError =
+        err == null || err === ""
+          ? null
+          : typeof err === "string"
+            ? err
+            : JSON.stringify(err);
+      result.structuredOutputError = structuredOutputError;
     }
     activeTools.clear();
   }
@@ -968,6 +1005,22 @@ export function createStreamTranscript() {
   }
 
   return {
+    /**
+     * Record a non-empty NDJSON line that failed to parse (C13).
+     * @param {string} line
+     * @param {string} [reason]
+     */
+    noteMalformedLine(line, reason = "json-parse-failed") {
+      const text = String(line ?? "").trim();
+      if (!text) {
+        return;
+      }
+      malformedLines.push({
+        reason: String(reason ?? "json-parse-failed"),
+        line: text.length > 200 ? `${text.slice(0, 200)}…` : text
+      });
+    },
+
     accept(event) {
       const type = typeof event?.type === "string" ? event.type : "";
       const result = { phase: PHASE_BY_TYPE[type] ?? null, textDelta: "", messageCompleted: null };
@@ -1159,6 +1212,10 @@ export function createStreamTranscript() {
         filesChanged,
         autoContinueCount,
         streamSchemaVersion,
+        structuredOutput,
+        structuredOutputError,
+        malformedLines: [...malformedLines],
+        malformedLineCount: malformedLines.length,
         // Zero means the CLI emitted a stream this parser understood nothing
         // of - a renamed event vocabulary, or not NDJSON at all. Callers use it
         // to decide whether the transcript above is empty because the run was

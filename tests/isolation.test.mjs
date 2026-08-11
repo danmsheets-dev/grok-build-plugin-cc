@@ -26,7 +26,9 @@ import {
   detectCaller
 } from "../plugins/grok-build/scripts/lib/workspace.mjs";
 import {
+  collectWorktreeReparsePaths,
   createWorktree,
+  linkExcludePathspecs,
   reconcileOrphanWorktrees,
   removeDirectoryTree,
   removeWorktree,
@@ -115,13 +117,12 @@ test("resolveIsolateSetting forced-programmatic refusal path", () => {
  * Deny rules + self-denying guard
  * ---------------------------------------------------------------------- */
 
-test("buildWorkspaceRootDenyRules emits Edit/Write/NotebookEdit with forward slashes", () => {
+test("buildWorkspaceRootDenyRules emits Edit/Write with forward slashes", () => {
   const plan = buildWorkspaceRootDenyRules("C:\\Users\\me\\repo", "C:\\Users\\me\\wt");
   assert.equal(plan.skipped, false);
   assert.deepEqual(plan.rules, [
     "Edit(C:/Users/me/repo/**)",
-    "Write(C:/Users/me/repo/**)",
-    "NotebookEdit(C:/Users/me/repo/**)"
+    "Write(C:/Users/me/repo/**)"
   ]);
 });
 
@@ -809,6 +810,27 @@ test("max-duration returns after a bounded kill wait and reports a surviving tre
   assert.match(outcome.result.stderr, /could not be terminated|still running/i);
 });
 
+test("max-duration uses fallback pids when agentPid never arrives (C23)", async () => {
+  const killed = [];
+  const outcome = await runHeadlessAgentWithDurationBudget(
+    "/tmp/worktree",
+    { onProgress() {} },
+    0.01,
+    {
+      runAgentImpl: () => new Promise(() => {}),
+      getFallbackPids: () => [4242],
+      terminateProcessTreeImpl: (pid) => {
+        killed.push(pid);
+        return { attempted: true, delivered: true, method: "test-kill" };
+      },
+      terminationGraceMs: 25
+    }
+  );
+  assert.equal(outcome.timedOut, true);
+  assert.deepEqual(killed, [4242]);
+  assert.ok(outcome.termination.attempted);
+});
+
 test("terminateProcessTree never throws on taskkill failure", () => {
   const calls = [];
   let alive = true;
@@ -1016,7 +1038,7 @@ test("segment-anchored deny rules are added when the repo name is safe", () => {
   });
   assert.equal(plan.skipped, false);
   assert.equal(plan.segmentRuleApplied, true);
-  for (const tool of ["Edit", "Write", "NotebookEdit"]) {
+  for (const tool of ["Edit", "Write"]) {
     assert.ok(plan.rules.includes(`${tool}(C:/work/Main Repo/**)`), `absolute ${tool}`);
     assert.ok(plan.rules.includes(`${tool}(**/Main Repo/**)`), `segment ${tool}`);
   }
@@ -1029,7 +1051,7 @@ test("segment-anchored deny rules are omitted when the name occurs in the worktr
     segmentSafe: false
   });
   assert.equal(plan.segmentRuleApplied, false);
-  assert.equal(plan.rules.length, 3);
+  assert.equal(plan.rules.length, 2);
   assert.ok(plan.rules.every((rule) => !rule.includes("**/src/**")));
 });
 
@@ -1044,6 +1066,30 @@ test("segment-anchored rules are skipped for a drive root or a one-character nam
   );
 });
 
+test("collectWorktreeReparsePaths finds nested junctions (C18)", () => {
+  const root = makeTempDir("reparse-root-");
+  const nested = path.join(root, "game");
+  fs.mkdirSync(nested, { recursive: true });
+  const target = makeTempDir("reparse-target-");
+  // Prefer symlink; on win32 without privilege this may fail — skip then.
+  try {
+    fs.symlinkSync(target, path.join(nested, "vendor"), process.platform === "win32" ? "junction" : "dir");
+  } catch {
+    // Junctions need privileges on some Windows setups.
+    return;
+  }
+  const found = collectWorktreeReparsePaths(root);
+  assert.ok(
+    found.some((p) => p === "game/vendor" || p.endsWith("game/vendor")),
+    `expected nested reparse, got ${JSON.stringify(found)}`
+  );
+  const excludes = linkExcludePathspecs(root);
+  assert.ok(
+    excludes.some((p) => p.includes("game/vendor")),
+    `expected exclude pathspec for nested link, got ${JSON.stringify(excludes)}`
+  );
+});
+
 test("worktreeContainsSegment reports a collision, and fails closed on a git error", () => {
   const calls = [];
   const hit = worktreeContainsSegment("C:/tmp/wt", "src", {
@@ -1054,7 +1100,15 @@ test("worktreeContainsSegment reports a collision, and fails closed on a git err
   });
   assert.equal(hit, true);
   assert.equal(calls[0].bin, "git");
-  assert.deepEqual(calls[0].args, ["ls-files", "-z", "--", "src/*", "**/src/*"]);
+  assert.deepEqual(calls[0].args, [
+    "ls-files",
+    "-z",
+    "--",
+    "src/*",
+    "**/src/*",
+    ":(glob)src/**",
+    ":(glob)**/src/**"
+  ]);
   assert.equal(calls[0].cwd, "C:/tmp/wt");
 
   const clean = worktreeContainsSegment("C:/tmp/wt", "Main Repo", {

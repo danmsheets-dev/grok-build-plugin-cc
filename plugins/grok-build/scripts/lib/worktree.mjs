@@ -1067,8 +1067,11 @@ function formatGitFailure(operation, result) {
  * form are emitted for the same reason `artifactExcludePathspecs` emits both:
  * on POSIX the link itself is a stageable mode-120000 blob.
  *
- * Only the worktree root is scanned, because that is the only place
- * `planWorktreeLinks` ever creates a link.
+ * Scan the worktree for symlink/junction reparse points (root and nested).
+ *
+ * C18: `planWorktreeLinks` also creates share junctions under nested project
+ * dirs (e.g. `game/vendor`). Root-only scanning left those walkable by
+ * `git add -A` on Windows.
  *
  * A link git ALREADY ignores gets no pathspec at all, and that omission is the
  * whole point rather than an optimisation. `git add` fails outright — exit 1,
@@ -1083,32 +1086,69 @@ function formatGitFailure(operation, result) {
  * be staged, so it never needed an exclude in the first place.
  *
  * @param {string} worktreePath
+ * @param {{ maxDepth?: number }} [options]
  * @returns {string[]}
  */
-function linkExcludePathspecs(worktreePath) {
-  let entries;
-  try {
-    entries = fs.readdirSync(worktreePath, { withFileTypes: true });
-  } catch {
-    // A worktree we cannot read is a problem the `git add` below will report
-    // far more usefully than a thrown ENOENT from a pathspec helper.
-    return [];
+export function collectWorktreeReparsePaths(worktreePath, options = {}) {
+  const maxDepth = Number.isFinite(Number(options.maxDepth)) ? Number(options.maxDepth) : 8;
+  const found = [];
+
+  function walk(dir, rel, depth) {
+    if (depth > maxDepth) {
+      return;
+    }
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const name = entry.name;
+      if (name === ".git") {
+        continue;
+      }
+      const childRel = rel ? `${rel}/${name}` : name;
+      const full = path.join(dir, name);
+      if (entry.isSymbolicLink()) {
+        found.push(childRel.replace(/\\/g, "/"));
+        // Do not walk into junctions — that would traverse the main tree.
+        continue;
+      }
+      if (entry.isDirectory()) {
+        walk(full, childRel, depth + 1);
+      }
+    }
   }
 
-  const links = entries.filter((entry) => entry.isSymbolicLink()).map((entry) => entry.name);
+  walk(worktreePath, "", 0);
+  return found;
+}
+
+/**
+ * @param {string} worktreePath
+ * @returns {string[]}
+ */
+export function linkExcludePathspecs(worktreePath) {
+  const links = collectWorktreeReparsePaths(worktreePath);
   if (links.length === 0) {
     return [];
   }
 
   // One `check-ignore` for the whole set: it exits 1 when NOTHING matches, which
   // is not an error here, and prints one line per ignored path when some do.
+  // Cap argv size on huge monorepos by batching.
   const ignored = new Set();
-  const check = git(worktreePath, ["check-ignore", "--", ...links]);
-  if (check.status === 0) {
-    for (const line of String(check.stdout ?? "").split(/\r?\n/)) {
-      const name = line.trim();
-      if (name) {
-        ignored.add(name);
+  const batchSize = 64;
+  for (let i = 0; i < links.length; i += batchSize) {
+    const batch = links.slice(i, i + batchSize);
+    const check = git(worktreePath, ["check-ignore", "--", ...batch]);
+    if (check.status === 0) {
+      for (const line of String(check.stdout ?? "").split(/\r?\n/)) {
+        const name = line.trim().replace(/\\/g, "/");
+        if (name) {
+          ignored.add(name);
+        }
       }
     }
   }

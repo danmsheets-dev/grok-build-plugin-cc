@@ -110,7 +110,7 @@ describe("planWorktreeLinks", () => {
     }
   });
 
-  test("live-state dirs are private (hardlink-seed / env), not shared junctions", () => {
+  test("live-state dirs are private (copy / env), not shared junctions", () => {
     const existsSync = mock.method(fs, "existsSync", (p) => {
       const s = String(p);
       return s.endsWith("node_modules") || s.endsWith("target") || s.endsWith(".venv");
@@ -119,11 +119,11 @@ describe("planWorktreeLinks", () => {
     const plan = planWorktreeLinks("/repo", "/wt", { platform: "linux", existsSync, statSync });
     const nm = plan.links.find((l) => path.basename(l.from) === "node_modules");
     assertModule.ok(nm, "node_modules must be planned");
-    assertModule.strictEqual(nm.kind, "hardlink-seed");
+    assertModule.strictEqual(nm.kind, "copy");
     assertModule.ok(!plan.links.some((l) => path.basename(l.from) === ".venv" && (l.kind === "symlink" || l.kind === "junction")));
     const venv = plan.links.find((l) => path.basename(l.from) === ".venv");
     assertModule.ok(venv);
-    assertModule.strictEqual(venv.kind, "hardlink-seed");
+    assertModule.strictEqual(venv.kind, "copy");
     // target uses CARGO_TARGET_DIR, not a link into main target/
     assertModule.ok(plan.env.CARGO_TARGET_DIR);
     assertModule.ok(String(plan.env.CARGO_TARGET_DIR).includes(CARGO_TARGET_DIR_RELATIVE.replace(/\//g, path.sep)) ||
@@ -326,7 +326,7 @@ describe("Godot import cache tier", () => {
     assertModule.ok(!plan.links.some((link) => link.kind === "junction"), "no .godot junction");
     assertModule.ok(names.includes("uid_cache.bin"), `expected a seeded uid_cache.bin, got ${names}`);
     for (const link of plan.links) {
-      // Private seed uses hardlink-seed (falls back to copy on EXDEV).
+      // Private seed uses full copy (C16: no shared inodes with main).
       assertModule.ok(
         link.kind === "mkdir" || link.kind === "hardlink-seed" || link.kind === "copy",
         `unexpected kind ${link.kind}`
@@ -878,7 +878,7 @@ describe("shared-dir fingerprint post-run assertion", () => {
 });
 
 describe("private node_modules does not write through", () => {
-  test("hardlink-seeded node_modules keeps main checkout untouched by new files", () => {
+  test("copied node_modules keeps main checkout untouched by new files and content writes (C16)", () => {
     const repo = makeTempDir("grok-nm-repo-");
     const wt = makeTempDir("grok-nm-wt-");
     realFs.mkdirSync(path.join(repo, "node_modules", "left-pad"), { recursive: true });
@@ -889,18 +889,31 @@ describe("private node_modules does not write through", () => {
       statSync: realFs.statSync,
       env: {}
     });
+    const nmLink = plan.links.find((l) => path.basename(l.from) === "node_modules");
+    assertModule.strictEqual(nmLink?.kind, "copy");
     const result = provisionWorktree(plan, realFs);
     assertModule.ok(
       result.provisioned.some((e) => path.basename(e.to) === "node_modules"),
       JSON.stringify(result)
     );
     assertModule.ok(!result.provisioned.some((e) => e.kind === "junction" || e.kind === "symlink"));
+    assertModule.ok(
+      result.provisioned.some((e) => path.basename(e.to) === "node_modules" && e.kind === "copy"),
+      "private node_modules must be a full copy, not a hardlink-seed"
+    );
 
     realFs.mkdirSync(path.join(wt, "node_modules", "evil"), { recursive: true });
     realFs.writeFileSync(path.join(wt, "node_modules", "evil", "pwn.js"), "owned\n");
     assertModule.ok(
       !realFs.existsSync(path.join(repo, "node_modules", "evil")),
       "install into private node_modules must not create packages in the main checkout"
+    );
+
+    // In-place content mutation must not rewrite main (shared-inode bug).
+    realFs.writeFileSync(path.join(wt, "node_modules", "left-pad", "index.js"), "module.exports=99\n");
+    assertModule.equal(
+      realFs.readFileSync(path.join(repo, "node_modules", "left-pad", "index.js"), "utf8"),
+      "module.exports=0\n"
     );
   });
 });

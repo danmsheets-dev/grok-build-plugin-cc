@@ -48,7 +48,7 @@ test("terminateProcessTree uses taskkill on Windows", () => {
   assert.equal(outcome.method, "taskkill");
 });
 
-test("terminateProcessTree treats missing Windows processes as already stopped", () => {
+test("terminateProcessTree treats missing Windows processes as already stopped (C24)", () => {
   const outcome = terminateProcessTree(1234, {
     platform: "win32",
     runCommandImpl(command, args) {
@@ -65,6 +65,9 @@ test("terminateProcessTree treats missing Windows processes as already stopped",
   });
 
   assert.equal(outcome.attempted, true);
+  // delivered means observed-dead — already-exited is success, not a tombstone.
+  assert.equal(outcome.delivered, true);
+  assert.equal(outcome.alreadyExited, true);
   assert.equal(outcome.method, "taskkill");
   assert.equal(outcome.result.status, 128);
   assert.match(outcome.result.stdout, /not found/i);

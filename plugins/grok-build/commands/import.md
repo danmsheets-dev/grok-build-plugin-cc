@@ -7,4 +7,4 @@ allowed-tools: Bash(node:*)
 
 !`node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" import "$ARGUMENTS"`
 
-Present the command output to the user exactly as returned. Preserve the Grok session ID and the `grok -r <session-id>` command.
+Present the command output to the user exactly as returned. Preserve the Grok session ID and the resume command (`turbo -r <session-id>` or whatever binary the bridge resolved).

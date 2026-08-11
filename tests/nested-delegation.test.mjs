@@ -30,7 +30,8 @@ import {
 import {
   collectJobTreeLeafFirst,
   resolveJobKillTargets,
-  resolveJobTreeKillTargets
+  resolveJobTreeKillTargets,
+  claimJobTreeDescendantsCancelled
 } from "../plugins/grok-build/scripts/lib/tracked-jobs.mjs";
 import {
   generateJobId,
@@ -681,6 +682,79 @@ test("resolveJobTreeKillTargets walks children leaf-first", () => {
     // Own-only targets omit the descendants.
     const own = resolveJobKillTargets(parent);
     assert.equal(own.includes(3001), false);
+  } finally {
+    if (previous == null) {
+      delete process.env.CLAUDE_PLUGIN_DATA;
+    } else {
+      process.env.CLAUDE_PLUGIN_DATA = previous;
+    }
+  }
+});
+
+test("claimJobTreeDescendantsCancelled snapshots PIDs before claim nulls them (C21)", () => {
+  const dir = makeTempDir("nest-cancel-snapshot-");
+  const previous = process.env.CLAUDE_PLUGIN_DATA;
+  process.env.CLAUDE_PLUGIN_DATA = dir;
+  try {
+    const parentId = generateJobId("run");
+    const childId = generateJobId("run");
+    const grandId = generateJobId("run");
+    writeJobFile(dir, grandId, {
+      id: grandId,
+      status: "running",
+      parentRunId: childId,
+      agentPid: 3001,
+      bridgePid: 3002,
+      children: []
+    });
+    writeJobFile(dir, childId, {
+      id: childId,
+      status: "running",
+      parentRunId: parentId,
+      agentPid: 2001,
+      bridgePid: 2002,
+      children: [{ runId: grandId, status: "running" }]
+    });
+    writeJobFile(dir, parentId, {
+      id: parentId,
+      status: "running",
+      agentPid: 1001,
+      bridgePid: 1002,
+      children: [{ runId: childId, status: "running" }]
+    });
+    upsertJob(dir, { id: parentId, status: "running" });
+    upsertJob(dir, { id: childId, status: "running" });
+    upsertJob(dir, { id: grandId, status: "running" });
+
+    const parent = {
+      id: parentId,
+      status: "running",
+      agentPid: 1001,
+      bridgePid: 1002,
+      children: [{ runId: childId, status: "running" }]
+    };
+
+    const result = claimJobTreeDescendantsCancelled(dir, parent, {
+      childErrorMessage: "Stopped because parent run was cancelled."
+    });
+
+    // Pre-claim snapshot must still include descendant agent/bridge PIDs.
+    for (const pid of [1001, 1002, 2001, 2002, 3001, 3002]) {
+      assert.ok(result.pids.includes(pid), `missing kill target ${pid}`);
+    }
+
+    // Descendants are cancelled; stored pid fields are nulled (as stop does).
+    const childClaims = result.childClaims.filter((entry) => !entry.alreadyTerminal);
+    assert.ok(childClaims.some((entry) => entry.jobId === childId && entry.claimed));
+    assert.ok(childClaims.some((entry) => entry.jobId === grandId && entry.claimed));
+    assert.equal(isTerminalJobStatus("cancelled"), true);
+
+    // Re-resolving after claim must NOT be used for kill — descendants are empty.
+    const after = resolveJobTreeKillTargets(dir, parent);
+    assert.equal(after.pids.includes(2001), false);
+    assert.equal(after.pids.includes(3001), false);
+    // Parent was not claimed by this helper; its pids remain on disk.
+    assert.ok(after.pids.includes(1001));
   } finally {
     if (previous == null) {
       delete process.env.CLAUDE_PLUGIN_DATA;

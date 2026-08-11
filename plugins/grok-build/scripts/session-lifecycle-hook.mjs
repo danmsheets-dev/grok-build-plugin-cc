@@ -59,6 +59,8 @@ function cleanupSessionJobs(cwd, sessionId) {
     if (stillRunning) {
       // Cascade through nested children so a session-end stop is
       // platform-symmetric (not only the parent's own PIDs).
+      // Snapshot PIDs before any claim nulls them (C21). Claim descendants AND
+      // root before kill so a finishing runner cannot win completed (H3/M7).
       const { pids: killTargets, jobs: treeJobs } = resolveJobTreeKillTargets(
         workspaceRoot,
         job
@@ -82,6 +84,21 @@ function cleanupSessionJobs(cwd, sessionId) {
           // Claim races are fine.
         }
       }
+      // Claim root before kill (same order as handleCancel).
+      let rootClaimed = false;
+      try {
+        const rootClaim = claimJobTerminal(workspaceRoot, job.id, "cancelled", {
+          errorMessage: "Stopped by session end.",
+          phase: "cancelled",
+          pid: null,
+          agentPid: null,
+          bridgePid: null
+        });
+        rootClaimed = Boolean(rootClaim?.claimed || rootClaim?.status === "cancelled");
+      } catch {
+        // Claim races are fine.
+      }
+
       const killResults = [];
       const survivors = [];
       for (const pid of killTargets) {
@@ -99,29 +116,27 @@ function cleanupSessionJobs(cwd, sessionId) {
         killTargets.length === 0 ||
         (killResults.some((entry) => entry.delivered) && survivors.length === 0);
 
-      try {
-        claimJobTerminal(workspaceRoot, job.id, "cancelled", {
-          errorMessage: killDelivered
-            ? "Stopped by session end."
-            : "Stopped by session end; process kill was not confirmed.",
-          phase: "cancelled",
-          pid: null,
-          agentPid: null,
-          bridgePid: null,
-          // Tombstone when a kill could not be delivered so later prune/doctor
-          // can see which PIDs may still need a human.
-          killTombstone: killDelivered
-            ? null
-            : {
-                at: new Date().toISOString(),
-                survivors: [...new Set(survivors)],
-                method: killResults.map((entry) => entry.method).filter(Boolean).join("+") || null,
-                errorText:
-                  killResults.map((entry) => entry.errorText).filter(Boolean).join("; ") || null
-              }
-        });
-      } catch {
-        // Claim races are fine; the process kill already ran.
+      // Patch kill outcome onto the already-claimed root when possible.
+      if (rootClaimed) {
+        try {
+          claimJobTerminal(workspaceRoot, job.id, "cancelled", {
+            errorMessage: killDelivered
+              ? "Stopped by session end."
+              : "Stopped by session end; process kill was not confirmed.",
+            phase: "cancelled",
+            killTombstone: killDelivered
+              ? null
+              : {
+                  at: new Date().toISOString(),
+                  survivors: [...new Set(survivors)],
+                  method: killResults.map((entry) => entry.method).filter(Boolean).join("+") || null,
+                  errorText:
+                    killResults.map((entry) => entry.errorText).filter(Boolean).join("; ") || null
+                }
+          });
+        } catch {
+          // cancelled-wins / races are fine.
+        }
       }
     }
   }

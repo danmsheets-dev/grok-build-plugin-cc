@@ -580,6 +580,72 @@ export function resolveJobTreeKillTargets(workspaceRoot, job, options = {}) {
   return { pids, jobs };
 }
 
+/**
+ * Snapshot tree kill PIDs, then claim every non-root descendant cancelled.
+ *
+ * Order is load-bearing (C21): `claimJobTerminal` persists `pid`/`agentPid`/
+ * `bridgePid` as null. Resolving kill targets *after* that re-read yields an
+ * empty set for descendants, so nested turbo/workers keep running while the
+ * job record says cancelled. Session-end already used snapshot-then-claim;
+ * stop/cancel must match.
+ *
+ * @param {string} workspaceRoot
+ * @param {object} rootJob
+ * @param {{
+ *   childErrorMessage?: string,
+ *   onChildClaimed?: (node: object, claim: object) => void,
+ *   readStoredJob?: Function
+ * }} [options]
+ * @returns {{ pids: number[], childClaims: object[], treeJobIds: string[], tree: object[] }}
+ */
+export function claimJobTreeDescendantsCancelled(workspaceRoot, rootJob, options = {}) {
+  const tree = collectJobTreeLeafFirst(workspaceRoot, rootJob, options);
+  // Snapshot BEFORE any claim nulls PIDs on disk.
+  const { pids } = resolveJobTreeKillTargets(workspaceRoot, rootJob, options);
+  const childClaims = [];
+  const childErrorMessage =
+    options.childErrorMessage ?? "Stopped because parent run was cancelled.";
+
+  for (const node of tree) {
+    if (!node?.id || node.id === rootJob.id) {
+      continue;
+    }
+    if (isTerminalJobStatus(node.status)) {
+      childClaims.push({ jobId: node.id, status: node.status, alreadyTerminal: true });
+      continue;
+    }
+    try {
+      const claim = claimJobTerminal(workspaceRoot, node.id, "cancelled", {
+        errorMessage: childErrorMessage,
+        phase: "cancelled",
+        pid: null,
+        agentPid: null,
+        bridgePid: null,
+        logFile: node.logFile ?? null
+      });
+      childClaims.push({
+        jobId: node.id,
+        status: claim.status ?? "cancelled",
+        alreadyTerminal: !claim.claimed,
+        claimed: Boolean(claim.claimed)
+      });
+      options.onChildClaimed?.(node, claim);
+    } catch (error) {
+      childClaims.push({
+        jobId: node.id,
+        error: error instanceof Error ? error.message : String(error)
+      });
+    }
+  }
+
+  return {
+    pids,
+    childClaims,
+    treeJobIds: tree.map((node) => node.id),
+    tree
+  };
+}
+
 export const HEARTBEAT_INTERVAL_MS = 15000;
 
 /**

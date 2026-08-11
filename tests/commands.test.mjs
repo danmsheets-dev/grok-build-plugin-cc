@@ -116,7 +116,7 @@ test("plugin surfaces use /grok-build names and grok binary, not codex", () => {
   assert.match(hooks, /session-lifecycle-hook\.mjs/);
 
   const importCmd = read("commands/import.md");
-  assert.match(importCmd, /grok -r <session-id>/);
+  assert.match(importCmd, /turbo -r <session-id>/);
   assert.match(importCmd, /grok-bridge\.mjs" import/);
 
   const check = read("commands/check.md");

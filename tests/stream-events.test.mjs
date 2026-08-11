@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createNdjsonDecoder, parseStreamEvent } from "../plugins/grok-build/scripts/lib/stream-events.mjs";
+import {
+  createNdjsonDecoder,
+  parseStreamEvent,
+  parseStreamEventDetailed
+} from "../plugins/grok-build/scripts/lib/stream-events.mjs";
 
 test("decoder returns only complete lines and retains the partial tail", () => {
   const decoder = createNdjsonDecoder();
@@ -160,6 +164,53 @@ test("toolCallCount is a genuine 0 when the end event reports zero tool calls", 
     { type: "end", stopReason: "EndTurn", toolCallCount: 0 }
   ]);
   assert.equal(transcript.finish().toolCallCount, 0);
+});
+
+test("streaming end captures structuredOutput and structuredOutputError (C11)", () => {
+  const transcript = createStreamTranscript();
+  feed(transcript, [
+    { type: "text", data: "review done" },
+    {
+      type: "end",
+      stopReason: "EndTurn",
+      sessionId: "sess-1",
+      structuredOutput: { verdict: "approve", summary: "ok", findings: [], next_steps: [] },
+      structuredOutputError: null
+    }
+  ]);
+  const result = transcript.finish();
+  assert.equal(result.structuredOutput?.verdict, "approve");
+  assert.equal(result.structuredOutputError, null);
+
+  const failed = createStreamTranscript();
+  feed(failed, [
+    { type: "end", structuredOutput: null, structuredOutputError: "schema failed" }
+  ]);
+  assert.equal(failed.finish().structuredOutputError, "schema failed");
+});
+
+test("malformed NDJSON lines are recorded with reasons (C13)", () => {
+  const transcript = createStreamTranscript();
+  transcript.noteMalformedLine("{not json", "json-parse-failed");
+  transcript.noteMalformedLine('["array"]', "not-a-json-object");
+  const result = transcript.finish();
+  assert.equal(result.malformedLineCount, 2);
+  assert.equal(result.malformedLines.length, 2);
+  assert.equal(result.malformedLines[0].reason, "json-parse-failed");
+  assert.equal(result.malformedLines[1].reason, "not-a-json-object");
+});
+
+test("parseStreamEventDetailed reports reasons for bad lines (C13)", () => {
+  assert.equal(parseStreamEventDetailed(""), null);
+  assert.equal(parseStreamEventDetailed("   "), null);
+  const badJson = parseStreamEventDetailed("{not json");
+  assert.equal(badJson.ok, false);
+  assert.match(String(badJson.reason), /JSON|json|Unexpected|position|token/i);
+  const arr = parseStreamEventDetailed("[1,2]");
+  assert.deepEqual(arr, { ok: false, reason: "not-a-json-object", line: "[1,2]" });
+  const good = parseStreamEventDetailed('{"type":"text","data":"x"}');
+  assert.equal(good.ok, true);
+  assert.equal(good.event.type, "text");
 });
 
 test("toolCallCount counts multiple invocations", () => {

@@ -12,7 +12,7 @@ import { detectEcosystems, sanitizePythonModuleName } from "./ecosystem.mjs";
 // (node_modules + framework build caches), and generic vendor dirs.
 //
 // Classification into *share* vs *live-state* is PROVISION_DIR_POLICY below.
-// Live-state dirs are private to the worktree (hardlink-seeded when possible);
+// Live-state dirs are private to the worktree (full copy — not hardlinked);
 // only read-mostly caches are junctioned/symlinked into the main checkout.
 export const PROVISION_LINK_DIRS = Object.freeze([
   "node_modules",
@@ -532,8 +532,8 @@ export function planWorktreeLinks(repoRoot, worktreePath, options = {}) {
       continue;
     }
 
-    // tier === "copy" (private). Godot keeps its partial seed; everything else
-    // hardlink-seeds the whole tree.
+    // tier === "copy" (private). Godot keeps a partial seed (not multi-GB
+    // .godot/imported); other live-state dirs are full-copied (C16).
     if (GODOT_CACHE_DIRS.includes(name)) {
       // Keep the cache private even when it is empty. A mkdir entry gives the
       // engine a real directory to import into instead of leaving a missing
@@ -548,7 +548,10 @@ export function planWorktreeLinks(repoRoot, worktreePath, options = {}) {
       continue;
     }
 
-    links.push({ from, to, kind: "hardlink-seed", name });
+    // C16: real copy, not hardlink-seed. Hardlinks share inodes with main —
+    // in-place edits to node_modules/.venv/etc. would corrupt the user's tree
+    // while deny/confine still look clean (gitignored paths).
+    links.push({ from, to, kind: "copy", name });
     privateDirs.push(name);
   }
 
@@ -561,10 +564,8 @@ export function planWorktreeLinks(repoRoot, worktreePath, options = {}) {
       if (!existsSync(from)) {
         continue;
       }
-      // Godot seed: hardlink-seed when same volume, else plain copy. Marked
-      // "hardlink-seed" so provisionWorktree uses the volume-aware path; for
-      // single files EXDEV falls back to copyFileSync automatically.
-      links.push({ from, to, kind: "hardlink-seed", name: path.basename(relativePath) });
+      // C16: full file copy for private Godot seed paths (no shared inodes).
+      links.push({ from, to, kind: "copy", name: path.basename(relativePath) });
       copied.push(relativePath);
     }
     notes.push(cacheMode.cacheLine);
@@ -586,7 +587,7 @@ export function planWorktreeLinks(repoRoot, worktreePath, options = {}) {
   if (privateDirs.filter((d) => !GODOT_CACHE_DIRS.includes(d) && d !== "target").length > 0) {
     const seeded = privateDirs.filter((d) => !GODOT_CACHE_DIRS.includes(d) && d !== "target");
     notes.push(
-      `Private (live-state) directories — hardlink-seeded into this worktree: ${seeded.join(", ")}`
+      `Private (live-state) directories — copied into this worktree (inode-isolated): ${seeded.join(", ")}`
     );
   }
 
@@ -656,8 +657,50 @@ export function planWorktreeLinks(repoRoot, worktreePath, options = {}) {
       if (tier === "share") {
         links.push({ from, to, kind: shareKind, name: linkName });
         sharedDirs.push(linkName);
+      } else if (GODOT_CACHE_DIRS.includes(name)) {
+        // M9: mirror root private Godot policy — mkdir + partial seed only.
+        // Full-copying nested game/.godot would drag multi-GB imported/ assets.
+        links.push({
+          from: path.join(wt, ...nestedRel.split("/"), name),
+          to: path.join(wt, ...nestedRel.split("/"), name),
+          kind: "mkdir",
+          name: linkName
+        });
+        privateDirs.push(linkName);
+        if (cacheMode.private) {
+          for (const relativePath of PROVISION_COPY_PATHS) {
+            // Only seed files under this cache dir name (e.g. .godot/... paths).
+            if (!relativePath.startsWith(`${name}/`) && relativePath !== name) {
+              // Also allow top-level .import paths when name is .import
+              if (!(name === ".import" && relativePath.startsWith(".import"))) {
+                if (!relativePath.split("/")[0] || relativePath.split("/")[0] !== name) {
+                  // PROVISION_COPY_PATHS are like ".godot/uid_cache.bin"
+                  const top = relativePath.split("/")[0];
+                  if (top !== name) {
+                    continue;
+                  }
+                }
+              }
+            }
+            const segs = relativePath.split("/");
+            if (segs[0] !== name) {
+              continue;
+            }
+            const fromSeed = path.join(root, ...nestedRel.split("/"), ...segs);
+            const toSeed = path.join(wt, ...nestedRel.split("/"), ...segs);
+            if (!existsSync(fromSeed)) {
+              continue;
+            }
+            links.push({
+              from: fromSeed,
+              to: toSeed,
+              kind: "copy",
+              name: `${nestedRel}/${relativePath}`
+            });
+          }
+        }
       } else {
-        links.push({ from, to, kind: "hardlink-seed", name: linkName });
+        links.push({ from, to, kind: "copy", name: linkName });
         privateDirs.push(linkName);
       }
     }
@@ -696,7 +739,7 @@ export function planWorktreeLinks(repoRoot, worktreePath, options = {}) {
       links.push({ from, to, kind: shareKind, name: rel });
       sharedDirs.push(rel);
     } else if (tier === "copy") {
-      links.push({ from, to, kind: "hardlink-seed", name: rel });
+      links.push({ from, to, kind: "copy", name: rel });
       privateDirs.push(rel);
     } else {
       continue;
@@ -705,7 +748,7 @@ export function planWorktreeLinks(repoRoot, worktreePath, options = {}) {
   }
   if (nestedNmLinked > 0) {
     notes.push(
-      `Nested node_modules hardlink-seeded/linked (${nestedNmLinked}): workspace packages keep per-package deps in the worktree`
+      `Nested node_modules copied/linked (${nestedNmLinked}): workspace packages keep per-package deps in the worktree`
     );
   }
 

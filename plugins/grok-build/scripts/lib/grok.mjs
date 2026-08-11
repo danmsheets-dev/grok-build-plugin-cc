@@ -10,14 +10,24 @@ import {
   createNdjsonDecoder,
   createStreamTranscript,
   extractFinalReport,
-  parseStreamEvent
+  normalizeUsage,
+  parseStreamEventDetailed
 } from "./stream-events.mjs";
-import { resolveSpawnInvocation } from "./which.mjs";
+import { resolveExecutable, resolveSpawnInvocation } from "./which.mjs";
 
 export const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 
-const DEFAULT_BINARY = "grok";
+/**
+ * Default CLI resolution order when GROK_BINARY is unset.
+ *
+ * Turbo (the preferred Grok Build fork) is tried first, then the stock
+ * `grok` binary. Hyper is intentionally absent — it is never auto-selected;
+ * set GROK_BINARY explicitly if you still need it.
+ */
+export const DEFAULT_BINARY_CANDIDATES = Object.freeze(["turbo", "grok"]);
+/** Preferred default name used in error text when nothing is on PATH. */
+export const PREFERRED_BINARY = DEFAULT_BINARY_CANDIDATES[0];
 const BINARY_ENV = "GROK_BINARY";
 
 /** The HOME value THIS process supplied, when the environment carried none. */
@@ -29,18 +39,239 @@ let appliedHomeDefault = null;
 // it into a job record, through redaction, and into the terminal.
 const RAW_STDOUT_FALLBACK_LINES = 200;
 
-export function resolveGrokBinary(env = process.env) {
+/**
+ * True when `name` resolves to an executable on PATH (or is an absolute file).
+ * Does not spawn the binary — only filesystem lookup.
+ */
+export function binaryOnPath(name, env = process.env, platform = process.platform) {
+  const command = String(name ?? "").trim();
+  if (!command) {
+    return false;
+  }
+  if (path.isAbsolute(command) || command.includes("/") || command.includes("\\")) {
+    try {
+      return fs.statSync(command).isFile();
+    } catch {
+      return false;
+    }
+  }
+
+  if (platform === "win32") {
+    const resolved = resolveExecutable(command, env, platform);
+    return resolved !== command && path.isAbsolute(resolved);
+  }
+
+  const searchPath = String(env?.PATH ?? env?.Path ?? "");
+  for (const directory of searchPath.split(path.delimiter).filter(Boolean)) {
+    const candidate = path.join(directory, command);
+    try {
+      if (fs.statSync(candidate).isFile()) {
+        return true;
+      }
+    } catch {
+      // keep looking
+    }
+  }
+  return false;
+}
+
+/**
+ * True when a GROK_BINARY value is Hyper (bare name or path ending in hyper[.exe]).
+ * Hyper is no longer a supported auto/default target for this plugin.
+ */
+export function isHyperBinaryName(binary) {
+  const raw = String(binary ?? "").trim();
+  if (!raw) {
+    return false;
+  }
+  const base = path.basename(raw).toLowerCase();
+  return base === "hyper" || base === "hyper.exe";
+}
+
+// Per-process cache: agent-CLI identity probes (C1). Tests inject a fresh Map.
+const defaultAgentCompatCache = new Map();
+// Per-process cache: permission tool prefixes from `version --json` (rc2+).
+// null entry = probed, CLI did not advertise prefixes (use static fallback).
+const defaultPermissionPrefixCache = new Map();
+
+/**
+ * True when `detail` from `version` / `--version` looks like Vercel Turborepo
+ * (or another non-agent turbo), not Turbo Grok Build / stock grok.
+ */
+export function looksLikeNonAgentTurboVersion(detail) {
+  const text = String(detail ?? "").toLowerCase();
+  if (!text.trim()) {
+    return false;
+  }
+  if (/\bturborepo\b/.test(text)) {
+    return true;
+  }
+  // Vercel turbo often prints a short "2.x.x" banner without grok/agent markers.
+  if (/the build system that makes/.test(text)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * True when help/version text exposes the headless agent surface this bridge needs.
+ * Distinguishes Turbo Grok Build / grok from Vercel `turbo` on PATH (C1).
+ *
+ * @param {string} binary
+ * @param {{ env?: NodeJS.ProcessEnv, cwd?: string, runCommandImpl?: Function, cache?: Map<string, boolean>, force?: boolean }} [options]
+ * @returns {boolean}
+ */
+/**
+ * Parse Turbo/Grok `version --json` identity card (rc2+).
+ * @param {string} stdout
+ * @returns {object|null}
+ */
+export function parseCliVersionIdentity(stdout) {
+  const text = String(stdout ?? "").trim();
+  if (!text.startsWith("{")) {
+    return null;
+  }
+  try {
+    const value = JSON.parse(text);
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return null;
+    }
+    return value;
+  } catch {
+    return null;
+  }
+}
+
+export function isAgentCompatibleBinary(binary, options = {}) {
+  const name = String(binary ?? "").trim();
+  if (!name) {
+    return false;
+  }
+  const cache = options.cache ?? defaultAgentCompatCache;
+  if (!options.force && cache.has(name)) {
+    return cache.get(name);
+  }
+  const runCommandImpl = options.runCommandImpl ?? runCommand;
+  const runOpts = {
+    env: options.env,
+    cwd: options.cwd,
+    maxBuffer: 256 * 1024
+  };
+  let ok = false;
+  try {
+    // Prefer Turbo rc2+ machine-readable identity (distinguishes Vercel Turborepo).
+    const jsonVersion = runCommandImpl(name, ["version", "--json"], runOpts);
+    if (!jsonVersion.error && (jsonVersion.status == null || jsonVersion.status === 0)) {
+      const identity = parseCliVersionIdentity(jsonVersion.stdout);
+      if (identity) {
+        // L1: agentCompatible is authoritative when present; cliFamily alone is
+        // only a positive signal when the flag is absent/undefined.
+        if (identity.agentCompatible === false) {
+          ok = false;
+          cache.set(name, ok);
+          return ok;
+        }
+        if (identity.agentCompatible === true || identity.cliFamily === "grok-build") {
+          ok = true;
+          cache.set(name, ok);
+          return ok;
+        }
+        // If JSON parsed but no identity fields (pre-rc2), fall through.
+      }
+    }
+
+    let versionResult = runCommandImpl(name, ["version"], runOpts);
+    if (versionResult.error || (versionResult.status != null && versionResult.status !== 0)) {
+      versionResult = runCommandImpl(name, ["--version"], runOpts);
+    }
+    const versionText = `${versionResult.stdout ?? ""}\n${versionResult.stderr ?? ""}`;
+    if (looksLikeNonAgentTurboVersion(versionText)) {
+      ok = false;
+    } else if (/\b(grok|hyper)\b/i.test(versionText) && !/turborepo/i.test(versionText)) {
+      // Stock grok / Hyper / "turbo … grok" banners.
+      ok = true;
+    } else {
+      const help = runCommandImpl(name, ["--help"], runOpts);
+      const helpText = `${help.stdout ?? ""}\n${help.stderr ?? ""}`;
+      // Headless agent surface Turbo Grok / grok expose; Turborepo does not.
+      ok =
+        /--output-format\b/.test(helpText) &&
+        /--always-approve\b/.test(helpText) &&
+        (/--prompt-file\b/.test(helpText) || /--single\b/.test(helpText) || /(?:^|[\s,|])-p(?:\s|,|$)/.test(helpText));
+    }
+  } catch {
+    ok = false;
+  }
+  cache.set(name, ok);
+  return ok;
+}
+
+/** Test seam: clear agent-compat probe cache. */
+export function resetAgentCompatCacheForTests(cache = defaultAgentCompatCache) {
+  cache.clear();
+}
+
+/**
+ * Resolve which CLI binary the bridge should invoke.
+ *
+ * Order:
+ *   1. GROK_BINARY (explicit override — any compatible CLI *except Hyper*)
+ *   2. First of DEFAULT_BINARY_CANDIDATES on PATH that passes the agent-CLI
+ *      surface probe (`turbo` preferred, then `grok`) — skips Vercel Turborepo
+ *   3. First name merely present on PATH (for error text)
+ *   4. PREFERRED_BINARY (`turbo`) so missing-binary messages name the right product
+ *
+ * Hyper is never selected — neither automatically nor via `GROK_BINARY=hyper`.
+ * Point GROK_BINARY at `turbo`, `grok`, or an absolute path to another binary.
+ *
+ * @param {NodeJS.ProcessEnv} [env]
+ * @param {{ platform?: NodeJS.Platform, candidates?: readonly string[], skipAgentProbe?: boolean, runCommandImpl?: Function, cache?: Map<string, boolean> }} [options]
+ * @returns {string}
+ */
+export function resolveGrokBinary(env = process.env, options = {}) {
   const override = env?.[BINARY_ENV];
   if (override && String(override).trim()) {
-    return String(override).trim();
+    const value = String(override).trim();
+    // Drop Hyper overrides so a leftover GROK_BINARY=hyper from older docs does
+    // not keep spawning hyper.exe after Turbo became the preferred CLI.
+    if (!isHyperBinaryName(value)) {
+      return value;
+    }
   }
-  return DEFAULT_BINARY;
+  const candidates = options.candidates ?? DEFAULT_BINARY_CANDIDATES;
+  const platform = options.platform ?? process.platform;
+  const onPath = [];
+  for (const name of candidates) {
+    if (binaryOnPath(name, env, platform)) {
+      onPath.push(name);
+    }
+  }
+  if (!options.skipAgentProbe) {
+    for (const name of onPath) {
+      if (
+        isAgentCompatibleBinary(name, {
+          env,
+          runCommandImpl: options.runCommandImpl,
+          cache: options.cache
+        })
+      ) {
+        return name;
+      }
+    }
+    // M1: do not fail open to Vercel Turborepo / non-agent turbo when every
+    // candidate failed the probe. Prefer PREFERRED_BINARY for error text only.
+    return candidates[0] ?? PREFERRED_BINARY;
+  }
+  if (onPath.length > 0) {
+    return onPath[0];
+  }
+  return candidates[0] ?? PREFERRED_BINARY;
 }
 
 /**
  * Give the CLI a HOME on Windows.
  *
- * The Grok/Hyper CLIs resolve their config, credentials and session store off
+ * The Grok/Turbo CLIs resolve their config, credentials and session store off
  * HOME. Windows does not set it - `%USERPROFILE%` is the equivalent - and
  * whether a shell happens to define one is luck: Git Bash and WSL do, cmd.exe,
  * PowerShell, most CI runners and most agent tool-shells do not.
@@ -110,13 +341,12 @@ export function runGrok(args = [], options = {}) {
 }
 
 /**
- * Which CLI is actually behind `GROK_BINARY`.
+ * Which CLI is actually behind the resolved binary / GROK_BINARY.
  *
- * `GROK_BINARY` has always accepted any compatible executable, and community
- * builds of Grok Build ship under their own name (Hyper is the common one:
- * same CLI surface, same `~/.grok` config and auth, different binary). When the
- * bridge is driving one of those, saying "install the Grok Build CLI" on
- * failure sends the user to the wrong product.
+ * Compatible Grok Build forks ship under their own name (Turbo is preferred;
+ * same CLI surface, same `~/.grok` config and auth). When the bridge is driving
+ * one of those, saying "install the Grok Build CLI" on failure sends the user
+ * to the wrong product.
  *
  * Detection is on the version banner rather than the binary path, because the
  * path may be a shim, a symlink, or a bare name resolved through PATH.
@@ -127,6 +357,11 @@ export function runGrok(args = [], options = {}) {
  */
 export function detectCliBrand(versionDetail) {
   const text = String(versionDetail ?? "").trim().toLowerCase();
+  // Turbo before Hyper: Turbo's banner may still mention shared lineage, but a
+  // clear "turbo" token is the preferred brand for the local fork.
+  if (/\bturbo\b/.test(text)) {
+    return { id: "turbo", label: "Turbo" };
+  }
   if (/\bhyper\b/.test(text)) {
     return { id: "hyper", label: "Hyper" };
   }
@@ -136,48 +371,175 @@ export function detectCliBrand(versionDetail) {
 /**
  * Remediation text for "the CLI is not runnable".
  *
- * Branches on whether `GROK_BINARY` is actually overriding the default. Telling
- * someone who deliberately pointed the bridge at `hyper` to "install the Grok
- * Build CLI" is wrong twice over: they did not want that product, and the real
- * fault is almost always a bad path or a binary that is not executable.
+ * Branches on whether the name is one of the auto-resolved defaults or an
+ * explicit GROK_BINARY override. Telling someone who pointed the bridge at a
+ * custom path to "install Grok Build" is wrong: the real fault is almost always
+ * a bad path or a binary that is not executable.
  *
  * @param {string} binary The binary the bridge tried to run
  * @returns {string}
  */
 export function describeMissingBinary(binary) {
-  const name = String(binary ?? "").trim() || DEFAULT_BINARY;
-  if (name === DEFAULT_BINARY) {
-    return "Install the Grok Build CLI and ensure `grok` is on PATH (or point GROK_BINARY at a compatible CLI, e.g. a Hyper build).";
+  const name = String(binary ?? "").trim() || PREFERRED_BINARY;
+  if (DEFAULT_BINARY_CANDIDATES.includes(name)) {
+    return (
+      "Install Turbo (preferred) or the Grok Build CLI and ensure `turbo` or `grok` is on PATH " +
+      "(or point GROK_BINARY at a compatible executable)."
+    );
   }
-  return `\`${name}\` (from GROK_BINARY) could not be run. Check the path is correct and executable, or unset GROK_BINARY to fall back to the default \`grok\` CLI.`;
+  return (
+    `\`${name}\` (from GROK_BINARY) could not be run. Check the path is correct and executable, ` +
+    `or unset GROK_BINARY to fall back to \`turbo\` / \`grok\`.`
+  );
+}
+
+/**
+ * Pick the clearer of two availability failure details (C4).
+ * Prefer concrete ENOENT / "not found" signals and longer diagnostic text
+ * over monorepo-task noise from a wrong `turbo version` subcommand.
+ *
+ * @param {string|null|undefined} versionDetail  From `binary version`
+ * @param {string|null|undefined} versionFlagDetail  From `binary --version`
+ * @returns {string}
+ */
+export function pickAvailabilityFailureDetail(versionDetail, versionFlagDetail) {
+  const a = String(versionDetail ?? "").trim();
+  const b = String(versionFlagDetail ?? "").trim();
+  if (!a && !b) {
+    return "not found";
+  }
+  if (!a) {
+    return b;
+  }
+  if (!b) {
+    return a;
+  }
+  if (a === b) {
+    return a;
+  }
+
+  const looksMissing = (text) =>
+    /^not found$/i.test(text) || /enoent|cannot find|is not recognized|no such file/i.test(text);
+  const looksWrongProduct = (text) =>
+    /\bpipeline\b|turborepo|unknown command|unexpected argument|no such subcommand/i.test(text);
+
+  // Prefer a clear missing-binary signal over monorepo/wrong-CLI noise.
+  if (looksMissing(b) && looksWrongProduct(a)) {
+    return b;
+  }
+  if (looksMissing(a) && looksWrongProduct(b)) {
+    return a;
+  }
+  if (looksMissing(b) && !looksMissing(a) && a.length < 80) {
+    return b;
+  }
+  if (looksMissing(a) && !looksMissing(b) && b.length < 80) {
+    return a;
+  }
+
+  const score = (text) => {
+    let n = text.length;
+    if (looksMissing(text)) {
+      n += 40;
+    }
+    if (looksWrongProduct(text)) {
+      n -= 40;
+    }
+    if (/usage:|error:/i.test(text)) {
+      n += 10;
+    }
+    return n;
+  };
+
+  return score(b) >= score(a) ? b : a;
+}
+
+/**
+ * Build the ordered list of CLI names to probe for availability (C3).
+ * Explicit binary / GROK_BINARY is a single-item list; otherwise walk candidates on PATH.
+ */
+export function listGrokBinaryCandidates(env = process.env, options = {}) {
+  if (options.binary && String(options.binary).trim()) {
+    return [String(options.binary).trim()];
+  }
+  const override = env?.[BINARY_ENV];
+  if (override && String(override).trim() && !isHyperBinaryName(override)) {
+    return [String(override).trim()];
+  }
+  const candidates = options.candidates ?? DEFAULT_BINARY_CANDIDATES;
+  const platform = options.platform ?? process.platform;
+  const onPath = [];
+  for (const name of candidates) {
+    if (binaryOnPath(name, env, platform)) {
+      onPath.push(name);
+    }
+  }
+  return onPath.length > 0 ? onPath : [candidates[0] ?? PREFERRED_BINARY];
 }
 
 export function getGrokAvailability(cwd, options = {}) {
-  const binary = options.binary ?? resolveGrokBinary(options.env ?? process.env);
-  const versionStatus = binaryAvailable(binary, ["version"], { cwd, env: options.env });
-  if (!versionStatus.available) {
-    const alt = binaryAvailable(binary, ["--version"], { cwd, env: options.env });
-    if (!alt.available) {
-      return {
+  const env = options.env ?? process.env;
+  const binaries = listGrokBinaryCandidates(env, options);
+  let lastFailure = null;
+
+  for (const binary of binaries) {
+    const versionStatus = binaryAvailable(binary, ["version"], { cwd, env });
+    let detail = versionStatus.detail;
+    let available = versionStatus.available;
+    if (!available) {
+      const alt = binaryAvailable(binary, ["--version"], { cwd, env });
+      if (alt.available) {
+        available = true;
+        detail = alt.detail;
+      } else {
+        lastFailure = {
+          available: false,
+          // C4: prefer the clearer of version vs --version (do not always keep `version`).
+          detail: pickAvailabilityFailureDetail(versionStatus.detail, alt.detail),
+          binary,
+          brand: detectCliBrand(null)
+        };
+        // C3: try next candidate when this name is broken / not runnable.
+        continue;
+      }
+    }
+    if (
+      !options.skipAgentProbe &&
+      !isAgentCompatibleBinary(binary, {
+        env,
+        cwd,
+        runCommandImpl: options.runCommandImpl,
+        cache: options.cache
+      })
+    ) {
+      lastFailure = {
         available: false,
-        detail: versionStatus.detail,
+        detail:
+          `${binary} is on PATH but does not look like Turbo Grok Build / Grok Build ` +
+          `(missing headless agent surface). If this is Vercel Turborepo, install Turbo Grok ` +
+          `or set GROK_BINARY to the agent CLI.`,
         binary,
-        brand: detectCliBrand(null)
+        brand: detectCliBrand(detail)
       };
+      // C3: try next candidate (e.g. grok after a Turborepo turbo).
+      continue;
     }
     return {
       available: true,
-      detail: alt.detail,
+      detail,
       binary,
-      brand: detectCliBrand(alt.detail)
+      brand: detectCliBrand(detail)
     };
   }
-  return {
-    available: true,
-    detail: versionStatus.detail,
-    binary,
-    brand: detectCliBrand(versionStatus.detail)
-  };
+
+  return (
+    lastFailure ?? {
+      available: false,
+      detail: "not found",
+      binary: binaries[0] ?? PREFERRED_BINARY,
+      brand: detectCliBrand(null)
+    }
+  );
 }
 
 function buildAuthStatus(fields = {}) {
@@ -302,11 +664,13 @@ export function runModelsProbe(cwd, options = {}) {
   });
 
   if (result.error && /** @type {NodeJS.ErrnoException} */ (result.error).code === "ENOENT") {
+    // C5: name the binary that was actually tried (turbo / GROK_BINARY path).
     return buildAuthStatus({
       available: false,
       loggedIn: false,
-      detail: "grok binary not found",
-      source: "availability"
+      detail: `${binary}: not found. ${describeMissingBinary(binary)}`,
+      source: "availability",
+      binary
     });
   }
 
@@ -315,7 +679,8 @@ export function runModelsProbe(cwd, options = {}) {
       available: true,
       loggedIn: false,
       detail: result.error.message,
-      source: "models-probe"
+      source: "models-probe",
+      binary
     });
   }
 
@@ -326,8 +691,9 @@ export function runModelsProbe(cwd, options = {}) {
     return buildAuthStatus({
       available: true,
       loggedIn: false,
-      detail: detail || "grok models failed; not logged in or not ready",
-      source: "models-probe"
+      detail: detail || `${binary} models failed; not logged in or not ready`,
+      source: "models-probe",
+      binary
     });
   }
 
@@ -336,8 +702,9 @@ export function runModelsProbe(cwd, options = {}) {
     return buildAuthStatus({
       available: true,
       loggedIn: false,
-      detail: detail || "grok models failed; not logged in or not ready",
-      source: "models-probe"
+      detail: detail || `${binary} models failed; not logged in or not ready`,
+      source: "models-probe",
+      binary
     });
   }
 
@@ -346,11 +713,12 @@ export function runModelsProbe(cwd, options = {}) {
     available: true,
     loggedIn: true,
     detail: loggedInHint
-      ? firstLine(stdout) || "grok models succeeded"
-      : firstLine(stdout) || "grok models succeeded (treated as logged in)",
+      ? firstLine(stdout) || `${binary} models succeeded`
+      : firstLine(stdout) || `${binary} models succeeded (treated as logged in)`,
     source: "models-probe",
     authMethod: "grok-cli",
-    verified: true
+    verified: true,
+    binary
   });
 }
 
@@ -372,7 +740,8 @@ export function listGrokModels(cwd, options = {}) {
       ok: false,
       binary,
       brand: availability.brand,
-      error: "binary not found",
+      // C5: remediation text names turbo/GROK_BINARY, not a hard-coded "grok".
+      error: `${binary}: not found. ${describeMissingBinary(binary)}`,
       status: result.status,
       defaultModel: null,
       models: []
@@ -617,12 +986,160 @@ function writePromptFile(directory, prompt) {
  * deny the only write-blocking mechanism that actually holds on Windows, where
  * the OS sandbox is compiled out entirely
  * (`xai-grok-sandbox`: `#[cfg(all(feature = "enforce", unix))]`).
+ *
+/**
+ * Read-only denials (C8).
+ *
+ * Turbo treats `Edit` / `Edit(*)` as tool-wide (no path pattern). `Edit(**)` is
+ * only a path glob and can miss exotic path spellings. `Write` maps to the same
+ * Edit filter on Turbo, so a single tool-wide Edit rule is enough.
  */
-export const READ_ONLY_DENY_RULES = Object.freeze([
-  "Edit(**)",
-  "Write(**)",
-  "NotebookEdit(**)"
+export const READ_ONLY_DENY_RULES = Object.freeze(["Edit(*)"]);
+
+/**
+ * Claude-compat tool prefixes Turbo/Grok accept on `--deny` / `--allow` (C10).
+ * Turbo 1.0.0-rc.2+ accepts NotebookEdit/MultiEdit/NotebookRead as Edit/Read
+ * aliases; pre-rc2 rejected NotebookEdit. Prefer live prefixes from
+ * `probePermissionToolPrefixes` (`version --json` → permissionToolPrefixes).
+ * Unknown prefixes are still dropped so headless start does not hard-abort.
+ */
+export const SUPPORTED_PERMISSION_TOOL_PREFIXES = Object.freeze([
+  "Edit",
+  "Write",
+  "MultiEdit",
+  "NotebookEdit",
+  "Read",
+  "NotebookRead",
+  "Bash",
+  "Grep",
+  "Glob",
+  "WebFetch",
+  "WebSearch",
+  "Mcp",
+  "MCP",
+  "MCPTool",
+  "Any"
 ]);
+
+/**
+ * Probe `binary version --json` for `permissionToolPrefixes` (Turbo rc2+).
+ * Returns the advertised list, or null when the CLI is older / probe fails.
+ * Results are cached per binary name (including null = "no list advertised").
+ *
+ * @param {string} binary
+ * @param {{ env?: NodeJS.ProcessEnv, cwd?: string, runCommandImpl?: Function, cache?: Map<string, string[]|null>, force?: boolean }} [options]
+ * @returns {string[]|null}
+ */
+export function probePermissionToolPrefixes(binary, options = {}) {
+  const name = String(binary ?? "").trim();
+  if (!name) {
+    return null;
+  }
+  const cache = options.cache ?? defaultPermissionPrefixCache;
+  if (!options.force && cache.has(name)) {
+    return cache.get(name);
+  }
+  const runCommandImpl = options.runCommandImpl ?? runCommand;
+  let prefixes = null;
+  try {
+    const result = runCommandImpl(name, ["version", "--json"], {
+      env: options.env,
+      cwd: options.cwd,
+      maxBuffer: 256 * 1024
+    });
+    if (!result.error && (result.status == null || result.status === 0)) {
+      const identity = parseCliVersionIdentity(result.stdout);
+      const raw =
+        identity?.permissionToolPrefixes ?? identity?.permission_tool_prefixes ?? null;
+      if (Array.isArray(raw) && raw.length > 0) {
+        const cleaned = raw.map((p) => String(p ?? "").trim()).filter(Boolean);
+        if (cleaned.length > 0) {
+          prefixes = cleaned;
+        }
+      }
+    }
+  } catch {
+    prefixes = null;
+  }
+  cache.set(name, prefixes);
+  return prefixes;
+}
+
+/** Test seam: clear permission-prefix probe cache. */
+export function resetPermissionPrefixCacheForTests(cache = defaultPermissionPrefixCache) {
+  cache.clear();
+}
+
+/**
+ * Resolve the deny/allow prefix allow-list for a headless spawn.
+ * Prefer caller override, then live `version --json` prefixes, then static fallback.
+ *
+ * @param {string} [binary]
+ * @param {{ supportedPermissionPrefixes?: readonly string[]|null, env?: NodeJS.ProcessEnv, runCommandImpl?: Function, cache?: Map<string, string[]|null> }} [options]
+ * @returns {readonly string[]}
+ */
+export function resolveSupportedPermissionPrefixes(binary, options = {}) {
+  if (Array.isArray(options.supportedPermissionPrefixes) && options.supportedPermissionPrefixes.length > 0) {
+    return options.supportedPermissionPrefixes;
+  }
+  if (binary) {
+    const probed = probePermissionToolPrefixes(binary, options);
+    if (probed && probed.length > 0) {
+      return probed;
+    }
+  }
+  return SUPPORTED_PERMISSION_TOOL_PREFIXES;
+}
+
+/**
+ * Extract the tool prefix from a permission rule string (`Edit(**)`, `Bash(rm *)`, `Edit`).
+ * @param {string} rule
+ * @returns {string|null}
+ */
+export function parsePermissionRulePrefix(rule) {
+  const text = String(rule ?? "").trim();
+  if (!text) {
+    return null;
+  }
+  const match = text.match(/^([A-Za-z][A-Za-z0-9_]*)\s*(?:\(|$)/);
+  return match ? match[1] : null;
+}
+
+/**
+ * Drop deny/allow rules whose tool prefix the CLI will reject (C10).
+ * Prevents NotebookEdit-style hard aborts on headless start.
+ *
+ * @param {string[]|string|null|undefined} rules
+ * @param {{ supportedPrefixes?: readonly string[] }} [options]
+ * @returns {{ rules: string[], dropped: Array<{ rule: string, reason: string }> }}
+ */
+export function filterPermissionRulesForCli(rules, options = {}) {
+  const supported = options.supportedPrefixes ?? SUPPORTED_PERMISSION_TOOL_PREFIXES;
+  const allowed = new Set([...supported].map((p) => String(p).toLowerCase()));
+  const kept = [];
+  const dropped = [];
+  const list = Array.isArray(rules) ? rules : rules == null ? [] : [rules];
+  for (const entry of list) {
+    const rule = String(entry ?? "").trim();
+    if (!rule) {
+      continue;
+    }
+    const prefix = parsePermissionRulePrefix(rule);
+    if (!prefix) {
+      dropped.push({ rule, reason: "unparseable permission rule" });
+      continue;
+    }
+    if (!allowed.has(prefix.toLowerCase())) {
+      dropped.push({
+        rule,
+        reason: `unsupported tool prefix: ${prefix}`
+      });
+      continue;
+    }
+    kept.push(rule);
+  }
+  return { rules: kept, dropped };
+}
 
 /**
  * Normalise a filesystem path for Hyper deny/allow globs.
@@ -706,7 +1223,11 @@ export function buildWorkspaceRootDenyRules(workspaceRoot, worktreePath = null, 
     };
   }
 
-  const rules = [`Edit(${root}/**)`, `Write(${root}/**)`, `NotebookEdit(${root}/**)`];
+  // Edit + Write cover the write tool family. Turbo rc2+ also accepts
+  // NotebookEdit/MultiEdit as Edit aliases; we do not emit those extras here
+  // because Edit(*) already denies the whole family, and path-scoped Edit/Write
+  // is enough for workspace-root isolation.
+  const rules = [`Edit(${root}/**)`, `Write(${root}/**)`];
 
   // Last path segment, e.g. "Main Repo" from "C:/…/isotest/Main Repo".
   const segment = root.split("/").filter(Boolean).at(-1) ?? "";
@@ -717,8 +1238,7 @@ export function buildWorkspaceRootDenyRules(workspaceRoot, worktreePath = null, 
   if (segmentRuleApplied) {
     rules.push(
       `Edit(**/${segment}/**)`,
-      `Write(**/${segment}/**)`,
-      `NotebookEdit(**/${segment}/**)`
+      `Write(**/${segment}/**)`
     );
   }
 
@@ -747,9 +1267,20 @@ export function worktreeContainsSegment(worktreePath, segment, options = {}) {
     return false;
   }
   const runner = options.gitImpl ?? runCommand;
+  // :(glob) is required for recursive ** (C7/C17). Without it, git treats
+  // `**/name/*` as a shallow pathspec and misses deep nested basenames like
+  // packages/foo/src/ — which then incorrectly enables self-denying segment rules.
   const result = runner(
     "git",
-    ["ls-files", "-z", "--", `${name}/*`, `**/${name}/*`],
+    [
+      "ls-files",
+      "-z",
+      "--",
+      `${name}/*`,
+      `**/${name}/*`,
+      `:(glob)${name}/**`,
+      `:(glob)**/${name}/**`
+    ],
     { cwd: worktreePath }
   );
   if (result.error || result.status !== 0) {
@@ -775,12 +1306,18 @@ export function confineFeatureEnabled(env = process.env) {
 }
 
 /**
- * Probe whether the CLI binary advertises `--confine`. Cached per binary path
- * for the lifetime of the process so a long-running bridge does not pay the
- * cost on every run.
+ * Probe whether the CLI binary advertises `--confine`.
+ *
+ * Cache policy (C6): only cache a **positive** result forever. A failed/empty
+ * probe must not permanently disable confine for the process (one bad --help
+ * under load used to omit the path jail for every later isolated run).
+ *
+ * Turbo 1.0 always implements --confine; when the binary is already known to be
+ * agent-compatible (Turbo/Grok), a failed help parse still defaults to true so
+ * isolation stays fail-closed.
  *
  * @param {string} binary
- * @param {{ env?: NodeJS.ProcessEnv, runCommandImpl?: typeof runCommand, cache?: Map<string, boolean> }} [options]
+ * @param {{ env?: NodeJS.ProcessEnv, runCommandImpl?: typeof runCommand, cache?: Map<string, boolean>, assumeSupportedIfAgent?: boolean }} [options]
  * @returns {boolean}
  */
 export function cliSupportsConfine(binary, options = {}) {
@@ -791,20 +1328,50 @@ export function cliSupportsConfine(binary, options = {}) {
   }
   const runCommandImpl = options.runCommandImpl ?? runCommand;
   let supported = false;
+  let probed = false;
   try {
     const result = runCommandImpl(binary, ["--help"], {
       env: options.env,
       maxBuffer: 256 * 1024
     });
     const text = `${result.stdout ?? ""}\n${result.stderr ?? ""}`;
+    probed = Boolean(text.trim());
     // Do not use a leading \b: `--` is non-word so \b-- never matches after a
     // space. Look for the flag token anywhere in --help output.
     supported = /(?:^|[\s,|])--confine(?:\b|=|\s|$)/.test(text);
   } catch {
     supported = false;
+    probed = false;
   }
-  cache.set(key, supported);
-  return supported;
+  if (supported) {
+    cache.set(key, true);
+    return true;
+  }
+  // Agent CLIs (Turbo 1.0+) always have --confine. Prefer enabling over a
+  // permanent false cache when help was empty/failed (C6).
+  const assumeAgent =
+    options.assumeSupportedIfAgent !== false &&
+    isAgentCompatibleBinary(binary, {
+      env: options.env,
+      runCommandImpl,
+      cache: options.agentCache
+    });
+  if (assumeAgent) {
+    // Do not cache false; cache true so we do not re-probe forever.
+    cache.set(key, true);
+    return true;
+  }
+  // Negative results are not cached when the probe did not clearly run — next
+  // call may succeed. Clear miss only when help text was present and lacked the flag.
+  if (probed) {
+    cache.set(key, false);
+  }
+  return false;
+}
+
+/** Test seam: clear confine probe cache. */
+export function resetConfineSupportCacheForTests(cache = defaultConfineSupportCache) {
+  cache.clear();
 }
 
 /**
@@ -876,13 +1443,54 @@ export function buildHeadlessArgs(prompt, options = {}) {
   if (options.alwaysApprove) {
     trailing.push("--always-approve");
   }
+  // Windows: put the agent process tree in a Job Object so stop/kill can tear
+  // down descendants by closing the job (Turbo `--job-object` / TURBO_JOB_OBJECT).
+  // Opt out with GROK_BUILD_JOB_OBJECT=0. No-op on non-Windows CLIs.
+  const jobObjectEnv = String(options.env?.GROK_BUILD_JOB_OBJECT ?? process.env.GROK_BUILD_JOB_OBJECT ?? "")
+    .trim()
+    .toLowerCase();
+  const jobObjectOff = jobObjectEnv === "0" || jobObjectEnv === "false" || jobObjectEnv === "off" || jobObjectEnv === "no";
+  const jobObjectOn =
+    options.jobObject === true ||
+    (!jobObjectOff &&
+      (options.jobObject === undefined
+        ? (options.platform ?? process.platform) === "win32"
+        : Boolean(options.jobObject)));
+  if (jobObjectOn) {
+    trailing.push("--job-object");
+  }
   // Repeated --deny / --allow. Order does not matter for Hyper - a deny is
   // evaluated before --always-approve either way - but each rule is its own
   // argv pair and must be counted in the budget like every other flag.
-  for (const rule of normalizeRuleList(options.denyRules)) {
+  // C10: filter unknown prefixes so Turbo does not abort the whole headless start.
+  // Prefer caller override, then version --json permissionToolPrefixes (rc2+).
+  const supportedPrefixes =
+    options.supportedPermissionPrefixes ??
+    (options.binary
+      ? resolveSupportedPermissionPrefixes(options.binary, {
+          env: options.env,
+          runCommandImpl: options.runCommandImpl,
+          cache: options.permissionPrefixCache
+        })
+      : SUPPORTED_PERMISSION_TOOL_PREFIXES);
+  const denyFiltered = filterPermissionRulesForCli(options.denyRules, {
+    supportedPrefixes
+  });
+  const allowFiltered = filterPermissionRulesForCli(options.allowRules, {
+    supportedPrefixes
+  });
+  const droppedPermissionRules = [...denyFiltered.dropped, ...allowFiltered.dropped];
+  if (droppedPermissionRules.length > 0) {
+    options.onPermissionRulesFiltered?.({
+      deny: denyFiltered,
+      allow: allowFiltered,
+      dropped: droppedPermissionRules
+    });
+  }
+  for (const rule of denyFiltered.rules) {
     trailing.push("--deny", rule);
   }
-  for (const rule of normalizeRuleList(options.allowRules)) {
+  for (const rule of allowFiltered.rules) {
     trailing.push("--allow", rule);
   }
   // Future Hyper flag: confine the agent to a single writable root. Only
@@ -997,8 +1605,18 @@ export function runHeadlessAgent(cwd, options = {}) {
   const invocationShape = resolveSpawnInvocation(binary, [], spawnEnv, platform);
   let promptTransport = null;
 
+  // Prefer live prefixes from version --json when the caller did not override.
+  const supportedPermissionPrefixes = resolveSupportedPermissionPrefixes(binary, {
+    supportedPermissionPrefixes: options.supportedPermissionPrefixes,
+    env: spawnEnv,
+    runCommandImpl: options.runCommandImpl,
+    cache: options.permissionPrefixCache
+  });
+
   const args = buildHeadlessArgs(prompt, {
     ...options,
+    binary,
+    supportedPermissionPrefixes,
     cwd: options.cwd ?? cwd,
     sessionId: options.resumeSessionId || options.continueLast ? undefined : sessionId,
     platform,
@@ -1006,6 +1624,24 @@ export function runHeadlessAgent(cwd, options = {}) {
     argvOverheadBytes: argvBytes([invocationShape.executable, ...invocationShape.args]),
     onPromptBounded: (info) => {
       promptTransport = info;
+    },
+    // C10: surface dropped deny/allow prefixes so operators see why a rule vanished.
+    onPermissionRulesFiltered: (info) => {
+      options.onPermissionRulesFiltered?.(info);
+      const dropped = info?.dropped ?? [];
+      if (dropped.length === 0) {
+        return;
+      }
+      const sample = dropped
+        .slice(0, 3)
+        .map((d) => `${d.rule} (${d.reason})`)
+        .join("; ");
+      const more = dropped.length > 3 ? ` (+${dropped.length - 3} more)` : "";
+      emitProgress(
+        options.onProgress,
+        `Warning: dropped ${dropped.length} permission rule(s) unsupported by the CLI: ${sample}${more}`,
+        "starting"
+      );
     }
   });
 
@@ -1023,7 +1659,11 @@ export function runHeadlessAgent(cwd, options = {}) {
       env: spawnEnv,
       stdio: ["ignore", "pipe", "pipe"],
       detached,
-      windowsHide: true
+      windowsHide: true,
+      // Required when resolveSpawnInvocation routes a .cmd/.bat through
+      // cmd.exe /d /s /c with a pre-quoted command line (C2). process.mjs
+      // already forwards this; dropping it here mangles argv on Windows shims.
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments === true
     });
 
     const agentPid = child.pid ?? null;
@@ -1059,10 +1699,17 @@ export function runHeadlessAgent(cwd, options = {}) {
     let lastPhase = null;
 
     function consumeLine(line) {
-      const event = parseStreamEvent(line);
-      if (!event) {
+      // C13: use detailed parse so malformed/truncated lines keep a reason
+      // (json-parse-failed vs not-a-json-object) instead of a silent drop.
+      const detailed = parseStreamEventDetailed(line);
+      if (!detailed) {
         return;
       }
+      if (!detailed.ok) {
+        transcript.noteMalformedLine?.(detailed.line, detailed.reason);
+        return;
+      }
+      const event = detailed.event;
       const outcome = transcript.accept(event);
       if (outcome.messageCompleted) {
         emitProgress(
@@ -1138,11 +1785,19 @@ export function runHeadlessAgent(cwd, options = {}) {
         result = transcript.finish();
       }
 
-      const resolvedThreadId = result?.sessionId || sessionId;
       // Non-streaming (`--output-format json`, or plain) has exactly one body of
       // text, so all four text fields collapse onto it. Only `finalReport` can
       // still differ, because the fence may or may not be in there.
       const plainText = stdout.trimEnd();
+
+      // C14: extract usage/toolCalls/sessionId from Turbo JSON envelope.
+      let jsonEnvelope = null;
+      if (!streaming && (outputFormat === "json" || plainText.startsWith("{"))) {
+        jsonEnvelope = parseJsonAgentEnvelope(plainText);
+      }
+
+      const resolvedThreadId =
+        result?.sessionId || jsonEnvelope?.sessionId || sessionId;
 
       // Did the streaming parser understand ANY of what came back? A CLI update
       // that renames the event vocabulary turns every text field empty while
@@ -1161,7 +1816,12 @@ export function runHeadlessAgent(cwd, options = {}) {
           : "";
       // One body of text that every text field collapses onto, or null when a
       // parsed transcript is available and should be used instead.
-      const collapsedText = streamFallback || (result ? null : plainText);
+      let collapsedText = streamFallback || (result ? null : plainText);
+      if (!streaming && jsonEnvelope && typeof jsonEnvelope.text === "string") {
+        // Prefer envelope.text (model answer) over raw envelope JSON for
+        // finalMessage-style fields; raw stdout stays on `stdout`.
+        collapsedText = jsonEnvelope.text;
+      }
       emitProgress(
         options.onProgress,
         status === 0 ? "Grok finished." : `Grok exited with status ${status}.`,
@@ -1187,14 +1847,18 @@ export function runHeadlessAgent(cwd, options = {}) {
         finalReport:
           collapsedText == null ? result.finalReport : extractFinalReport(collapsedText),
         messages: result ? result.messages : null,
-        usage: result?.usage ?? null,
-        stopReason: result?.stopReason ?? null,
+        usage: result?.usage ?? jsonEnvelope?.usage ?? null,
+        stopReason: result?.stopReason ?? jsonEnvelope?.stopReason ?? null,
         // null when the stream never proved it speaks tools - not the same as 0.
-        toolCallCount: result?.toolCallCount ?? null,
+        toolCallCount: result?.toolCallCount ?? jsonEnvelope?.toolCallCount ?? null,
         toolCallCountFloor: result?.toolCallCountFloor ?? null,
-        toolVisibility: result?.toolVisibility ?? null,
+        toolVisibility: result?.toolVisibility ?? jsonEnvelope?.toolVisibility ?? null,
         toolActivity: result?.toolActivity ?? [],
-        resolvedModel: result?.usage?.resolvedModel ?? result?.modelResolved ?? null,
+        resolvedModel:
+          result?.usage?.resolvedModel ??
+          result?.modelResolved ??
+          jsonEnvelope?.usage?.resolvedModel ??
+          null,
         unknownEventTypes: result?.unknownTypes ?? [],
         // Stream-channel honesty: error / confine / denials must reach the run
         // record rather than being dropped after unrecognized-type counting.
@@ -1209,7 +1873,13 @@ export function runHeadlessAgent(cwd, options = {}) {
         maxTurnsReached: Boolean(result?.maxTurnsReached),
         start: result?.start ?? null,
         streamSchemaVersion: result?.streamSchemaVersion ?? null,
-        filesChangedFromStream: result?.filesChanged ?? null,
+        filesChangedFromStream: result?.filesChanged ?? jsonEnvelope?.filesChanged ?? null,
+        // Turbo --json-schema on streaming-json end (C11) or json envelope (C14).
+        structuredOutput: result?.structuredOutput ?? jsonEnvelope?.structuredOutput ?? null,
+        structuredOutputError:
+          result?.structuredOutputError ?? jsonEnvelope?.structuredOutputError ?? null,
+        malformedStreamLines: result?.malformedLines ?? [],
+        malformedStreamLineCount: result?.malformedLineCount ?? 0,
         // False only when a streaming run's events were all unrecognized, i.e.
         // when the four text fields above are raw stdout rather than a parsed
         // transcript. The renderer says so out loud rather than passing off
@@ -1290,7 +1960,196 @@ export function runImport(cwd, options = {}) {
     sessionId,
     threadId: sessionId,
     parsed,
-    resumeCommand: sessionId ? `grok -r ${sessionId}` : null
+    resumeCommand: sessionId ? `${binary} -r ${sessionId}` : null
+  };
+}
+
+/**
+ * True when `value` looks like a Turbo/Grok headless `--output-format json`
+ * envelope (`build_json_result`) rather than the review/critique schema body.
+ *
+ * Real CLIs nest the schema under `structuredOutput` and put failures on
+ * `structuredOutputError`. Treating the envelope itself as the schema loses
+ * both (C12).
+ */
+export function isCliJsonEnvelope(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  if ("structuredOutput" in value || "structuredOutputError" in value) {
+    return true;
+  }
+  // Envelope without a schema attachment still carries session/result keys.
+  const hasSession = typeof value.sessionId === "string" && value.sessionId.length > 0;
+  const hasResultShape =
+    "stopReason" in value || "text" in value || "usage" in value || "requestId" in value;
+  // Bare review objects also have string fields — do not treat a top-level
+  // `verdict` payload (fixtures / older bare JSON) as an envelope.
+  if (typeof value.verdict === "string") {
+    return false;
+  }
+  return hasSession && hasResultShape;
+}
+
+/**
+ * Prefer Turbo's nested structuredOutput body; surface structuredOutputError.
+ * Non-envelope objects (bare schema, fixtures) pass through unchanged.
+ *
+ * @param {unknown} value
+ * @returns {{ parsed: object|null, parseError: string|null, envelope: object|null }}
+ */
+export function unwrapCliStructuredBody(value) {
+  if (!isCliJsonEnvelope(value)) {
+    return { parsed: value, parseError: null, envelope: null };
+  }
+  const envelope = value;
+  const schemaErrorRaw = envelope.structuredOutputError;
+  const schemaError =
+    schemaErrorRaw != null && String(schemaErrorRaw).trim() ? String(schemaErrorRaw).trim() : null;
+
+  let body = envelope.structuredOutput;
+  if (body === undefined || body === null) {
+    if (schemaError) {
+      return { parsed: null, parseError: schemaError, envelope };
+    }
+    return {
+      parsed: null,
+      parseError: "CLI JSON envelope had no structuredOutput body.",
+      envelope
+    };
+  }
+  if (typeof body === "string") {
+    try {
+      body = JSON.parse(body);
+    } catch (error) {
+      return {
+        parsed: null,
+        parseError: schemaError ?? (error instanceof Error ? error.message : String(error)),
+        envelope
+      };
+    }
+  }
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    return {
+      parsed: null,
+      parseError: schemaError ?? "CLI structuredOutput was not a JSON object.",
+      envelope
+    };
+  }
+  return { parsed: body, parseError: null, envelope };
+}
+
+function finishStructuredParse(value, fallback, rawOutput) {
+  const unwrapped = unwrapCliStructuredBody(value);
+  return {
+    ...fallback,
+    parsed: unwrapped.parsed,
+    parseError: unwrapped.parseError,
+    rawOutput,
+    // Optional for diagnostics / future consumers; harmless if ignored.
+    envelope: unwrapped.envelope
+  };
+}
+
+/**
+ * Parse a Turbo/Grok non-streaming `--output-format json` envelope (C14).
+ * Extracts usage, toolCalls, sessionId, structuredOutput, and primary text.
+ *
+ * @param {string} raw
+ * @returns {{
+ *   envelope: object|null,
+ *   text: string,
+ *   sessionId: string|null,
+ *   stopReason: string|null,
+ *   usage: object|null,
+ *   toolCallCount: number|null,
+ *   toolVisibility: string|null,
+ *   structuredOutput: unknown,
+ *   structuredOutputError: string|null,
+ *   filesChanged: object|null
+ * }|null}
+ */
+export function parseJsonAgentEnvelope(raw) {
+  const text = String(raw ?? "").trim();
+  if (!text) {
+    return null;
+  }
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  // Bare review schema (fixture) is not an agent envelope for tool/usage.
+  if (typeof value.verdict === "string" && !("sessionId" in value) && !("usage" in value)) {
+    return null;
+  }
+
+  const usage = normalizeUsage(value);
+  let toolCallCount = null;
+  // Turbo emits toolCalls as a u32 integer on --output-format json (H2).
+  // Streaming path uses the same shape on end.toolCalls. Also accept arrays
+  // (fixtures / older shapes) and explicit toolCallCount fields.
+  if (typeof value.toolCalls === "number" && Number.isFinite(value.toolCalls)) {
+    toolCallCount = Number(value.toolCalls);
+  } else if (typeof value.tool_calls === "number" && Number.isFinite(value.tool_calls)) {
+    toolCallCount = Number(value.tool_calls);
+  } else if (Array.isArray(value.toolCalls)) {
+    toolCallCount = value.toolCalls.length;
+  } else if (Array.isArray(value.tool_calls)) {
+    toolCallCount = value.tool_calls.length;
+  } else if (value.toolCallCount != null && Number.isFinite(Number(value.toolCallCount))) {
+    toolCallCount = Number(value.toolCallCount);
+  } else if (value.tool_call_count != null && Number.isFinite(Number(value.tool_call_count))) {
+    toolCallCount = Number(value.tool_call_count);
+  }
+
+  let toolVisibility = null;
+  if (toolCallCount != null) {
+    toolVisibility = "explicit";
+  }
+
+  const fc = value.filesChanged ?? value.files_changed;
+  let filesChanged = null;
+  if (fc && typeof fc === "object") {
+    const paths = Array.isArray(fc.paths)
+      ? fc.paths.map(String)
+      : Array.isArray(fc.entries)
+        ? fc.entries.map((e) => (typeof e === "string" ? e : e?.path)).filter(Boolean)
+        : [];
+    const count = Number.isFinite(Number(fc.count ?? fc.total))
+      ? Number(fc.count ?? fc.total)
+      : paths.length;
+    filesChanged = { count, paths, truncated: Boolean(fc.truncated) };
+  }
+
+  const bodyText =
+    typeof value.text === "string"
+      ? value.text
+      : typeof value.finalMessage === "string"
+        ? value.finalMessage
+        : text;
+
+  const schemaErr = value.structuredOutputError ?? value.structured_output_error;
+  return {
+    envelope: value,
+    text: bodyText,
+    sessionId: typeof value.sessionId === "string" ? value.sessionId : null,
+    stopReason: typeof value.stopReason === "string" ? value.stopReason : null,
+    usage,
+    toolCallCount,
+    toolVisibility,
+    structuredOutput: value.structuredOutput ?? value.structured_output ?? null,
+    structuredOutputError:
+      schemaErr == null || schemaErr === ""
+        ? null
+        : typeof schemaErr === "string"
+          ? schemaErr
+          : JSON.stringify(schemaErr),
+    filesChanged
   };
 }
 
@@ -1300,37 +2159,30 @@ export function parseStructuredOutput(rawOutput, fallback = {}) {
       ...fallback,
       parsed: null,
       parseError: fallback.failureMessage ?? "Grok did not return a final structured message.",
-      rawOutput: rawOutput ?? ""
+      rawOutput: rawOutput ?? "",
+      envelope: null
     };
   }
 
   const text = String(rawOutput).trim();
 
   try {
-    return {
-      ...fallback,
-      parsed: JSON.parse(text),
-      parseError: null,
-      rawOutput: text
-    };
+    return finishStructuredParse(JSON.parse(text), fallback, text);
   } catch {
+    // try fenced / sliced forms below
   }
 
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fenced) {
     try {
-      return {
-        ...fallback,
-        parsed: JSON.parse(fenced[1].trim()),
-        parseError: null,
-        rawOutput: text
-      };
+      return finishStructuredParse(JSON.parse(fenced[1].trim()), fallback, text);
     } catch (error) {
       return {
         ...fallback,
         parsed: null,
         parseError: error.message,
-        rawOutput: text
+        rawOutput: text,
+        envelope: null
       };
     }
   }
@@ -1339,18 +2191,14 @@ export function parseStructuredOutput(rawOutput, fallback = {}) {
   const end = text.lastIndexOf("}");
   if (start !== -1 && end > start) {
     try {
-      return {
-        ...fallback,
-        parsed: JSON.parse(text.slice(start, end + 1)),
-        parseError: null,
-        rawOutput: text
-      };
+      return finishStructuredParse(JSON.parse(text.slice(start, end + 1)), fallback, text);
     } catch (error) {
       return {
         ...fallback,
         parsed: null,
         parseError: error.message,
-        rawOutput: text
+        rawOutput: text,
+        envelope: null
       };
     }
   }
@@ -1359,7 +2207,8 @@ export function parseStructuredOutput(rawOutput, fallback = {}) {
     ...fallback,
     parsed: null,
     parseError: "Could not parse structured JSON from Grok output.",
-    rawOutput: text
+    rawOutput: text,
+    envelope: null
   };
 }
 

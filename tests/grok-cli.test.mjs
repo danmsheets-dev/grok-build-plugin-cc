@@ -6,18 +6,35 @@ import assert from "node:assert/strict";
 import { resolveExecutable } from "../plugins/grok-build/scripts/lib/which.mjs";
 
 import { FAKE_GROK_LONG_TURN_TEXT, buildEnv, installFakeGrok } from "./fake-grok-fixture.mjs";
-import { makeTempDir, run } from "./helpers.mjs";
+import { makeTempDir, run, writeExecutable } from "./helpers.mjs";
 import {
+  DEFAULT_BINARY_CANDIDATES,
+  PREFERRED_BINARY,
   PROMPT_ARGV_BUDGET_POSIX,
   PROMPT_ARGV_BUDGET_WIN32,
   PROMPT_ARGV_BUDGET_WIN32_CMD_SHIM,
+  binaryOnPath,
   buildHeadlessArgs,
   buildReviewPrompt,
+  detectCliBrand,
+  describeMissingBinary,
+  filterPermissionRulesForCli,
   getGrokAuthStatus,
   getGrokAvailability,
+  isAgentCompatibleBinary,
+  listGrokBinaryCandidates,
+  looksLikeNonAgentTurboVersion,
+  parseJsonAgentEnvelope,
+  parsePermissionRulePrefix,
   parseStructuredOutput,
+  pickAvailabilityFailureDetail,
+  probePermissionToolPrefixes,
+  READ_ONLY_DENY_RULES,
+  resetAgentCompatCacheForTests,
+  resetPermissionPrefixCacheForTests,
   resolveGrokBinary,
   resolvePromptArgvBudget,
+  resolveSupportedPermissionPrefixes,
   runHeadlessAgent,
   runImport
 } from "../plugins/grok-build/scripts/lib/grok.mjs";
@@ -25,7 +42,164 @@ import { runCommand } from "../plugins/grok-build/scripts/lib/process.mjs";
 
 test("resolveGrokBinary prefers GROK_BINARY override", () => {
   assert.equal(resolveGrokBinary({ GROK_BINARY: "/custom/grok" }), "/custom/grok");
-  assert.equal(resolveGrokBinary({}), "grok");
+  assert.equal(resolveGrokBinary({ GROK_BINARY: "turbo" }), "turbo");
+});
+
+test("resolveGrokBinary prefers turbo over grok and never selects hyper", () => {
+  assert.deepEqual([...DEFAULT_BINARY_CANDIDATES], ["turbo", "grok"]);
+  assert.equal(PREFERRED_BINARY, "turbo");
+  assert.ok(!DEFAULT_BINARY_CANDIDATES.includes("hyper"));
+
+  // PATH-order preference without spawning agent probes (unit-level).
+  const pathOpts = { skipAgentProbe: true };
+
+  const emptyPathEnv = { PATH: "", Path: "" };
+  assert.equal(resolveGrokBinary(emptyPathEnv, pathOpts), "turbo");
+
+  const binDir = makeTempDir();
+  // Only grok present → fall back to grok, not hyper.
+  writeExecutable(path.join(binDir, "grok"), "#!/usr/bin/env node\nprocess.exit(0);\n");
+  const grokOnly = { PATH: binDir, Path: binDir };
+  assert.equal(resolveGrokBinary(grokOnly, pathOpts), "grok");
+  assert.equal(binaryOnPath("hyper", grokOnly), false);
+
+  // turbo present → preferred even if grok is also there.
+  writeExecutable(path.join(binDir, "turbo"), "#!/usr/bin/env node\nprocess.exit(0);\n");
+  assert.equal(resolveGrokBinary({ PATH: binDir, Path: binDir }, pathOpts), "turbo");
+
+  // hyper on PATH alone must not win auto-resolution.
+  const hyperDir = makeTempDir();
+  writeExecutable(path.join(hyperDir, "hyper"), "#!/usr/bin/env node\nprocess.exit(0);\n");
+  assert.equal(resolveGrokBinary({ PATH: hyperDir, Path: hyperDir }, pathOpts), "turbo");
+
+  // Stale GROK_BINARY=hyper (bare or path) is ignored so turbo wins.
+  assert.equal(
+    resolveGrokBinary({ GROK_BINARY: "hyper", PATH: binDir, Path: binDir }, pathOpts),
+    "turbo"
+  );
+  assert.equal(
+    resolveGrokBinary(
+      {
+        GROK_BINARY: "C:\\Users\\me\\.hyper\\bin\\hyper.exe",
+        PATH: binDir,
+        Path: binDir
+      },
+      pathOpts
+    ),
+    "turbo"
+  );
+});
+
+test("isAgentCompatibleBinary rejects turborepo-shaped version banners (C1)", () => {
+  assert.equal(looksLikeNonAgentTurboVersion("turborepo 2.5.4"), true);
+  assert.equal(looksLikeNonAgentTurboVersion("grok 0.2.83"), false);
+  assert.equal(looksLikeNonAgentTurboVersion("turbo 1.0.0-rc.1 (abc)"), false);
+
+  const cache = new Map();
+  resetAgentCompatCacheForTests(cache);
+  const turboRepo = (bin, args) => {
+    if (args[0] === "version" && args[1] === "--json") {
+      return { status: 1, stdout: "", stderr: "unknown", error: null };
+    }
+    if (args[0] === "version" || args[0] === "--version") {
+      return { status: 0, stdout: "2.5.4\n", stderr: "", error: null };
+    }
+    return {
+      status: 0,
+      stdout: "Usage: turbo run <task>\n  --filter\n  --cache\n",
+      stderr: "",
+      error: null
+    };
+  };
+  assert.equal(
+    isAgentCompatibleBinary("turbo", { runCommandImpl: turboRepo, cache, force: true }),
+    false
+  );
+
+  // rc2 identity card is authoritative when present.
+  assert.equal(
+    isAgentCompatibleBinary("turbo", {
+      runCommandImpl: (bin, args) => {
+        if (args[0] === "version" && args[1] === "--json") {
+          return {
+            status: 0,
+            stdout: JSON.stringify({
+              currentVersion: "1.0.0-rc.2",
+              cliFamily: "grok-build",
+              agentCompatible: true,
+              product: "turbo-grok-build"
+            }),
+            stderr: "",
+            error: null
+          };
+        }
+        return { status: 0, stdout: "", stderr: "", error: null };
+      },
+      cache: new Map(),
+      force: true
+    }),
+    true
+  );
+
+  const agentTurbo = (bin, args) => {
+    if (args[0] === "version" && args[1] === "--json") {
+      return { status: 1, stdout: "", stderr: "", error: null };
+    }
+    if (args[0] === "version" || args[0] === "--version") {
+      return { status: 0, stdout: "turbo 1.0.0-rc.1 (deadbeef)\n", stderr: "", error: null };
+    }
+    return {
+      status: 0,
+      stdout:
+        "Usage: turbo\n  -p, --single\n  --prompt-file\n  --output-format\n  --always-approve\n  --confine\n",
+      stderr: "",
+      error: null
+    };
+  };
+  assert.equal(
+    isAgentCompatibleBinary("turbo", { runCommandImpl: agentTurbo, cache: new Map(), force: true }),
+    true
+  );
+
+  assert.equal(
+    isAgentCompatibleBinary("grok", {
+      runCommandImpl: (bin, args) => {
+        if (args[0] === "version" && args[1] === "--json") {
+          return { status: 1, stdout: "", stderr: "", error: null };
+        }
+        return { status: 0, stdout: "grok 0.2.83-fake\n", stderr: "", error: null };
+      },
+      cache: new Map(),
+      force: true
+    }),
+    true
+  );
+});
+
+test("buildHeadlessArgs emits --job-object on win32 by default (rc2)", () => {
+  const win = buildHeadlessArgs("hi", { platform: "win32", argvBudget: 100_000 });
+  assert.ok(win.includes("--job-object"));
+  const off = buildHeadlessArgs("hi", {
+    platform: "win32",
+    argvBudget: 100_000,
+    env: { GROK_BUILD_JOB_OBJECT: "0" }
+  });
+  assert.ok(!off.includes("--job-object"));
+  const posix = buildHeadlessArgs("hi", { platform: "linux", argvBudget: 100_000 });
+  assert.ok(!posix.includes("--job-object"));
+});
+
+test("detectCliBrand recognizes Turbo first", () => {
+  assert.deepEqual(detectCliBrand("turbo 0.2.119-r2"), { id: "turbo", label: "Turbo" });
+  assert.deepEqual(detectCliBrand("hyper 0.2.114-r5"), { id: "hyper", label: "Hyper" });
+  assert.deepEqual(detectCliBrand("grok 0.2.83"), { id: "grok", label: "Grok Build" });
+});
+
+test("describeMissingBinary names turbo for defaults and the override path for GROK_BINARY", () => {
+  assert.match(describeMissingBinary("turbo"), /Turbo/);
+  assert.match(describeMissingBinary("grok"), /turbo|Turbo/i);
+  assert.match(describeMissingBinary("C:\\\\custom\\\\hyper.exe"), /GROK_BINARY/);
+  assert.doesNotMatch(describeMissingBinary("turbo"), /Hyper build/i);
 });
 
 test("getGrokAvailability reports available with fake grok on PATH", () => {
@@ -92,7 +266,8 @@ test("runImport parses session id from fake grok json output", () => {
   });
 
   assert.equal(result.sessionId, "11111111-2222-4333-8444-555555555555");
-  assert.equal(result.resumeCommand, "grok -r 11111111-2222-4333-8444-555555555555");
+  // Preferred default is turbo when the fixture installs both names on PATH.
+  assert.equal(result.resumeCommand, "turbo -r 11111111-2222-4333-8444-555555555555");
 });
 
 test("parseStructuredOutput extracts fenced JSON", () => {
@@ -112,6 +287,229 @@ test("parseStructuredOutput does not let fallback clobber canonical fields", () 
   assert.equal(parsed.parseError, null);
   assert.equal(parsed.parsed.verdict, "approve");
   assert.equal(parsed.status, 7);
+});
+
+test("parseStructuredOutput unwraps Turbo JSON envelope structuredOutput (C12)", () => {
+  const envelope = {
+    text: "Review complete.",
+    stopReason: "end_turn",
+    sessionId: "019ff0aa-0000-7000-8000-000000000001",
+    requestId: "req-1",
+    structuredOutput: {
+      verdict: "needs-attention",
+      summary: "One real issue.",
+      findings: [{ severity: "high", title: "Race", body: "…", file: "a.ts" }],
+      next_steps: ["Fix the race"]
+    },
+    usage: { input_tokens: 10, output_tokens: 5 }
+  };
+  const parsed = parseStructuredOutput(JSON.stringify(envelope));
+  assert.equal(parsed.parseError, null);
+  assert.equal(parsed.parsed.verdict, "needs-attention");
+  assert.equal(parsed.parsed.summary, "One real issue.");
+  assert.equal(parsed.envelope?.sessionId, "019ff0aa-0000-7000-8000-000000000001");
+  // Must not treat the outer envelope as the schema body.
+  assert.equal(parsed.parsed.sessionId, undefined);
+  assert.equal(parsed.parsed.stopReason, undefined);
+});
+
+test("parseStructuredOutput surfaces structuredOutputError from Turbo envelope (C12)", () => {
+  const envelope = {
+    text: "Could not satisfy schema.",
+    stopReason: "end_turn",
+    sessionId: "019ff0aa-0000-7000-8000-000000000002",
+    structuredOutput: null,
+    structuredOutputError: "JSON schema validation failed: missing verdict"
+  };
+  const parsed = parseStructuredOutput(JSON.stringify(envelope));
+  assert.equal(parsed.parsed, null);
+  assert.match(String(parsed.parseError), /JSON schema validation failed/);
+  assert.equal(parsed.envelope?.sessionId, "019ff0aa-0000-7000-8000-000000000002");
+});
+
+test("parseStructuredOutput still accepts bare review schema without envelope", () => {
+  const bare = {
+    verdict: "approve",
+    summary: "LGTM",
+    findings: [],
+    next_steps: []
+  };
+  const parsed = parseStructuredOutput(JSON.stringify(bare));
+  assert.equal(parsed.parseError, null);
+  assert.equal(parsed.parsed.verdict, "approve");
+  assert.equal(parsed.envelope, null);
+});
+
+test("parseJsonAgentEnvelope extracts usage and toolCalls from Turbo json (C14)", () => {
+  const envelope = {
+    text: "Done.",
+    stopReason: "end_turn",
+    sessionId: "sess-json-1",
+    toolCalls: [{ name: "read_file" }, { name: "write" }],
+    usage: {
+      input_tokens: 10,
+      output_tokens: 4,
+      total_tokens: 14,
+      total_cost_usd: 0.01
+    },
+    structuredOutput: { verdict: "approve", summary: "ok", findings: [], next_steps: [] }
+  };
+  const parsed = parseJsonAgentEnvelope(JSON.stringify(envelope));
+  assert.ok(parsed);
+  assert.equal(parsed.sessionId, "sess-json-1");
+  assert.equal(parsed.toolCallCount, 2);
+  assert.equal(parsed.toolVisibility, "explicit");
+  assert.equal(parsed.usage?.outputTokens, 4);
+  assert.equal(parsed.structuredOutput?.verdict, "approve");
+  assert.equal(parsed.text, "Done.");
+});
+
+test("parseJsonAgentEnvelope accepts integer toolCalls from Turbo json (H2)", () => {
+  const envelope = {
+    text: "Done.",
+    stopReason: "end_turn",
+    sessionId: "sess-json-int",
+    toolCalls: 7,
+    usage: { input_tokens: 1, output_tokens: 2 }
+  };
+  const parsed = parseJsonAgentEnvelope(JSON.stringify(envelope));
+  assert.ok(parsed);
+  assert.equal(parsed.toolCallCount, 7);
+  assert.equal(parsed.toolVisibility, "explicit");
+
+  const zero = parseJsonAgentEnvelope(
+    JSON.stringify({ text: "noop", toolCalls: 0, sessionId: "s0" })
+  );
+  assert.equal(zero?.toolCallCount, 0);
+  assert.equal(zero?.toolVisibility, "explicit");
+});
+
+test("READ_ONLY_DENY_RULES use tool-wide Edit(*) (C8)", () => {
+  assert.deepEqual([...READ_ONLY_DENY_RULES], ["Edit(*)"]);
+});
+
+test("listGrokBinaryCandidates walks PATH order without override (C3)", () => {
+  const binDir = makeTempDir();
+  writeExecutable(path.join(binDir, "turbo"), "#!/usr/bin/env node\nprocess.exit(0);\n");
+  writeExecutable(path.join(binDir, "grok"), "#!/usr/bin/env node\nprocess.exit(0);\n");
+  const list = listGrokBinaryCandidates({ PATH: binDir, Path: binDir });
+  assert.deepEqual(list, ["turbo", "grok"]);
+});
+
+test("pickAvailabilityFailureDetail prefers clearer --version text (C4)", () => {
+  assert.equal(
+    pickAvailabilityFailureDetail("Unknown command: version", "not found"),
+    "not found"
+  );
+  assert.equal(
+    pickAvailabilityFailureDetail(
+      "error: unexpected argument 'version' for turborepo pipeline",
+      "ENOENT: no such file or directory"
+    ),
+    "ENOENT: no such file or directory"
+  );
+  assert.equal(pickAvailabilityFailureDetail("same", "same"), "same");
+  assert.equal(pickAvailabilityFailureDetail("", "alt only"), "alt only");
+});
+
+test("describeMissingBinary names the tried binary (C5)", () => {
+  assert.match(describeMissingBinary("turbo"), /Turbo|turbo/);
+  assert.match(describeMissingBinary("C:\\custom\\agent.exe"), /C:\\custom\\agent\.exe|GROK_BINARY/);
+});
+
+test("filterPermissionRulesForCli keeps NotebookEdit/MultiEdit aliases and drops unknown (C10/rc2)", () => {
+  assert.equal(parsePermissionRulePrefix("Edit(*)"), "Edit");
+  assert.equal(parsePermissionRulePrefix("NotebookEdit(**)"), "NotebookEdit");
+  assert.equal(parsePermissionRulePrefix("MultiEdit(**)"), "MultiEdit");
+  const filtered = filterPermissionRulesForCli([
+    "Edit(*)",
+    "Write(C:/repo/**)",
+    "NotebookEdit(**)",
+    "MultiEdit(**)",
+    "search_replace(**)"
+  ]);
+  // rc2 Turbo maps NotebookEdit/MultiEdit → Edit; bridge keeps aliases.
+  assert.deepEqual(filtered.rules, [
+    "Edit(*)",
+    "Write(C:/repo/**)",
+    "NotebookEdit(**)",
+    "MultiEdit(**)"
+  ]);
+  assert.equal(filtered.dropped.length, 1);
+  assert.ok(filtered.dropped.some((d) => d.rule.includes("search_replace")));
+
+  const args = buildHeadlessArgs("hi", {
+    denyRules: ["Edit(*)", "NotebookEdit(**)", "MultiEdit(**)", "search_replace(**)"],
+    platform: "linux",
+    argvBudget: 100_000
+  });
+  assert.ok(args.includes("Edit(*)"));
+  assert.ok(args.includes("NotebookEdit(**)"));
+  assert.ok(args.includes("MultiEdit(**)"));
+  assert.ok(!args.includes("search_replace(**)"));
+});
+
+test("probePermissionToolPrefixes reads version --json permissionToolPrefixes", () => {
+  const cache = new Map();
+  const prefixes = probePermissionToolPrefixes("fake-turbo", {
+    force: true,
+    cache,
+    runCommandImpl: (bin, args) => {
+      assert.equal(bin, "fake-turbo");
+      assert.deepEqual(args, ["version", "--json"]);
+      return {
+        status: 0,
+        stdout: JSON.stringify({
+          currentVersion: "1.0.0-rc.2",
+          agentCompatible: true,
+          permissionToolPrefixes: ["Edit", "Write", "MultiEdit", "NotebookEdit", "Bash"]
+        }),
+        stderr: "",
+        error: null
+      };
+    }
+  });
+  assert.deepEqual(prefixes, ["Edit", "Write", "MultiEdit", "NotebookEdit", "Bash"]);
+  // Cache hit must not re-run.
+  const again = probePermissionToolPrefixes("fake-turbo", {
+    cache,
+    runCommandImpl: () => {
+      throw new Error("should use cache");
+    }
+  });
+  assert.deepEqual(again, prefixes);
+
+  const empty = probePermissionToolPrefixes("old-cli", {
+    force: true,
+    cache: new Map(),
+    runCommandImpl: () => ({
+      status: 0,
+      stdout: JSON.stringify({ currentVersion: "1.0.0-rc.1", channel: "stable" }),
+      stderr: "",
+      error: null
+    })
+  });
+  assert.equal(empty, null);
+
+  resetPermissionPrefixCacheForTests(cache);
+  assert.equal(cache.size, 0);
+});
+
+test("resolveSupportedPermissionPrefixes prefers override then probe then static", () => {
+  assert.deepEqual(
+    [...resolveSupportedPermissionPrefixes("x", { supportedPermissionPrefixes: ["Edit"] })],
+    ["Edit"]
+  );
+  const probed = resolveSupportedPermissionPrefixes("probed-cli", {
+    cache: new Map(),
+    runCommandImpl: () => ({
+      status: 0,
+      stdout: JSON.stringify({ permissionToolPrefixes: ["Bash", "Edit"] }),
+      stderr: "",
+      error: null
+    })
+  });
+  assert.deepEqual([...probed], ["Bash", "Edit"]);
 });
 
 test("runHeadlessAgent reports agentPid from the spawned child", async () => {

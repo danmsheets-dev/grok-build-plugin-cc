@@ -701,23 +701,29 @@ export function terminateProcessTree(pid, options = {}) {
         const direct = tryKill(killImpl, pid, "SIGTERM");
         methods.push("kill");
         if (direct.missing) {
+          // C24: process already gone is observed-dead.
           return {
             attempted: true,
-            delivered: false,
+            delivered: true,
             method: methods.join("+"),
             errorText: errorParts.join("; ") || null,
-            result: lastResult
+            result: lastResult,
+            alreadyExited: true
           };
         }
       } else if (result.error) {
         recordError(result.error.message || String(result.error));
       } else if (looksLikeMissingProcessMessage(combinedOutput)) {
+        // C24: "process not found" means observed-dead (already exited), not a
+        // failed kill. delivered must mean observed-dead per this function's
+        // contract — otherwise stop writes killTombstone false alarms.
         return {
           attempted: true,
-          delivered: false,
+          delivered: true,
           method: methods.join("+"),
           errorText: null,
-          result: lastResult
+          result: lastResult,
+          alreadyExited: true
         };
       } else if (result.status === 0 && !looksLikeCouldNotTerminateMessage(combinedOutput)) {
         // Clean taskkill. Still re-probe below — exit 0 is not proof a

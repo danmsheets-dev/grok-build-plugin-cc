@@ -69,10 +69,49 @@ writeLog();
 
 if (argv[0] === "version" || argv[0] === "--version" || argv[0] === "-V") {
   if (hasFlag("--json")) {
-    process.stdout.write(JSON.stringify({ currentVersion: "0.2.83-fake", channel: "test" }) + "\\n");
+    process.stdout.write(
+      JSON.stringify({
+        currentVersion: "0.2.83-fake",
+        channel: "test",
+        product: "grok-build",
+        binary: "grok",
+        cliFamily: "grok-build",
+        agentCompatible: true,
+        features: { headless: true, confine: true, jobObject: false },
+        permissionToolPrefixes: [
+          "Any",
+          "Bash",
+          "Edit",
+          "Write",
+          "MultiEdit",
+          "NotebookEdit",
+          "Read",
+          "NotebookRead",
+          "Grep",
+          "Glob",
+          "MCPTool",
+          "WebFetch",
+          "WebSearch"
+        ]
+      }) + "\\n"
+    );
   } else {
     process.stdout.write("grok 0.2.83-fake\\n");
   }
+  process.exit(0);
+}
+
+if (argv[0] === "--help" || argv[0] === "-h" || argv[0] === "help") {
+  process.stdout.write(
+    "Usage: grok [OPTIONS]\\n" +
+      "  -p, --single <PROMPT>\\n" +
+      "  --prompt-file <PATH>\\n" +
+      "  --output-format <FORMAT>\\n" +
+      "  --always-approve\\n" +
+      "  --confine <PATH>\\n" +
+      "  models\\n" +
+      "  version\\n"
+  );
   process.exit(0);
 }
 
@@ -274,6 +313,17 @@ process.exit(1);
 `;
 
   writeExecutable(scriptPath, source);
+  // Bridge prefers `turbo` on PATH, then `grok`. Install both names so hermetic
+  // tests always hit this fixture first and never the developer's real Turbo.
+  const turboPath = path.join(binDir, "turbo");
+  if (turboPath !== scriptPath) {
+    fs.copyFileSync(scriptPath, turboPath);
+    try {
+      fs.chmodSync(turboPath, 0o755);
+    } catch {
+      // Windows may ignore mode bits; the copy is still invocable via PATHEXT.
+    }
+  }
   return scriptPath;
 }
 
@@ -284,16 +334,16 @@ export function buildEnv(binDir, extra = {}) {
     ...extra
   };
 
-  // Putting the fake `grok` first on PATH is not enough on its own: GROK_BINARY
-  // outranks PATH entirely, so a developer who has it exported — now a
-  // documented, supported setup for driving a community build such as Hyper —
-  // runs the whole suite against their REAL CLI. The failure is baffling rather
-  // than obvious: fixtures return live model output instead of scripted text,
-  // so assertions fail on content, not on "grok not found".
+  // Putting the fake CLI first on PATH is not enough on its own: GROK_BINARY
+  // outranks PATH entirely, so a developer who has it exported — a supported
+  // setup for driving a local fork such as Turbo — runs the whole suite against
+  // their REAL CLI. The failure is baffling rather than obvious: fixtures
+  // return live model output instead of scripted text, so assertions fail on
+  // content, not on "binary not found".
   //
-  // Deleted rather than pinned to "grok" so PATH stays the single source of
-  // truth for which binary a test exercises. A test that genuinely wants the
-  // override can still pass it through `extra`, which is applied above.
+  // Deleted rather than pinned so PATH stays the single source of truth for
+  // which binary a test exercises. A test that genuinely wants the override can
+  // still pass it through `extra`, which is applied above.
   if (!Object.prototype.hasOwnProperty.call(extra, "GROK_BINARY")) {
     delete env.GROK_BINARY;
   }

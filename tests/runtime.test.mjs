@@ -1011,7 +1011,7 @@ test("import uses grok import and prints resume hint", () => {
   assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
   const payload = JSON.parse(result.stdout);
   assert.equal(payload.threadId, "11111111-2222-4333-8444-555555555555");
-  assert.equal(payload.resumeCommand, "grok -r 11111111-2222-4333-8444-555555555555");
+  assert.equal(payload.resumeCommand, "turbo -r 11111111-2222-4333-8444-555555555555");
 });
 
 test("run-resume-candidate reports available after a completed run with thread id", () => {

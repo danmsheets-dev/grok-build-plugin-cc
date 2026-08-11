@@ -1,16 +1,18 @@
 # Grok Build ↔ Claude Code Bridge
 
-Bridge [Grok Build](https://x.ai) into Claude Code for review, critique, delegation, and session import.
+Bridge [Grok Build](https://x.ai) / **Turbo Grok Build** into Claude Code for review, critique, delegation, and session import.
 
-Plugin documentation, including the isolation guarantees, lives in [`plugins/grok-build/README.md`](plugins/grok-build/README.md).
+**Current plugin version: `0.6.7`.** Full isolation guarantees, verify semantics, and changelog live in [`plugins/grok-build/README.md`](plugins/grok-build/README.md).
 
-This repository is a Claude Code marketplace plugin that shells out to the real `grok` CLI. Run status, results, and stop are owned by the plugin (PID + log files). There is no app-server broker.
+This repository is a Claude Code marketplace plugin that shells out to a real agent CLI (`turbo` preferred, then `grok`). Run status, results, and stop are owned by the plugin (PID + log files). There is no app-server broker.
 
 ## Requirements
 
 - Node.js `>= 18.18`
-- Grok Build CLI (`grok`) on `PATH`, or set `GROK_BINARY`
-- A logged-in Grok CLI session (`grok models` succeeds)
+- **Turbo Grok Build** (`turbo`, preferred) or stock Grok Build CLI (`grok`) on `PATH`, or set `GROK_BINARY`
+  - Prefer **Turbo `1.0.0-rc.1+`**. `1.0.0-rc.2+` adds `turbo version --json` identity (`agentCompatible`, `permissionToolPrefixes`) and Claude-compat deny aliases (`NotebookEdit` / `MultiEdit`)
+  - The bridge probes identity and filters unknown `--deny` / `--allow` prefixes so older CLIs do not hard-abort
+- A logged-in session (`turbo models` / `grok models` succeeds; some forks exit non-zero on a successful listing — the bridge treats a model list as success)
 
 ## Local install
 
@@ -55,10 +57,12 @@ Read-only review of local git state:
 Runs (read-only):
 
 ```bash
-grok -p <prompt> --agent explore --always-approve --deny Edit(**) --deny Write(**) --deny NotebookEdit(**) --cwd <ws> --output-format streaming-json
+turbo -p <prompt> --agent explore --permission-mode plan --sandbox read-only --deny Edit(*) --cwd <ws> --output-format streaming-json
 ```
 
-Optional: pass `--model` / `--effort` (`low`|`medium`|`high`). If omitted, Grok chooses defaults.
+(Write-capable delegate runs use `--always-approve` and, on Windows, `--job-object` so stop can tear down the process tree.)
+
+Optional: pass `--model` / `--effort` (`none|minimal|low|medium|high|xhigh|max|ultra`). If omitted, the CLI chooses defaults.
 Pay-per-token models (`openai/*`) require `GROK_BUILD_ALLOW_PAY_PER_TOKEN=1`.
 
 ### `/grok-build:critique`
@@ -87,11 +91,11 @@ Write policy layering:
 
 | Layer | Default |
 | --- | --- |
-| Bridge `run` CLI | **Read-only** (`--always-approve` + `--deny Edit/Write/NotebookEdit`) unless you pass `--write` |
+| Bridge `run` CLI | **Read-only** (`--deny Edit/Write` + plan/sandbox) unless you pass `--write` |
 | Delegate agent / skill | Adds `--write` by policy (write-capable delegate) unless the user asks for read-only |
 
 - Direct `node …/grok-bridge.mjs run "…"` is therefore read-only unless `--write` is passed.
-- `--resume` / `--resume-last` continues the last stored Grok session id via `grok -r <id>`.
+- `--resume` / `--resume-last` continues the last stored Grok session id via `<cli> -r <id>` (resolved binary, usually `turbo`).
 - Prefer bridge `--background` for long work so runs record both `bridgePid` (Node worker) and `agentPid` (grok child).
 - `/grok-build:stop` terminates **both** process trees when present (agent then bridge/worker).
 - If you do not pass `--model` or `--effort`, Grok chooses its own defaults.
@@ -129,7 +133,7 @@ Import the current Claude transcript into Grok:
 /grok-build:import --source ~/.claude/projects/.../session.jsonl
 ```
 
-Uses `grok import` and prints a resume hint: `grok -r <id>`.
+Uses `<cli> import` and prints a resume hint: `<cli> -r <id>` (resolved binary, usually `turbo`).
 
 ### `/grok-build:runs`
 
@@ -172,7 +176,9 @@ Kills every distinct pid among `agentPid` (detached grok child) and `bridgePid` 
 
 | Variable | Purpose |
 | --- | --- |
-| `GROK_BINARY` | Optional override for the `grok` executable (e.g. Hyper) |
+| `GROK_BINARY` | Optional override for the CLI executable (default resolution: `turbo`, then `grok`; Hyper overrides are ignored) |
+| `GROK_BUILD_JOB_OBJECT` | Windows: set to `0`/`false` to skip passing `--job-object` on headless spawns (default: on for `win32`) |
+| `GROK_BUILD_ALLOW_WEAK_ISOLATE` | Set to `1` to allow isolated write runs when the CLI does not advertise `--confine` (default: refuse) |
 | `GROK_BUILD_ALLOW_PAY_PER_TOKEN` | Set to `1` to allow `openai/*` pay-per-token models |
 | `GROK_CC_SESSION_ID` | Claude session id (set by SessionStart hook) |
 | `GROK_CC_TRANSCRIPT_PATH` | Claude transcript path (set by SessionStart hook) |
@@ -184,13 +190,27 @@ Kills every distinct pid among `agentPid` (detached grok child) and `bridgePid` 
 
 State fallback when `CLAUDE_PLUGIN_DATA` is unset: `$TMPDIR/grok-cc-runs`.
 
+## Release notes (0.6.7)
+
+Harness hardening for Turbo Grok Build 1.0:
+
+- Structured critique reads Turbo `structuredOutput` / `structuredOutputError` (not free-form text alone)
+- JSON envelope accepts integer `toolCalls`; streaming records malformed NDJSON lines with reasons
+- Stop / session-end **claim terminal before kill** so a finishing runner cannot win `completed` over stop
+- Max-duration kill uses production PID fallbacks; porcelain isolation is fail-closed when git status is unreadable
+- CLI identity via `version --json`; deny/allow prefixes from `permissionToolPrefixes` when advertised
+- Windows headless passes `--job-object` by default
+
+See [`plugins/grok-build/README.md`](plugins/grok-build/README.md) for the full changelog.
+
 ## Development
 
 ```bash
 npm test
+npm run check-version
 ```
 
-Tests use Node's built-in test runner and a fake `grok` binary on `PATH`. Runtime code uses Node stdlib only.
+Tests use Node's built-in test runner and a fake CLI binary on `PATH`. Runtime code uses Node stdlib only.
 
 ## License
 
