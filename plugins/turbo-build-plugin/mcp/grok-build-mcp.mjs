@@ -171,8 +171,15 @@ defineTool(
         type: "boolean",
         description: "Allow the child to edit files (default true). Nested runs are always isolated."
       },
-      model: { type: "string" },
-      effort: { type: "string", enum: ["low", "medium", "high"] },
+      model: {
+        type: "string",
+        description: "Model id (default grok-4.6)."
+      },
+      effort: {
+        type: "string",
+        enum: ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"],
+        description: "Reasoning effort (default xhigh — Extra High)."
+      },
       max_turns: { type: "number" },
       max_cost: { type: "number", description: "USD ceiling; cannot exceed parent's remaining budget." },
       max_duration: { type: "number", description: "Seconds ceiling; cannot exceed parent's remaining wall clock." }
@@ -464,12 +471,8 @@ export function buildDelegateRunBridgeArgs(args = {}, promptFile = "prompt.txt")
   if (write) {
     bridgeArgs.push("--write");
   }
-  if (args.model) {
-    bridgeArgs.push("--model", String(args.model));
-  }
-  if (args.effort) {
-    bridgeArgs.push("--effort", String(args.effort));
-  }
+  bridgeArgs.push("--model", String(args.model || "grok-4.6"));
+  bridgeArgs.push("--effort", String(args.effort || "xhigh"));
   if (args.max_turns != null) {
     bridgeArgs.push("--max-turns", String(args.max_turns));
   }

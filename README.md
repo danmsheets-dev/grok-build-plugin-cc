@@ -2,7 +2,7 @@
 
 Claude Code bridge for review, critique, delegation, and session import. Shells out to **Turbo Grok Build** (`turbo`, preferred) or stock `grok`.
 
-**Current plugin version: `0.7.0`.** Full isolation guarantees, verify semantics, and changelog live in [`plugins/turbo-build-plugin/README.md`](plugins/turbo-build-plugin/README.md).
+**Current plugin version: `0.7.1`.** Defaults: **grok-4.6** at **xhigh**. Full isolation guarantees, verify semantics, and changelog live in [`plugins/turbo-build-plugin/README.md`](plugins/turbo-build-plugin/README.md).
 
 Run status, results, and stop are owned by the plugin (PID + log files). There is no app-server broker. This is an independent fork of the original xAI Grok Build plugin, rebranded and maintained at [danmsheets-dev/turbo-build-plugin](https://github.com/danmsheets-dev/turbo-build-plugin).
 
@@ -61,7 +61,7 @@ Read-only review of local git state:
 /turbo-build-plugin:review --wait
 /turbo-build-plugin:review --background --scope working-tree
 /turbo-build-plugin:review --base main
-/turbo-build-plugin:review --wait --model grok-build --effort high
+/turbo-build-plugin:review --wait --model grok-4.6 --effort xhigh
 ```
 
 Runs (read-only):
@@ -72,7 +72,7 @@ turbo -p <prompt> --agent explore --permission-mode plan --sandbox read-only --d
 
 (Write-capable delegate runs use `--always-approve` and, on Windows, `--job-object` so stop can tear down the process tree.)
 
-Optional: pass `--model` / `--effort` (`none|minimal|low|medium|high|xhigh|max|ultra`). If omitted, the CLI chooses defaults.
+Optional: pass `--model` / `--effort` (`none|minimal|low|medium|high|xhigh|max|ultra`). If omitted, the plugin defaults to **`grok-4.6`** at **`xhigh`** (Extra High Effort).
 Pay-per-token models (`openai/*`) require `GROK_BUILD_ALLOW_PAY_PER_TOKEN=1`.
 
 ### `/turbo-build-plugin:critique`
@@ -82,7 +82,7 @@ Same target selection as review, with a design/risk critique prompt and structur
 ```text
 /turbo-build-plugin:critique --wait
 /turbo-build-plugin:critique --base main challenge whether this was the right caching and retry design
-/turbo-build-plugin:critique --wait --model grok-build --effort high focus on failure modes
+/turbo-build-plugin:critique --wait --model grok-4.6 --effort xhigh focus on failure modes
 ```
 
 Optional: same `--model` / `--effort` flags as review.
@@ -94,7 +94,7 @@ Delegate investigation or implementation to Grok via the `turbo-build-plugin:tur
 ```text
 /turbo-build-plugin:delegate investigate the flaky test in auth
 /turbo-build-plugin:delegate --resume apply the top fix
-/turbo-build-plugin:delegate --model grok-build --effort high fix the race
+/turbo-build-plugin:delegate --model grok-4.6 --effort xhigh fix the race
 ```
 
 Write policy layering:
@@ -200,6 +200,10 @@ Kills every distinct pid among `agentPid` (detached grok child) and `bridgePid` 
 | `HOME` / `GROK_HOME` | Where the CLI keeps config, credentials and sessions. On Windows the bridge defaults both to `%USERPROFILE%` when neither is set; an explicit value is never overwritten. |
 
 State fallback when `CLAUDE_PLUGIN_DATA` is unset: `$TMPDIR/grok-cc-runs`.
+
+## Release notes (0.7.1)
+
+Default model is `grok-4.6` and default effort is `xhigh` (Extra High). MCP nest-run now accepts the full effort ladder.
 
 ## Release notes (0.7.0)
 

@@ -51,7 +51,13 @@ import {
   parseJsonRpcLine,
   shapeDelegateResult
 } from "../plugins/turbo-build-plugin/mcp/grok-build-mcp.mjs";
-import { normalizeReasoningEffort } from "../plugins/turbo-build-plugin/scripts/grok-bridge.mjs";
+import {
+  DEFAULT_EFFORT,
+  DEFAULT_MODEL,
+  normalizeReasoningEffort,
+  resolveEffortChoice,
+  resolveModelChoice
+} from "../plugins/turbo-build-plugin/scripts/grok-bridge.mjs";
 import { buildEnv, installFakeGrok } from "./fake-grok-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 
@@ -521,6 +527,20 @@ test("MCP tools/list does not advertise verify on delegate_run", () => {
   assert.ok(runTool);
   assert.equal(runTool.inputSchema.properties.verify, undefined);
   assert.equal(runTool.inputSchema.properties.no_verify, undefined);
+  assert.ok(runTool.inputSchema.properties.effort.enum.includes("xhigh"));
+});
+
+test("defaults are grok-4.6 at xhigh and MCP nest-run forwards them", () => {
+  assert.equal(DEFAULT_MODEL, "grok-4.6");
+  assert.equal(DEFAULT_EFFORT, "xhigh");
+  assert.equal(resolveModelChoice(null), "grok-4.6");
+  assert.equal(resolveEffortChoice(null), "xhigh");
+  assert.equal(resolveModelChoice("grok-4.5"), "grok-4.5");
+  assert.equal(resolveEffortChoice("high"), "high");
+  assert.equal(resolveModelChoice(null, "configured-model"), "configured-model");
+  const args = buildDelegateRunBridgeArgs({ prompt: "noop" }, "prompt.txt");
+  assert.equal(args[args.indexOf("--model") + 1], "grok-4.6");
+  assert.equal(args[args.indexOf("--effort") + 1], "xhigh");
 });
 
 /* -------------------------------------------------------------------------

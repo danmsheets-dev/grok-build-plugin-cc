@@ -39,7 +39,7 @@ Argument handling:
 - Do not strip `--wait` or `--background` yourself.
 - Do not weaken the critique framing or rewrite the user's focus text.
 - `--model` and `--effort` are runtime-selection flags. Preserve them for the bridge call; do not treat them as focus text.
-- Leave `--model` and `--effort` unset unless the user explicitly asks for them. Accepted effort values: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra` (unknown values are passed through to the CLI).
+- Default to `--model grok-4.6 --effort xhigh` unless the user explicitly asks for a different model or effort. Accepted effort values: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra` (unknown values are passed through to the CLI).
 - The bridge script parses `--wait` and `--background`. Bridge `--background` owns the long-running process group (detached `run-worker` + grok agent). Claude Code's `Bash(..., run_in_background: true)` is only for the short enqueue call, not the long critique process.
 - `/turbo-build-plugin:critique` uses the same review target selection as `/turbo-build-plugin:review`.
 - Unlike `/turbo-build-plugin:review`, `/turbo-build-plugin:critique` can still take extra focus text after the flags.

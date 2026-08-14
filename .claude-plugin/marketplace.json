@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "Turbo Build Plugin — Claude Code bridge for review, critique, and delegation via Turbo Grok Build.",
-    "version": "0.7.0"
+    "version": "0.7.1"
   },
   "plugins": [
     {
       "name": "turbo-build-plugin",
       "description": "Turbo Build Plugin — Claude Code bridge for review, critique, and delegation via Turbo Grok Build.",
-      "version": "0.7.0",
+      "version": "0.7.1",
       "author": {
         "name": "danmsheets-dev"
       },

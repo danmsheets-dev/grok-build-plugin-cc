@@ -214,6 +214,28 @@ export const KNOWN_REASONING_EFFORTS = Object.freeze([
 ]);
 const KNOWN_REASONING_EFFORT_SET = new Set(KNOWN_REASONING_EFFORTS);
 
+/** Default when the user / config does not pick a model. */
+export const DEFAULT_MODEL = "grok-4.6";
+/** Extra-high reasoning — the Turbo UI "Extra High Effort" tier. */
+export const DEFAULT_EFFORT = "xhigh";
+export const EFFORT_FLAG_HELP = "<none|minimal|low|medium|high|xhigh|max|ultra>";
+
+export function resolveModelChoice(explicit, configured = null) {
+  const fromFlag =
+    explicit != null && String(explicit).trim() !== "" ? String(explicit).trim() : null;
+  const fromConfig =
+    configured != null && String(configured).trim() !== "" ? String(configured).trim() : null;
+  return fromFlag ?? fromConfig ?? DEFAULT_MODEL;
+}
+
+export function resolveEffortChoice(explicit, configured = null) {
+  const effortNorm = normalizeReasoningEffort(explicit ?? configured ?? DEFAULT_EFFORT);
+  if (effortNorm.warning) {
+    process.stderr.write(`[turbo-build] ${effortNorm.warning}\n`);
+  }
+  return effortNorm.value ?? DEFAULT_EFFORT;
+}
+
 // Floor for the implausible-duration signal on write runs (BRIDGE-1 bonus).
 // Overridable via GROK_BUILD_MIN_PLAUSIBLE_WRITE_SECONDS. Signal only — never
 // invents a new terminal status.
@@ -277,10 +299,10 @@ function printUsage() {
       "  node scripts/grok-bridge.mjs verify-plan [--verify <command>]... [--no-verify] [--cwd|-C <dir>] [--json]",
       "  node scripts/grok-bridge.mjs trust-config [--revoke] [--cwd|-C <dir>] [--json]",
       "  node scripts/grok-bridge.mjs prune [--apply] [--include-unlanded] [--json]",
-      "  node scripts/grok-bridge.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <low|medium|high>]",
-      "  node scripts/grok-bridge.mjs critique [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <low|medium|high>] [focus text]",
+      "  node scripts/grok-bridge.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>]",
+      "  node scripts/grok-bridge.mjs critique [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [focus text]",
       "  node scripts/grok-bridge.mjs run [--background] [--write] [--isolate|--no-isolate] [--resume-last|--resume|--fresh]",
-      "      [--model <model>] [--effort <low|medium|high>] [--caller <id>]",
+      "      [--model <model>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--caller <id>]",
       "      [--verify <command>]... [--verify-attempts <n>] [--verify-timeout <seconds>] [--baseline-timeout <seconds>]",
       "      [--verify-max-buffer <megabytes>] [--verify-ignore <regex>]... [--no-verify] [--no-verify-baseline]",
       "      [--env KEY=VALUE]... [--blender-sandbox|--no-blender-sandbox] [--godot-export-smoke]",
@@ -291,7 +313,7 @@ function printUsage() {
       "    as success. See `verify-plan` to preview the resolved plan without running it.",
       "    Pay-per-token models (openai/*) require GROK_BUILD_ALLOW_PAY_PER_TOKEN=1.",
       "  node scripts/grok-bridge.mjs nest-run [--background] [--write] [--prompt-file <path>]",
-      "      [--model <model>] [--effort <low|medium|high>] [--verify <command>]... [--no-verify]",
+      "      [--model <model>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--verify <command>]... [--no-verify]",
       "      [--max-duration <seconds>] [--max-turns <n>] [--max-cost <usd>] [--json] [prompt]",
       "    Nested Hyper-to-Hyper delegation: always isolated, sibling worktree, depth/fan-out bounded.",
       "    Refuses --no-isolate. Intended for the runtime MCP server (delegate_run), not humans.",
@@ -328,16 +350,17 @@ const SUBCOMMAND_HELP = {
     "Reap abandoned runs and finished worktrees."
   ],
   review: [
-    "Usage: node scripts/grok-bridge.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <low|medium|high>]",
-    "Read-only review of local git state."
+    "Usage: node scripts/grok-bridge.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>]",
+    "Read-only review of local git state. Defaults: --model grok-4.6 --effort xhigh."
   ],
   critique: [
-    "Usage: node scripts/grok-bridge.mjs critique [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <low|medium|high>] [focus text]",
+    "Usage: node scripts/grok-bridge.mjs critique [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--model <model>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [focus text]",
     "Structured design/risk critique."
   ],
   run: [
     "Usage: node scripts/grok-bridge.mjs run [options] [prompt]",
     "Delegate a task. Default is read-only; pass --write to allow edits.",
+    "Defaults: --model grok-4.6 --effort xhigh.",
     "See `node scripts/grok-bridge.mjs help` for the full flag list."
   ],
   "nest-run": [
@@ -6128,12 +6151,8 @@ async function handleReviewCommand(argv, config) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const model = options.model ? String(options.model).trim() : null;
-  const effortNorm = normalizeReasoningEffort(options.effort);
-  if (effortNorm.warning) {
-    process.stderr.write(`[grok-build] ${effortNorm.warning}\n`);
-  }
-  const effort = effortNorm.value;
+  const model = resolveModelChoice(options.model);
+  const effort = resolveEffortChoice(options.effort);
   const billingGate = assertModelBillingAllowed(model, process.env);
   if (!billingGate.allowed) {
     throw new Error(billingGate.message);
@@ -6323,12 +6342,8 @@ async function handleTask(argv) {
 
   // Effort: full Hyper ladder accepted; unknown values warn and pass through
   // (HYPER-2). The config value is already schema-checked when present.
-  const model = options.model ? String(options.model).trim() : (settings.model ?? null);
-  const effortNorm = normalizeReasoningEffort(options.effort ?? settings.effort ?? null);
-  if (effortNorm.warning) {
-    process.stderr.write(`[grok-build] ${effortNorm.warning}\n`);
-  }
-  const effort = effortNorm.value;
+  const model = resolveModelChoice(options.model, settings.model);
+  const effort = resolveEffortChoice(options.effort, settings.effort);
   // Pay-per-token models (openai/*) require an explicit opt-in so a typo does
   // not silently burn metered budget.
   const billingGate = assertModelBillingAllowed(model, process.env);
@@ -6561,15 +6576,8 @@ async function handleNestRun(argv) {
     autoVerifyTrusted
   } = resolveProjectRunPlan(workspaceRoot, cliSettings);
 
-  const model = options.model ? String(options.model).trim() : (settings.model ?? null);
-  // Same destructure as handleTask: normalizeReasoningEffort always returns
-  // `{ value, warning }`, never a bare string/null — using `??` left the
-  // wrapper object on the request and Hyper saw --effort "[object Object]".
-  const effortNorm = normalizeReasoningEffort(options.effort ?? settings.effort ?? null);
-  if (effortNorm.warning) {
-    process.stderr.write(`[grok-build] ${effortNorm.warning}\n`);
-  }
-  const effort = effortNorm.value;
+  const model = resolveModelChoice(options.model, settings.model);
+  const effort = resolveEffortChoice(options.effort, settings.effort);
   const billingGate = assertModelBillingAllowed(model, process.env);
   if (!billingGate.allowed) {
     throw new Error(billingGate.message);

@@ -56,7 +56,7 @@ Operating rules:
 - Return the Grok bridge stdout verbatim to the user.
 - Do not paraphrase, summarize, rewrite, or add commentary before or after it.
 - Do not ask the subagent to inspect files, monitor progress, poll `/turbo-build-plugin:runs`, fetch `/turbo-build-plugin:show`, call `/turbo-build-plugin:stop`, summarize output, or do follow-up work of its own. The main thread may wait with `wait <id>` / `runs <id> --wait` after a background launch.
-- Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort (`none|minimal|low|medium|high|xhigh|max|ultra`; unknown values are passed through to the CLI).
+- Default to `--model grok-4.6 --effort xhigh` (Extra High Effort) unless the user explicitly asks for a different model or effort (`none|minimal|low|medium|high|xhigh|max|ultra`; unknown values are passed through to the CLI).
 - Leave the model unset unless the user explicitly asks for one.
 - Leave `--resume` and `--fresh` in the forwarded request. The subagent handles that routing when it builds the `run` command.
 - If the helper reports that Grok is missing or unauthenticated, stop and tell the user to run `/turbo-build-plugin:check`.

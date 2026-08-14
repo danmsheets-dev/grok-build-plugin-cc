@@ -1,6 +1,6 @@
 {
   "name": "turbo-build-plugin",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Turbo Build Plugin — Claude Code bridge for review, critique, and delegation via Turbo Grok Build.",
   "author": {
     "name": "danmsheets-dev"

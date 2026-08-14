@@ -4,7 +4,7 @@ Delegate coding work, reviews, and critiques to Turbo Grok Build (`turbo` / `gro
 
 ## What isolation does and does not guarantee
 
-**Write runs are isolated (since 0.3.2; current release 0.7.0).** A delegate run
+**Write runs are isolated (since 0.3.2; current release 0.7.1).** A delegate run
 started with `--write` executes in its own git worktree on a `turbo-build/<run-id>`
 branch, outside your repository. Nothing reaches your working tree until you run
 `/turbo-build-plugin:land`, which shows you the
@@ -325,6 +325,14 @@ A run also reports what it did to the disk and how it was captured:
   truncated response looks like. If the CLI streams event types this bridge does not know, they are
   named, and if *nothing* in the stream was recognized the raw stdout is shown (last 200 lines)
   under an explicit `showing raw stdout` note rather than being silently discarded.
+
+## Changelog (0.7.1)
+
+- **Defaults:** review, critique, delegate, nest-run, and MCP `delegate_run`
+  use `--model grok-4.6 --effort xhigh` (Extra High Effort) unless the user
+  or `.grok-build.json` says otherwise.
+- **xhigh:** MCP `delegate_run.effort` now accepts the full ladder
+  `none|minimal|low|medium|high|xhigh|max|ultra` (was `low|medium|high` only).
 
 ## Changelog (0.7.0)
 

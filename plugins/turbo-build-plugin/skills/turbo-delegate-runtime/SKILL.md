@@ -31,8 +31,7 @@ Execution rules:
 - Prefer the helper over hand-rolled `git`, direct Grok CLI strings, or any other Bash activity.
 - Do not call `check`, `review`, `critique`, `runs`, `show`, or `stop` from `turbo-build-plugin:turbo-delegate`.
 - Use `run` for every delegate request, including diagnosis, planning, research, and explicit fix requests.
-- Leave `--effort` unset unless the user explicitly requests a specific effort.
-- Leave model unset by default. Add `--model` only when the user explicitly asks for one.
+- Default to `--model grok-4.6 --effort xhigh` (Extra High Effort) unless the user explicitly requests a different model or effort.
 - Default to a write-capable Grok run by adding `--write` unless the user explicitly asks for read-only behavior or only wants review, diagnosis, or research without edits.
 
 Command selection:
