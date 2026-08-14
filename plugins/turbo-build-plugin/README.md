@@ -1,0 +1,562 @@
+# Turbo Build Plugin
+
+Delegate coding work, reviews, and critiques to Turbo Grok Build (`turbo` / `grok`) from inside Claude Code.
+
+## What isolation does and does not guarantee
+
+**Write runs are isolated (since 0.3.2; current release 0.7.0).** A delegate run
+started with `--write` executes in its own git worktree on a `turbo-build/<run-id>`
+branch, outside your repository. Nothing reaches your working tree until you run
+`/turbo-build-plugin:land`, which shows you the
+diff first and refuses to merge into a dirty tree.
+
+What isolation **does** guarantee:
+
+- Your working tree is untouched while the agent runs.
+- You see the diff before anything lands.
+- Concurrent delegate runs no longer collide — each gets its own worktree.
+- `/turbo-build-plugin:land --discard` throws the work away cleanly.
+
+What isolation **does not** guarantee:
+
+- **`--no-isolate` turns it off**, and then the agent edits your tree directly, as before.
+- **Read-only runs are not isolated** and do not need to be — they cannot write.
+  As of 0.5.0 they keep `--permission-mode plan` and `--sandbox read-only` **and** add
+  `--deny Edit(**)` / `Write(**)`. The sandbox is kernel-enforced
+  only on unix (Hyper compiles it out on Windows), so the deny rules are the half that
+  holds everywhere — measured, they are evaluated before `--always-approve` and they
+  also refuse a shell command that writes to a denied path.
+- **A worktree is not a sandbox.** The agent still runs with your permissions and can
+  reach anything on the machine outside the repository. Isolation protects your *working
+  tree*, not your filesystem.
+- **Heavyweight directories are provisioned, not blindly linked.** Live-state dirs —
+  `node_modules`, `.venv`, `venv`, `target`, `.tox`, `__pypackages__`, `.next`,
+  `.nuxt`, `.svelte-kit`, `.turbo`, `.parcel-cache`, and Godot's import cache
+  (`.godot`, `.import`) — are **private to the worktree** (hardlink-seeded from
+  your checkout when the filesystem allows it, otherwise copied). `target` is not
+  copied at all: the run sets `CARGO_TARGET_DIR` to a worktree-private path under
+  `.grok-build/cargo-target`. Only read-mostly caches such as `vendor` are still
+  **linked, not copied** — junctioned (Windows) or symlinked (POSIX) — so
+  **writes through those shared links reach your real directories**. The run
+  header names every SHARED directory, and a post-run fingerprint fails the run
+  if a shared dir mutates. For Godot's cache the isolated default is private
+  (`GROK_BUILD_LINK_GODOT_CACHE=0` / `{"provision": {"copy": true}}`); set
+  `GROK_BUILD_LINK_GODOT_CACHE=1` or `{"provision": {"copy": false}}` to share,
+  and when shared **close the Godot editor before a run verifies**. Private
+  Godot caches are seeded with only the small state files — `.godot/imported` is never copied;
+  it is the multi-gigabyte part. Untracked runtime files (`.env`, `.env.local`,
+  `.npmrc`, `local_settings.py`, …) are **copied** into the worktree so verify
+  can run, and are excluded from the run commit.
+- **A worktree holds the only copy of unlanded work.** `/turbo-build-plugin:prune` removes
+  worktrees for finished runs. Land before you prune.
+- **A checkout needs room.** An isolated run refuses to start when the volume holding
+  the worktree has less than 512 MB free, rather than failing halfway through the
+  checkout. `GROK_BUILD_MIN_FREE_BYTES` moves the floor; `0` disables the check.
+
+`/turbo-build-plugin:land <id>` squash-merges the run's branch into your current branch.
+Conflicts are expected on binary assets — a `.blend`, a `.png` or a `.tscn` touched on
+both sides cannot be content-merged. When that happens, land **rolls the repository
+back to HEAD** and names the conflicting files rather than leaving you in a half-merged
+state. Note that `git merge --abort` does not work here: a squash merge writes no
+`MERGE_HEAD`. Either `/turbo-build-plugin:land <id> --discard`, or check out `turbo-build/<id>`
+and pick a side per file.
+
+`/turbo-build-plugin:land <id> --preview` prints the stat, a `Total: N binary file(s)` count,
+and the diff itself — up to 128 KB. Past that the diff is omitted with the exact
+`git diff` command to run, because a 300 KB diff in a terminal is not a review.
+
+Land refuses more than 50 files unless you pass `--force`. Paths outside a run's
+`allowed_paths` (when set) are refused. Isolation harness files
+(`.grok-subagent-live`, `.grok/`, `.grok-restore/`) are not treated as payload.
+
+The bridge is read-only by default. `--write` is opt-in at the CLI, but the
+`turbo-build-plugin:turbo-delegate` subagent adds `--write` by policy, so `/turbo-build-plugin:delegate`
+is write-capable unless you ask for read-only.
+
+## Blender add-on isolation
+
+Blender loads add-ons from a per-user scripts directory, and the standard workflow
+symlinks `scripts/addons/<name>` at your **source checkout**. An isolated run therefore
+verifies your real repository, not the worktree — the agent's changes are not what gets
+tested, which is the exact failure isolation exists to prevent.
+
+`--blender-sandbox` fixes that for one run: the add-on (a `blender_manifest.toml`, or an
+`__init__.py` carrying `bl_info`, at the worktree root or one directory down) is linked
+into `.grok-build/blender/scripts/addons/<name>` inside the worktree, and
+`BLENDER_USER_SCRIPTS` / `BLENDER_USER_EXTENSIONS` point there for both the verify
+commands and the agent.
+
+- **It is opt-in, and it should be.** A private scripts directory hides every *other*
+  add-on your verify script may depend on, so applying it automatically would turn
+  working verify commands red.
+- **`BLENDER_USER_CONFIG` is deliberately left alone.** Cycles' GPU device selection and
+  every add-on preference live in `userpref.blend` under that directory; pointing it at
+  an empty sandbox silently forces CPU rendering and drops your preferences.
+- **Nothing is auto-enabled**, in either startup mode. Your test script must call
+  `addon_utils.enable("<module>", default_set=False, persistent=True)`.
+- `.grok-build/` is excluded from the run's commit, so the linked copy of the add-on
+  can never be committed twice.
+
+### `--env` and secrets
+
+`--env KEY=VALUE` (repeatable) sets a variable for the verify commands **and** the agent —
+the only lever Blender gives you for "use this add-on directory", and often the quickest way
+to hand a build script a license key or a private registry token. Know where that value
+goes before you use it that way:
+
+- A **foreground** run only ever holds the value in that process's own environment.
+- A **`--background`** run is different: the whole resolved request — including every
+  `--env` value, in plaintext — is written to `<stateDir>/jobs/<run-id>.json` so the
+  detached worker can read it back and start the process with it. That file is not
+  encrypted. The shared run index (`<stateDir>/state.json`) — which backs `runs --json`
+  and `show --json` — only ever gets a redacted copy of that request; a sensitive-looking
+  key (one containing `token`, `secret`, `key`, `pass`, `passwd`, `password`, `passphrase`,
+  `credential`, `cred`, `pat`, `dsn`, or `auth`, anywhere in the name, delimited by `_` or
+  a boundary) is replaced with `[redacted]` before it ever reaches the index or a run's
+  own display. From 0.5.0 the index also mirrors usage, stopReason, toolCallCount, and
+  related reporting fields so `runs --json` (schemaVersion 2) does not show null for
+  values that only lived in `jobs/<id>.json`.
+- Do not pass a long-lived credential through `--env` on a `--background` run unless you
+  trust the plugin's state directory (and anything that backs it up) as much as you trust
+  your shell's own environment.
+
+## Verification
+
+`--verify "<cmd>"` makes a green result mean something.
+The command is run **by the bridge**, not by the agent,
+so a run cannot claim success without it having passed.
+
+- The command runs once **before** the agent starts, to record which failures were
+  already there. Pre-existing failures are never blamed on the agent.
+- On new failures the agent is re-invoked to fix them, up to `--verify-attempts`
+  (default 2).
+- A run whose verification never passes is reported **`completed-unverified`**, never as
+  success. Other honest terminals (0.5.0+): `completed-truncated` (early stopReason),
+  `completed-noop` (write run, zero files), `completed-blind` (zero tool calls),
+  `timed-out`.
+- A command that outlives its budget has its **whole process tree** killed, not just the
+  shell wrapping it — an orphaned `godot.exe` would otherwise keep the import lock. Raise the
+  budget with `--verify-timeout <seconds>` or `verifyTimeoutMs` in `.grok-build.json`.
+- A command that prints more than the output budget is **not** a failure: a fifth of the
+  budget is kept from the head and the rest from the tail, both cut on line boundaries, the
+  middle is replaced by an `...[elided N bytes of output]...` marker, and the command's real
+  exit code is what counts. A capture whose middle was dropped is only a *sample* of the
+  failures, so it is reported as `verify-output-truncated` and never blamed on the agent —
+  raise `--verify-max-buffer` to get an attributed verdict back.
+- `--no-verify-baseline` skips the pre-run measurement. That makes verification **strict**:
+  with nothing measured, every failure — pre-existing or not — is treated as this run's.
+
+### Exit code 0 does not mean the project works
+
+Godot and Blender both report a broken project on stdout and exit **0** anyway.
+`godot --headless --import` prints `SCRIPT ERROR:` for a GDScript that does not parse and still
+exits 0; `blender -b --python x.py` exits 0 when the script raises. So the bridge also scans
+verify output for a small set of failure markers, chosen per detected ecosystem:
+
+| Ecosystem | Matched by default |
+| --- | --- |
+| Godot | `SCRIPT ERROR:`, `USER SCRIPT ERROR:`, `USER ERROR:`, `Parse Error`, `Failed to load script `, `Error importing '`, `Failed to instantiate scene` |
+| Blender | `Error: Python script failed` (anchored at line start) |
+
+`WARNING:` and `SCRIPT WARNING:` never match. A bare `ERROR:` and `Cannot open file '` are
+deliberately **not** defaults — Godot 4 emits both for entirely benign conditions, and turning a
+healthy run red is the same class of bug as reporting a broken one green. Add them yourself with
+`verifyFailurePatterns` in `.grok-build.json` if your project is clean enough to afford it.
+
+The same measurement runs at baseline, so a project that was already printing `SCRIPT ERROR`
+before the run started is not blamed on the agent.
+
+Two more knobs for noisy engines:
+
+- `--verify-ignore <regex>` (repeatable, or `verifyIgnorePatterns` in the config) drops matching
+  output lines before they can count as failures at all.
+- Godot re-prints the same runtime error **once per frame**, so for Godot projects the occurrence
+  *count* is ignored and only the deduped set of distinct errors is compared. A genuinely new
+  error is still caught; a run that simply idled a few frames longer is not reported as a
+  regression.
+
+#### Blender: make the exit code honest too
+
+For a Blender test script, pass `--python-exit-code` so a raising script also fails the process:
+
+```
+blender --background --factory-startup --python-exit-code 1 --python tests/run_tests.py
+```
+
+`--factory-startup` disables **every** installed add-on, including the one you are testing, so
+`run_tests.py` has to enable it itself:
+
+```python
+import addon_utils
+addon_utils.enable("my_addon", default_set=False, persistent=True)
+```
+
+### Ecosystem recipes
+
+These are the exact commands the bridge runs by default once it detects your project's
+ecosystem — useful if you want to type your own `--verify` instead, or just to know what a
+bare `/turbo-build-plugin:delegate` in a Godot or Blender repo actually verifies.
+
+| Ecosystem | Default verify commands |
+| --- | --- |
+| Godot 4 | `godot --headless --path . --import` then `godot --headless --path . --quit-after 1` |
+| Godot 3 | `godot --no-window --path . --editor --quit` — Godot 3 predates both `--headless` and `--quit-after` |
+| Blender, with a `blender_manifest.toml` | `blender --command extension validate <manifest>` (4.2+ only, which is exactly where the subcommand exists) |
+| Blender, with a test script | `blender --background --factory-startup --python-exit-code 1 --python <script>` |
+| Blender, neither of the above | a background smoke start, enough to catch a broken install or a GUI-only build that cannot start headless |
+
+A detected GUT suite adds `godot --headless --path . -s addons/gut/gut_cmdln.gd -gexit`; a
+detected gdUnit4 suite adds the equivalent `GdUnitCmdTool.gd` invocation. None of this
+requires you to write anything: the ecosystem is detected from `project.godot`,
+`blender_manifest.toml`, an `__init__.py` carrying `bl_info`, or a root/depth-1 `*.blend`,
+and your own `--verify` or a trusted `.grok-build.json`'s `verify` always wins over these
+defaults (see below).
+
+### Windows: use the console build
+
+A GUI-subsystem Godot or Blender build writes nothing to a captured pipe on Windows, which
+silently defeats every output-pattern check above — a `SCRIPT ERROR:` on screen and an exit-0
+result look, to the bridge, identical to a clean run. `/turbo-build-plugin:doctor` catches this
+**empirically** (it runs the binary and checks whether anything came back on stdout or
+stderr at all) rather than by filename, and the fix is the same either way: use the console
+build that ships in the same archive — `Godot_v4.x-stable_win64_console.exe` — and point
+`tools.godot` in `.grok-build.json`, or `GROK_BUILD_GODOT_BIN`, at it. The bridge also
+prefers a `*_console.exe` next to whatever binary it resolves, automatically, whenever one
+exists on disk.
+
+### Where the verify plan comes from
+
+You no longer have to pass `--verify` for a run to be verified. The bridge resolves the plan
+itself, in this order, and prints the resolved list and its source in the run's output:
+
+1. `--verify` flags you typed (these win outright)
+2. `verify` in the project's `.grok-build.json` — **only once you have trusted that file**
+3. defaults for the detected ecosystem (Godot, Blender, Rust, Python, Node)
+
+`--no-verify` opts out entirely. `node scripts/grok-bridge.mjs verify-plan` prints what would run
+without running any of it.
+
+### `.grok-build.json` and the trust gate
+
+A `.grok-build.json` at the repo root can set `verify`, `verifyAttempts`, `isolate`, `model`,
+`effort`, budget limits, and timeouts. Everything that cannot execute code is honoured
+immediately.
+
+`verify`, `tools`, and `env` are different: those strings are handed to `cmd.exe` / `sh`, and the
+file is tracked in the repository. Honouring them straight out of a clone would mean that cloning
+someone's repo and running `/turbo-build-plugin:delegate` executes commands they chose. So they are
+**withheld until you trust the file**:
+
+    node scripts/grok-bridge.mjs trust-config
+
+`/turbo-build-plugin:doctor` prints the withheld commands verbatim so you can read them first. Trust is
+recorded against the file's sha256 in the plugin's state directory — outside the repository, so a
+clone cannot ship its own trust record, and any later edit to the file withdraws it automatically.
+`trust-config --revoke` withdraws it by hand.
+
+## What a review sends, and how big it can get
+
+`/turbo-build-plugin:review` and `/turbo-build-plugin:critique` build their context from git, so a binary-heavy
+project used to pay for it twice — once in tokens, once in a prompt too long for the OS to accept.
+
+- **Binary files are described, never inlined.** The diff carries git's own
+  `Binary files a/tex.png and b/tex.png differ`, plus a `## Binary Assets` section giving each
+  side's size in bytes. Embedding the base85 patch inflated a 100 KB texture to ~145 KB of
+  characters the model cannot decode, and it inflated the *measurement* too, so one re-exported
+  texture silently demoted a whole review to "go read the diff yourself".
+- **Untracked files are capped** at 40 files and 64 KB in total, and bare path listings at 200
+  paths. A Godot import cache or a Blender bake directory holds thousands of untracked sidecars;
+  whatever is dropped is named in an omission line.
+- **An oversized prompt is not silently mangled.** Windows rejects a long command line — ~32767
+  characters via `CreateProcess`, far less through a `.cmd` shim — and Linux caps any single
+  argument at 128 KB. A prompt over the budget is written to the plugin's state directory and
+  passed with `--prompt-file`, so nothing is lost. If that spill cannot be written, the middle is
+  elided with a marker saying how many bytes went, and the run reports it.
+- **Verify output reaching a fix turn is tail-truncated** to the last 4 KB — the end is where the
+  assertion and the exit line are. It is redacted first, then truncated.
+
+## What a delegate run returns
+
+`grok --output-format streaming-json` emits only `text`, `thought` and `end` events — no tool
+events at all — and a `text` event arriving after a `thought` opens a new message. A 40-turn run is
+therefore dozens of narration fragments in which the conclusion is the last few lines, and a run
+that ends on a tool call ends on *"Let me check X"*. That is why a delegate run used to look like
+it returned nothing unless you told Grok to write the answer to a file.
+
+Three things changed:
+
+- **Delegate runs carry an output contract**, delivered on the CLI's `--rules` flag so it lands in
+  the system prompt rather than in your prompt (your prompt is also the run's title in
+  `/turbo-build-plugin:runs`). It asks for a `===GROK-FINAL-REPORT===` block with `## Result`,
+  `## Files changed`, `## Artifacts`, `## Verification` and `## Follow-ups`, emitted as prose in the
+  final message — **not** only into a file — and emitted even when the run failed or ran out of
+  turns. See `prompts/run-report.md`.
+- **The result is the answer, the transcript is kept separately.** The run reports the final report
+  if there is one, otherwise the last assistant message, otherwise the whole narration — so a model
+  that ignores the contract still prints exactly what it always did. `payload.transcript` (via
+  `--json`) always holds the full turn-separated narration.
+- **A verify fix turn cannot erase the answer.** When `--verify` fails once, the fix turn usually
+  ends on a tool call with no prose. Its empty result used to replace the original run's, so a run
+  that did the work and then passed verification reported *"Grok did not return a final message."*
+  The text channel now accumulates across turns; the newest non-empty answer wins.
+
+A run also reports what it did to the disk and how it was captured:
+
+- **Changed files (dual tree).** A write run reports worktree and main-tree sides **separately**
+  when both exist — never one conflated number. An isolated run reads worktree changes from the
+  agent's commit and main-tree changes from the post-run breach scan; a `--no-isolate` run diffs the
+  working tree against a pre-run snapshot. The count that feeds `decideCompletionStatus` is the
+  **sum across both**, so a main-only write is never `completed-noop`. Empty cases distinguish
+  "nothing was written" from "only excluded build artifacts".
+- **Debris.** Loose `*.log` / `*.tmp` / crash dumps the run left behind are listed as `Debris: …`
+  rather than silent "excluded artifacts". They are not deleted and not committed.
+- **The log path.** Every run prints `Log: <path>`. That file starts with a structured
+  `===RUN-LOG-HEADER===` naming run id, **Grok session id** (the join key for
+  `~/.grok/logs/unified.jsonl`), CLI binary/version, model requested/served, isolation decision, and
+  workspace root — so a log file is independently interpretable. Progress lines and the complete
+  rendered result follow.
+- **Cost attribution.** Usage includes `modelCalls` (Hyper inference-call count), tokens, cost, and
+  served model. `runs --json --all` adds `sessionTotals.byResolvedModel` so model-vs-model cost
+  comparison needs no external join. For deeper per-inference analysis, join
+  `~/.grok/logs/unified.jsonl` on the same session id the bridge prints in the log header and on
+  the job record as `threadId`.
+- **stderr and unrecognized events.** When a run produces no answer at all, the last 20 lines of the
+  CLI's stderr are shown — an exit-0 run with empty output and a warning on stderr is what a
+  truncated response looks like. If the CLI streams event types this bridge does not know, they are
+  named, and if *nothing* in the stream was recognized the raw stdout is shown (last 200 lines)
+  under an explicit `showing raw stdout` note rather than being silently discarded.
+
+## Changelog (0.7.0)
+
+- **Rebrand:** plugin id is `turbo-build-plugin`, marketplace is `turbo-build`,
+  slash commands are `/turbo-build-plugin:*`, subagent is
+  `turbo-build-plugin:turbo-delegate`. Isolated branches are `turbo-build/<run-id>`.
+- **Independence:** this is no longer published as an xAI marketplace plugin.
+  Source of truth is `danmsheets-dev/turbo-build-plugin`.
+
+## Changelog (0.6.9)
+
+- **Temp nest:** `createTempDir` / test `makeTempDir` write under
+  `%TEMP%/grok/plugin-tests` so `turbo disk clean --include temp-grok`
+  can reclaim leaks. Nest prompts go under `%TEMP%/grok/plugin-prompts`.
+- **Land harness:** `.grok-subagent-live` and `.grok/` are ignored by
+  `allowed_paths` checks and are not treated as payload.
+- **Git argv (EXSECRE-1190):** `git` / `gitChecked` force `shell: false` so a
+  ref like `main&probe.cmd` cannot run a tracked batch file on Windows.
+
+## Changelog (0.6.8)
+
+- **One identity probe:** `probeCliIdentity` caches `turbo version --json` and
+  drives agent-compat, `permissionToolPrefixes`, confine support, and
+  `--job-object` (skip when the card says `jobObject: false`).
+- **check / doctor** surface product, version, `agentCompatible`, and
+  advertised features so a pre-rc2 CLI is obvious.
+- **Fail-closed CLI selection:** `GROK_BINARY` is probed (Hyper `.cmd`/`.bat`
+  rejected); short Vercel `2.x.x` banners are not agent-compatible; leftover
+  Hyper banners no longer fail-open.
+- **Streaming honesty:** tool_result I/O, subagent isolation/spend, thoughts,
+  auto_continue reason, and `auto_compact_failed.error` are persisted.
+- **Isolation:** nest prompts write to temp (not the main checkout);
+  nest children unset inherited `GROK_CONFINE`; `GROK_BUILD_CONFINE=0` and
+  missing `start.confineRoot` require `GROK_BUILD_ALLOW_WEAK_ISOLATE=1`.
+- **Stop / land:** descendant snapshot before declaring stop success;
+  PATHEXT on absolute Windows paths; `--into-run --preview` is read-only;
+  land honors `allowed_paths`, Windows case-fold overlap, and a 50-file cap
+  (`--force` to override).
+
+## Changelog (0.6.7)
+
+- **Critique structuredOutput (H1):** structured critique prefers Turbo `structuredOutput` / `structuredOutputError` over free-form `text`.
+- **Integer `toolCalls` (H2):** JSON envelope parse accepts Turbo's `u32` tool call count (not only arrays).
+- **Stop / session-end claim-before-kill (H3/M7):** cancel root and descendants before process kill so a finishing runner cannot win `completed` over stop.
+- **Max-duration kill fallbacks (H4):** production path supplies bridge/worker/job PIDs when progress never carried `agentPid`.
+- **Porcelain fail-closed isolation (H5):** unreadable main-checkout `git status` is treated as an isolation breach, not a clean run.
+- **CLI identity:** `version --json` → `agentCompatible` / `cliFamily`; no fail-open to Vercel Turborepo; `permissionToolPrefixes` probe drives deny/allow filtering; Windows headless passes `--job-object` (opt out with `GROK_BUILD_JOB_OBJECT=0`).
+- **NDJSON honesty (C13):** malformed stream lines keep parse reasons (`json-parse-failed` / `not-a-json-object`) on the run record.
+- **Nested Godot (M9):** nested worktrees mirror root private Godot cache policy (mkdir + partial seed).
+
+## Changelog (0.5.0)
+
+- Honest terminal statuses: `completed-truncated`, `completed-noop`, `completed-blind`, plus existing `completed-unverified` / `timed-out`.
+- Read-only runs add `--deny Edit(*)` on top of plan + read-only sandbox, so writes are refused on Windows too. Turbo **1.0.0-rc.2+** accepts Claude-compat aliases (`NotebookEdit` / `MultiEdit` → Edit, `NotebookRead` → Read); the bridge probes `turbo version --json` → `permissionToolPrefixes` and filters unknown prefixes so older CLIs do not hard-abort.
+- Usage, served model, stopReason, and tool/file counts mirrored into the run index; `runs --json` is schemaVersion 2.
+- `show` always appends `===BRIDGE-RESULT===`; run header prints CLI, model, isolation, verify plan.
+- New `models [--json]` subcommand; pay-per-token models need `GROK_BUILD_ALLOW_PAY_PER_TOKEN=1`.
+- Every subcommand accepts `--help` / `-h`.
+- **Cost attribution (BRIDGE-5):** log-file header carries Grok session id (join key for `~/.grok/logs/unified.jsonl`); `usage.modelCalls` summed across turns; `runs --json --all` emits `sessionTotals` by `resolvedModel`.
+- **Dual-tree accounting (BRIDGE-3):** worktree vs main-tree changed files reported separately; status uses the sum; empty wording distinguishes nothing-written vs excluded-artifacts only.
+- **Implausible-duration signal (BRIDGE-1 bonus):** short write runs with no files and few/no tool calls set `implausiblyShort` and a report line (not a new terminal status). Floor via `GROK_BUILD_MIN_PLAUSIBLE_WRITE_SECONDS` (default 90).
+- **Full reasoning-effort ladder (HYPER-2):** `none|minimal|low|medium|high|xhigh|max|ultra`; unknown values warn and pass through to the CLI.
+- **Debris reporting (BRIDGE-12):** loose logs/temps/dumps listed as debris, not classed as excluded caches.
+- **Headless discipline (HYPER-1):** `prompts/headless.md` on every run; one auto-continue when a turn ends on a user question with zero tool calls.
+
+## Requirements
+
+- Node.js >= 18.18
+- `turbo` (preferred) or `grok` on `PATH`, or `GROK_BINARY` pointing at a compatible CLI (see [Alternate CLIs](#alternate-clis))
+- A logged-in Grok session — `turbo models` / `grok models` must succeed (some forks exit non-zero on a successful listing; the bridge treats a model list as success)
+- `HOME` or `GROK_HOME` must be set. On Windows neither is set by default; the bridge's core paths work without it, but `grok` subcommands such as `grok worktree` fail with `neither $GROK_HOME nor $HOME is set`.
+
+## Commands
+
+| Command | What it does |
+| --- | --- |
+| `/turbo-build-plugin:check` | Probes Node, the `grok` CLI, and authentication |
+| `/turbo-build-plugin:delegate` | Hands a task to Grok (write-capable by default) |
+| `/turbo-build-plugin:review` | Read-only review of local git state |
+| `/turbo-build-plugin:critique` | Adversarial design and risk pass, structured JSON output |
+| `/turbo-build-plugin:import` | Imports the current Claude transcript into a Grok session |
+| `/turbo-build-plugin:runs` | Lists active and recent runs (`--json` schemaVersion 2; legacy keys kept one minor version) |
+| `/turbo-build-plugin:show` | Shows stored output plus a `===BRIDGE-RESULT===` trailer |
+| `/turbo-build-plugin:stop` | Stops an active run and terminates its process trees |
+| `/turbo-build-plugin:land` | Reviews an isolated run's diff, then merges or discards it |
+| `/turbo-build-plugin:doctor` | Diagnoses environment and run state, with a fix for each problem |
+| `/turbo-build-plugin:prune` | Reclaims abandoned runs and stale worktrees (dry run by default) |
+
+## Common flags on `delegate`
+
+| Flag | Meaning |
+| --- | --- |
+| `--verify <cmd>` | Command that must pass before the run counts as done (repeatable) |
+| `--verify-attempts <n>` | Fix-and-recheck cycles allowed (default 2) |
+| `--no-verify` | Run nothing, even when a config or ecosystem plan exists |
+| `--no-verify-baseline` | Skip the pre-run baseline probe. Makes verification strict: every failure counts as this run's |
+| `--verify-ignore <regex>` | Drop matching output lines before they count as failures (repeatable) |
+| `--verify-timeout <seconds>` | Budget for each verify command. Used verbatim; without it the budget is derived from the measured baseline (4x, floored at 120s, capped at 900s) |
+| `--baseline-timeout <seconds>` | Budget for the pre-run baseline probe. Only ever raises the 900s default |
+| `--verify-max-buffer <megabytes>` | How much verify output to keep. Output over the budget is not an error: the head and tail are kept and the middle is elided |
+| `--env KEY=VALUE` | Set a variable for the verify commands **and** the agent (repeatable). Split on the first `=` only, so a value may contain more. The full process environment is inherited; these are overrides on top of it |
+| `--blender-sandbox` | Give the run a private Blender add-on directory inside the worktree (see below). Auto-enabled for isolated add-on/extension runs; this flag forces it on |
+| `--no-blender-sandbox` | Disable the Blender sandbox even when auto-enabled |
+| `--godot-export-smoke` | When `export_presets.cfg` exists, add a headless export smoke step (never touches `export_credentials.cfg`) |
+| `--no-isolate` | Edit the working tree directly instead of using a worktree |
+| `--max-duration <seconds>` | Stop the run after a wall-clock limit |
+| `--max-turns <n>` | Cap agent turns (passed through to the CLI) |
+| `--max-cost <usd>` | Stop once spend exceeds this. **Post-hoc**: cost is only known when a turn ends, so the run stops before the *next* turn rather than mid-turn |
+| `--background` | Detached run; poll with `/turbo-build-plugin:runs` |
+
+## Run lifecycle
+
+Runs are owned by the plugin, tracked by PID and log file. There is no app-server broker.
+
+Phases progress `queued → starting → thinking → writing → finalizing → done`, and each run records a `Last activity` age. **Use the age, not the phase, to tell a working run from a hung one** — a phase can be stale while a timestamp cannot.
+
+Finished runs report token usage and cost, for example:
+
+    Tokens: 22,962 in (33,408 cached) / 163 out · 2 turns · $0.0569
+
+Every run surfaces its Grok session id and a `<cli> -r <id>` resume line (using the resolved binary, usually `turbo`), so a run is never a dead end.
+
+Terminal status is claimed under a lock, and `cancelled` always wins: a run you stopped can never be reported as completed by a worker that finishes moments later.
+
+## Alternate CLIs
+
+When `GROK_BINARY` is unset, the bridge resolves the CLI in this order:
+
+1. **`turbo`** — preferred (local Grok Build fork, kept in sync with upstream)
+2. **`grok`** — stock Grok Build CLI
+
+Hyper is **not** selected — neither from PATH nor via `GROK_BINARY=hyper` (a
+leftover Hyper override is ignored so Turbo can take over).
+
+`GROK_BINARY` accepts any CLI that speaks the Grok Build command surface. The
+bridge calls `version` / `version --json` / `--version`, `models`, and the
+headless flags (`-p`, `--prompt-file`, `-c`, `-r`, `--session-id`, `--confine`,
+`--job-object` on Windows, permission deny/allow). Compatible forks work
+unmodified and share the same `~/.grok` config, auth, and session state.
+
+On **Turbo 1.0.0-rc.2+**, prefer `turbo version --json` for harness identity
+(`agentCompatible`, `cliFamily`, `permissionToolPrefixes`, `features.jobObject`).
+Isolated write runs require `--confine` unless `GROK_BUILD_ALLOW_WEAK_ISOLATE=1`.
+
+```bash
+# force a specific binary (optional — turbo is already preferred on PATH)
+export GROK_BINARY=turbo
+
+# or, for every Claude Code session, in ~/.claude/settings.json:
+#   "env": { "GROK_BINARY": "turbo" }
+```
+
+`/turbo-build-plugin:check` reports which CLI it resolved and adds a `brand` field, so
+an entry reading `turbo <version>` is expected and correct rather than a
+misconfiguration. When the configured binary cannot be run, the failure hint
+names *that* binary instead of telling you to install Grok Build.
+
+The test suite clears `GROK_BINARY` for fixture-backed runs, so having it
+exported does not silently point the suite at your real CLI.
+
+**Layer boundary.** This plugin is the Claude Code → CLI bridge. Anything that
+shapes how the *CLI agent itself* behaves — its system prompt, subagents,
+hooks, LSP servers, MCP servers — lives in `~/.grok` and is configured there,
+independent of this plugin. Ecosystem support in this repo (Godot, Blender)
+concerns how the bridge *verifies* a run, not how the agent writes code.
+
+## Nested delegation (CLI → CLI)
+
+A Turbo/Grok agent inside an isolated write run can hand a **sub-task** to
+another CLI instance — its own sibling worktree, bridge-side verify, tracked run,
+structured result, and an explicit land into the parent worktree.
+
+This is **not** the CLI's in-process subagents. Those share the parent's
+filesystem and default to max nesting depth 1; they fan out work, they do not
+isolate it. Nested delegation uses MCP (`delegate_run` / `delegate_status` /
+`delegate_wait` / `delegate_result` / `delegate_land` / `delegate_stop`) and the
+bridge subcommand `nest-run`.
+
+### Enable / disable
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `GROK_BUILD_NESTED_DELEGATION` | on | Set to `0` / `false` / `no` to stop offering the MCP server to agents |
+| `GROK_BUILD_MAX_NEST_DEPTH` | `2` | Maximum nest depth (incoming depth ≥ max is refused) |
+| `GROK_BUILD_MAX_NEST_CONCURRENCY` | `2` | Max live children per parent; further requests are refused, not queued |
+| `GROK_BUILD_NEST_DEPTH` | `0` | Set by the bridge for child processes; do not set by hand |
+
+The run header reports whether nested delegation was offered and how much depth
+budget remains.
+
+### Sibling worktrees, never nested
+
+A child's worktree is created **next to** the parent's under the same parent
+directory (e.g. `%TEMP%\gb\w\<short-id>` on Windows), off the **parent's base
+commit**, never as a directory inside the parent worktree. A worktree inside a
+worktree breaks `git worktree remove`, doubles path length on Windows, and makes
+artifact excludes and the land graph incoherent.
+
+### Budget inheritance
+
+The parent's `--max-cost`, `--max-duration`, and `--max-turns` are ceilings for
+the child. The child may ask for less, never more. Cost uses the parent's
+**remaining** budget (cap minus spend so far, including earlier children).
+
+### Landing nested work
+
+1. Wait for the child (`delegate_wait` or `runs` / `wait`).
+2. Read the structured result — a failed child is listed on the parent report
+   and is **never** summarised as success; it does not fail the parent by itself.
+3. Call `delegate_land` (or `land <child> --into-run <parent>`) to squash-merge
+   the child branch into the **parent worktree**. Nothing auto-lands.
+4. Land the parent into the main checkout as usual with `/turbo-build-plugin:land`.
+
+`.grok/` (including the injected runtime plugin and its `.mcp.json`) is excluded
+from the run commit the same way `.grok-build/` is.
+
+## Environment
+
+| Variable | Purpose |
+| --- | --- |
+| `GROK_BINARY` | Override the `grok` executable — see [Alternate CLIs](#alternate-clis) |
+| `GROK_CC_SESSION_ID` | Claude session id, set by the SessionStart hook |
+| `GROK_CC_TRANSCRIPT_PATH` | Claude transcript path, set by the SessionStart hook |
+| `CLAUDE_PLUGIN_DATA` | Plugin data root; run state lives under `.../state` |
+| `HOME` / `GROK_HOME` | Required by `grok` subcommands |
+| `GROK_BUILD_GODOT_BIN` / `GODOT_BIN` | Override the resolved `godot` executable. `tools.godot` in `.grok-build.json` outranks both (once trusted) |
+| `GROK_BUILD_BLENDER_BIN` / `BLENDER_BIN` | Override the resolved `blender` executable, same precedence as above |
+| `GROK_BUILD_LINK_GODOT_CACHE=0` | Copy Godot's small cache state files into the worktree instead of linking `.godot`/`.import` — see "What isolation does and does not guarantee" |
+| `GROK_BUILD_MIN_FREE_BYTES` | Moves the 512 MB free-space floor a checkout refuses to start under; `0` disables the check |
+| `GROK_VERIFY_MAX_OUTPUT_BYTES` | Overrides the default 32 MB verify-output ring (see `--verify-max-buffer`, which is the per-run form of this) |
+| `GROK_BUILD_NESTED_DELEGATION` | Nested CLI→CLI MCP offer; default on, `0` disables — see [Nested delegation](#nested-delegation-cli--cli) |
+| `GROK_BUILD_MAX_NEST_DEPTH` | Max nest depth (default 2) |
+| `GROK_BUILD_MAX_NEST_CONCURRENCY` | Max live children per parent (default 2) |
+
+State falls back to `$TMPDIR/grok-cc-runs` when `CLAUDE_PLUGIN_DATA` is unset.

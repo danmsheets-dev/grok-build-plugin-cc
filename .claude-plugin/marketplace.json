@@ -1,21 +1,21 @@
 {
-  "name": "xai-grok-build",
+  "name": "turbo-build",
   "owner": {
-    "name": "xAI"
+    "name": "danmsheets-dev"
   },
   "metadata": {
-    "description": "Grok Build ↔ Claude Code bridge plugins for review, critique, and delegation.",
-    "version": "0.6.9"
+    "description": "Turbo Build Plugin — Claude Code bridge for review, critique, and delegation via Turbo Grok Build.",
+    "version": "0.7.0"
   },
   "plugins": [
     {
-      "name": "grok-build",
-      "description": "Grok Build ↔ Claude Code bridge for review, critique, and delegation.",
-      "version": "0.6.9",
+      "name": "turbo-build-plugin",
+      "description": "Turbo Build Plugin — Claude Code bridge for review, critique, and delegation via Turbo Grok Build.",
+      "version": "0.7.0",
       "author": {
-        "name": "xAI"
+        "name": "danmsheets-dev"
       },
-      "source": "./plugins/grok-build"
+      "source": "./plugins/turbo-build-plugin"
     }
   ]
 }

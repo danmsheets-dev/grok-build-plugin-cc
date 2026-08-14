@@ -24,8 +24,8 @@ import {
   resolveDirPolicy,
   sameVolume,
   shouldAutoBlenderSandbox
-} from "../plugins/grok-build/scripts/lib/provision.mjs";
-import { artifactExcludePathspecs } from "../plugins/grok-build/scripts/lib/worktree.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/provision.mjs";
+import { artifactExcludePathspecs } from "../plugins/turbo-build-plugin/scripts/lib/worktree.mjs";
 import { makeTempDir } from "./helpers.mjs";
 
 /**

@@ -10,8 +10,8 @@ import {
   resolveJobFile,
   upsertJob,
   writeJobFile
-} from "../plugins/grok-build/scripts/lib/state.mjs";
-import { resolveJobKillTargets } from "../plugins/grok-build/scripts/lib/tracked-jobs.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/state.mjs";
+import { resolveJobKillTargets } from "../plugins/turbo-build-plugin/scripts/lib/tracked-jobs.mjs";
 
 function withPluginData(fn) {
   const previous = process.env.CLAUDE_PLUGIN_DATA;

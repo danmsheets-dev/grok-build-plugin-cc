@@ -3,17 +3,17 @@ import fs from "node:fs";
 import path from "node:path";
 import test from "node:test";
 
-import { redactSecrets, redactSecretsDeep } from "../plugins/grok-build/scripts/lib/redact.mjs";
+import { redactSecrets, redactSecretsDeep } from "../plugins/turbo-build-plugin/scripts/lib/redact.mjs";
 import {
   appendLogLine,
   runTrackedJob
-} from "../plugins/grok-build/scripts/lib/tracked-jobs.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/tracked-jobs.mjs";
 import {
   readJobFile,
   resolveJobFile,
   upsertJob,
   writeJobFile
-} from "../plugins/grok-build/scripts/lib/state.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/state.mjs";
 import { makeTempDir } from "./helpers.mjs";
 
 const xaiSecret = "xai-abcdefghijklmnopqrstuvwxyz123456";

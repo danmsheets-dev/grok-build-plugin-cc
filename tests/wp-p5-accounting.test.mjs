@@ -9,32 +9,32 @@ import {
   KNOWN_REASONING_EFFORTS,
   looksLikeUserQuestion,
   normalizeReasoningEffort
-} from "../plugins/grok-build/scripts/grok-bridge.mjs";
+} from "../plugins/turbo-build-plugin/scripts/grok-bridge.mjs";
 import {
   buildSessionTotalsByModel,
   buildTaskStatusLines,
   formatUsageLine
-} from "../plugins/grok-build/scripts/lib/render.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/render.mjs";
 import {
   addUsage,
   createStreamTranscript,
   normalizeUsage,
   sumModelCalls
-} from "../plugins/grok-build/scripts/lib/stream-events.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/stream-events.mjs";
 import {
   decideCompletionStatus,
   formatRunLogHeader,
   writeRunLogHeader
-} from "../plugins/grok-build/scripts/lib/tracked-jobs.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/tracked-jobs.mjs";
 import {
   isDebrisPath,
   isGeneratedArtifactPath,
   partitionWorkAndDebris
-} from "../plugins/grok-build/scripts/lib/worktree.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/worktree.mjs";
 import { makeTempDir } from "./helpers.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PLUGIN_ROOT = path.join(ROOT, "plugins", "grok-build");
+const PLUGIN_ROOT = path.join(ROOT, "plugins", "turbo-build-plugin");
 
 // --- BRIDGE-5: modelCalls summation ---
 

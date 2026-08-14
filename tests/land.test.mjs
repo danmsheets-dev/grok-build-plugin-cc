@@ -12,12 +12,12 @@ import {
   resolveJobFile,
   upsertJob,
   writeJobFile
-} from "../plugins/grok-build/scripts/lib/state.mjs";
-import { isHarnessLandPath } from "../plugins/grok-build/scripts/lib/fs.mjs";
-import { createWorktree } from "../plugins/grok-build/scripts/lib/worktree.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/state.mjs";
+import { isHarnessLandPath } from "../plugins/turbo-build-plugin/scripts/lib/fs.mjs";
+import { createWorktree } from "../plugins/turbo-build-plugin/scripts/lib/worktree.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PLUGIN_ROOT = path.join(ROOT, "plugins", "grok-build");
+const PLUGIN_ROOT = path.join(ROOT, "plugins", "turbo-build-plugin");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "grok-bridge.mjs");
 
 test("plugin temps nest under %TEMP%/grok/plugin-tests", () => {
@@ -343,7 +343,7 @@ test("land --preview errors on a stale branch ref instead of silently claiming n
       id: jobId,
       worktree: {
         path: path.join(pluginDataDir, "worktrees", "does-not-exist"),
-        branch: "grok-build/does-not-exist",
+        branch: "turbo-build/does-not-exist",
         baseSha
       }
     });
@@ -628,7 +628,7 @@ test("untracked dirt under an artifact path still lands, tracked or not the dire
 test("landing a job twice gives a clean error on the second call, not a raw git error", () => {
   // Regression found by a second-round audit: land never cleared the job's
   // worktree field after a successful apply or discard, so a second
-  // /grok-build:land call on the same job id fell through past the
+  // /turbo-build-plugin:land call on the same job id fell through past the
   // "no worktree to land" guard and hit a git diff against a branch
   // removeWorktree had already deleted - a raw, unfriendly git error
   // instead of a clear "already landed" message. It also left the

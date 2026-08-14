@@ -5,7 +5,7 @@ import {
   createNdjsonDecoder,
   parseStreamEvent,
   parseStreamEventDetailed
-} from "../plugins/grok-build/scripts/lib/stream-events.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/stream-events.mjs";
 
 test("decoder returns only complete lines and retains the partial tail", () => {
   const decoder = createNdjsonDecoder();
@@ -49,7 +49,7 @@ import {
   FINAL_REPORT_OPEN,
   MESSAGE_SEPARATOR,
   normalizeUsage
-} from "../plugins/grok-build/scripts/lib/stream-events.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/stream-events.mjs";
 
 function feed(transcript, events) {
   return events.map((event) => transcript.accept(event));
@@ -510,7 +510,7 @@ test("addUsage ORs costIsPartial when only one turn reports cost", () => {
 
 // --- WP-B8: schemaVersion 2 vocabulary ---
 
-import { describeToolProgress, HYPER_STREAM_EVENT_TYPES } from "../plugins/grok-build/scripts/lib/stream-events.mjs";
+import { describeToolProgress, HYPER_STREAM_EVENT_TYPES } from "../plugins/turbo-build-plugin/scripts/lib/stream-events.mjs";
 
 test("schemaVersion 2 start captures sessionCwd, originalCwd, folderTrust", () => {
   const transcript = createStreamTranscript();

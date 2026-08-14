@@ -4,16 +4,16 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { fileURLToPath } from "node:url";
 
-import { loadPromptTemplate } from "../plugins/grok-build/scripts/lib/prompts.mjs";
+import { loadPromptTemplate } from "../plugins/turbo-build-plugin/scripts/lib/prompts.mjs";
 import {
   FINAL_REPORT_CLOSE,
   FINAL_REPORT_OPEN
-} from "../plugins/grok-build/scripts/lib/stream-events.mjs";
-import { RUN_PASSTHROUGH_FLAGS } from "../plugins/grok-build/scripts/grok-bridge.mjs";
-import { PROVISION_LINK_DIRS } from "../plugins/grok-build/scripts/lib/provision.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/stream-events.mjs";
+import { RUN_PASSTHROUGH_FLAGS } from "../plugins/turbo-build-plugin/scripts/grok-bridge.mjs";
+import { PROVISION_LINK_DIRS } from "../plugins/turbo-build-plugin/scripts/lib/provision.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PLUGIN_ROOT = path.join(ROOT, "plugins", "grok-build");
+const PLUGIN_ROOT = path.join(ROOT, "plugins", "turbo-build-plugin");
 
 function read(relativePath) {
   return fs.readFileSync(path.join(PLUGIN_ROOT, relativePath), "utf8");
@@ -53,10 +53,10 @@ test("plugin surfaces use /grok-build names and grok binary, not codex", () => {
     "commands/show.md",
     "commands/stop.md",
     "commands/import.md",
-    "agents/grok-delegate.md",
+    "agents/turbo-delegate.md",
     "hooks/hooks.json",
-    "skills/grok-delegate-runtime/SKILL.md",
-    "skills/grok-run-output/SKILL.md",
+    "skills/turbo-delegate-runtime/SKILL.md",
+    "skills/turbo-run-output/SKILL.md",
     "scripts/grok-bridge.mjs"
   ];
 
@@ -72,7 +72,7 @@ test("plugin surfaces use /grok-build names and grok binary, not codex", () => {
   assert.doesNotMatch(bridge, /enable-review-gate|stopReviewGate|stop-review-gate/);
 
   const review = read("commands/review.md");
-  assert.match(review, /\/grok-build:review/);
+  assert.match(review, /\/turbo-build-plugin:review/);
   assert.match(review, /grok-bridge\.mjs" review/);
   assert.match(review, /AskUserQuestion/);
   assert.match(review, /run_in_background:\s*true/);
@@ -88,22 +88,22 @@ test("plugin surfaces use /grok-build names and grok binary, not codex", () => {
   assert.match(review, /--effort <none\|minimal\|low\|medium\|high\|xhigh\|max\|ultra>/);
 
   const critique = read("commands/critique.md");
-  assert.match(critique, /\/grok-build:critique/);
+  assert.match(critique, /\/turbo-build-plugin:critique/);
   assert.match(critique, /critique --background/);
-  assert.match(critique, /uses the same review target selection as `\/grok-build:review`/i);
+  assert.match(critique, /uses the same review target selection as `\/turbo-build-plugin:review`/i);
   assert.match(critique, /can still take extra focus text after the flags/i);
   assert.match(critique, /--model <model>/);
   assert.match(critique, /--effort <none\|minimal\|low\|medium\|high\|xhigh\|max\|ultra>/);
 
   const delegate = read("commands/delegate.md");
-  assert.match(delegate, /subagent_type: "grok-build:grok-delegate"/);
-  assert.match(delegate, /do not call `Skill\(grok-build:grok-delegate\)`/i);
+  assert.match(delegate, /subagent_type: "turbo-build-plugin:turbo-delegate"/);
+  assert.match(delegate, /do not call `Skill\(turbo-build-plugin:turbo-delegate\)`/i);
   assert.doesNotMatch(delegate, /^context:\s*fork\b/m);
   assert.match(delegate, /run-resume-candidate --json/);
   assert.match(delegate, /Continue current Grok thread/);
   assert.match(delegate, /Start a new Grok thread/);
 
-  const agent = read("agents/grok-delegate.md");
+  const agent = read("agents/turbo-delegate.md");
   assert.match(agent, /grok-bridge\.mjs" run/);
   assert.match(agent, /--resume-last/);
   assert.match(agent, /thin forwarding wrapper/i);
@@ -124,21 +124,21 @@ test("plugin surfaces use /grok-build names and grok binary, not codex", () => {
   assert.doesNotMatch(check, /enable-review-gate|disable-review-gate/);
 
   const readme = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
-  assert.match(readme, /### `\/grok-build:check`/);
-  assert.match(readme, /### `\/grok-build:review`/);
-  assert.match(readme, /### `\/grok-build:critique`/);
-  assert.match(readme, /### `\/grok-build:delegate`/);
-  assert.match(readme, /### `\/grok-build:import`/);
-  assert.match(readme, /### `\/grok-build:runs`/);
-  assert.match(readme, /### `\/grok-build:show`/);
-  assert.match(readme, /### `\/grok-build:stop`/);
-  assert.match(readme, /plugin install grok-build@xai-grok-build/);
+  assert.match(readme, /### `\/turbo-build-plugin:check`/);
+  assert.match(readme, /### `\/turbo-build-plugin:review`/);
+  assert.match(readme, /### `\/turbo-build-plugin:critique`/);
+  assert.match(readme, /### `\/turbo-build-plugin:delegate`/);
+  assert.match(readme, /### `\/turbo-build-plugin:import`/);
+  assert.match(readme, /### `\/turbo-build-plugin:runs`/);
+  assert.match(readme, /### `\/turbo-build-plugin:show`/);
+  assert.match(readme, /### `\/turbo-build-plugin:stop`/);
+  assert.match(readme, /plugin install turbo-build-plugin@turbo-build/);
   assert.doesNotMatch(readme, /\bcodex\b/i);
   assert.doesNotMatch(readme, /review-gate|enable-review-gate/i);
 });
 
 test("runtime skill only forwards run once", () => {
-  const runtimeSkill = read("skills/grok-delegate-runtime/SKILL.md");
+  const runtimeSkill = read("skills/turbo-delegate-runtime/SKILL.md");
   assert.match(runtimeSkill, /grok-bridge\.mjs" run --prompt-file/);
   assert.match(runtimeSkill, /Use `run` for every delegate request/i);
   assert.match(runtimeSkill, /run --resume-last/i);
@@ -148,14 +148,14 @@ test("runtime skill only forwards run once", () => {
   assert.match(runtimeSkill, /Never build the Bash command by directly embedding the task text/i);
   assert.match(runtimeSkill, /natural-language task text|task text/i);
 
-  const agent = read("agents/grok-delegate.md");
+  const agent = read("agents/turbo-delegate.md");
   assert.match(agent, /--prompt-file/i);
   assert.match(agent, /Never interpolate the task text into a hand-built shell string/i);
 
   const delegate = read("commands/delegate.md");
   assert.match(delegate, /--prompt-file/i);
 
-  const resultHandling = read("skills/grok-run-output/SKILL.md");
+  const resultHandling = read("skills/turbo-run-output/SKILL.md");
   assert.match(resultHandling, /do not turn a failed or incomplete Grok run into a Claude-side implementation attempt/i);
   assert.match(resultHandling, /if Grok was never successfully invoked, do not generate a substitute answer at all/i);
 });
@@ -179,7 +179,7 @@ test("the delegate command documents that verification is automatic", () => {
 });
 
 test("the delegate subagent defaults to background because of the Bash ceiling", () => {
-  const agent = read(path.join("agents", "grok-delegate.md"));
+  const agent = read(path.join("agents", "turbo-delegate.md"));
   assert.match(
     agent,
     /Default to background/i,
@@ -195,7 +195,7 @@ test("the delegate subagent defaults to background because of the Bash ceiling",
 });
 
 test("the delegate runtime skill defaults to background", () => {
-  const skill = read(path.join("skills", "grok-delegate-runtime", "SKILL.md"));
+  const skill = read(path.join("skills", "turbo-delegate-runtime", "SKILL.md"));
   assert.match(skill, /Always add `--background` unless/i);
   assert.match(skill, /10 minute|10-minute|Bash tool hard-caps/i);
   assert.match(skill, /wait <id>|runs <id> --wait/i);
@@ -248,7 +248,7 @@ test("the README documents the engines that exit 0 while broken", () => {
 });
 
 test("the delegate runtime skill warns that an engine exit code is not evidence", () => {
-  const skill = read(path.join("skills", "grok-delegate-runtime", "SKILL.md"));
+  const skill = read(path.join("skills", "turbo-delegate-runtime", "SKILL.md"));
   assert.match(skill, /--python-exit-code/);
   assert.match(skill, /exits \*\*0\*\*/, "the exit-0-while-broken behaviour must be stated");
   assert.match(skill, /addon_utils\.enable/);
@@ -262,7 +262,7 @@ test("every command file is documented in the plugin README", () => {
     .map((name) => path.basename(name, ".md"));
 
   for (const command of commands) {
-    assert.match(readme, new RegExp(`/grok-build:${command}\\b`), `README is missing /grok-build:${command}`);
+    assert.match(readme, new RegExp(`/turbo-build-plugin:${command}\\b`), `README is missing /turbo-build-plugin:${command}`);
   }
 });
 
@@ -360,7 +360,7 @@ test("the docs explain why a delegate run used to look like it returned nothing"
   assert.match(readme, /not\*{0,2} only into a file/i);
   assert.match(readme, /Grok did not return a final message/);
 
-  const skill = read("skills/grok-run-output/SKILL.md");
+  const skill = read("skills/turbo-run-output/SKILL.md");
   assert.match(skill, /## Artifacts/, "artifact paths are the deliverable for Godot and Blender");
   assert.match(skill, /do not invent one/i);
 });
@@ -378,7 +378,7 @@ test("the docs promise a changed-files manifest, including for a run that change
   assert.match(readme, /already dirty|pre-run snapshot/i);
   assert.match(readme, /Log: <path>|===RUN-LOG-HEADER===/);
 
-  const skill = read("skills/grok-run-output/SKILL.md");
+  const skill = read("skills/turbo-run-output/SKILL.md");
   assert.match(skill, /measured from git, not claimed by the model/);
   assert.match(skill, /showing raw stdout/);
 });
@@ -386,15 +386,15 @@ test("the docs promise a changed-files manifest, including for a run that change
 test("every RUN_PASSTHROUGH_FLAGS entry is documented, backticked, on all three delegate surfaces", () => {
   // The env/Blender unit flagged this gap directly: --env and --blender-sandbox
   // reach the bridge's `run` command but nothing forwards them from
-  // /grok-build:delegate, so a user typing either into a delegate request got
+  // /turbo-build-plugin:delegate, so a user typing either into a delegate request got
   // it folded into the prompt as prose. RUN_PASSTHROUGH_FLAGS is the single
   // source of truth for the full list (every flag this release added to the
   // delegate path, not only those two); this test is the contract that keeps
   // the three surfaces from drifting from it.
   const surfaces = [
     "commands/delegate.md",
-    "agents/grok-delegate.md",
-    "skills/grok-delegate-runtime/SKILL.md"
+    "agents/turbo-delegate.md",
+    "skills/turbo-delegate-runtime/SKILL.md"
   ];
   assert.ok(RUN_PASSTHROUGH_FLAGS.length > 0, "RUN_PASSTHROUGH_FLAGS must not be empty");
   for (const surface of surfaces) {

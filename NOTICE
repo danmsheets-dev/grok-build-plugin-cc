@@ -1,9 +1,12 @@
-Grok Build Plugin for Claude Code
-Copyright 2026 xAI
+Turbo Build Plugin for Claude Code
+Copyright 2026 danmsheets-dev
+
+This project is a fork of the Grok Build Plugin for Claude Code
+(Copyright 2026 xAI), rebranded and maintained independently.
 
 Layout inspiration for the Claude Code marketplace plugin structure draws briefly
 from community plugin packaging patterns; the product surface, commands, and
-runtime here are Grok-native and shell out to the Grok Build CLI.
+runtime here shell out to the Turbo Grok Build CLI.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.

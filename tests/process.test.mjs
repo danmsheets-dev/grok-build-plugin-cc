@@ -7,13 +7,13 @@ import assert from "node:assert/strict";
 import { pathToFileURL } from "node:url";
 
 import { makeTempDir } from "./helpers.mjs";
-import { resolveExecutable } from "../plugins/grok-build/scripts/lib/which.mjs";
+import { resolveExecutable } from "../plugins/turbo-build-plugin/scripts/lib/which.mjs";
 import {
   resolveMaxOutputBytes,
   runCommand,
   runCommandAsync,
   terminateProcessTree
-} from "../plugins/grok-build/scripts/lib/process.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/process.mjs";
 
 test("terminateProcessTree uses taskkill on Windows", () => {
   let captured = null;
@@ -450,7 +450,7 @@ test("runCommandAsync lets the process exit when the tree kill never lands", asy
   // coverage at all.
   const dir = makeTempDir();
   const moduleUrl = pathToFileURL(
-    path.join(process.cwd(), "plugins/grok-build/scripts/lib/process.mjs")
+    path.join(process.cwd(), "plugins/turbo-build-plugin/scripts/lib/process.mjs")
   ).href;
   const scriptPath = path.join(dir, "orphan.mjs");
   fs.writeFileSync(

@@ -12,10 +12,10 @@ import {
   resolveJobLogFile,
   upsertJob,
   writeJobFile
-} from "../plugins/grok-build/scripts/lib/state.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const HOOK_SCRIPT = path.join(ROOT, "plugins", "grok-build", "scripts", "session-lifecycle-hook.mjs");
+const HOOK_SCRIPT = path.join(ROOT, "plugins", "turbo-build-plugin", "scripts", "session-lifecycle-hook.mjs");
 
 function runSessionEnd(cwd, pluginDataDir, sessionId) {
   const input = JSON.stringify({ hook_event_name: "SessionEnd", session_id: sessionId, cwd });
@@ -147,7 +147,7 @@ test("SessionEnd retains completed write runs whose worktree still holds unlande
       write: true,
       worktree: {
         path: worktreePath,
-        branch: `grok-build/${jobId}`,
+        branch: `turbo-build/${jobId}`,
         baseSha: "abc123"
       }
     };

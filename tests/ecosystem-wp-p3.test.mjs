@@ -15,7 +15,7 @@ import {
   detectEcosystems,
   detectPrimaryEcosystem,
   resolvePythonInterpreter
-} from "../plugins/grok-build/scripts/lib/ecosystem.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/ecosystem.mjs";
 import {
   blenderVersionGuardNote,
   checkUidIntegrity,
@@ -23,20 +23,20 @@ import {
   parseBlenderVersionMin,
   parseBlenderVersionOutput,
   snapshotUidFiles
-} from "../plugins/grok-build/scripts/lib/engine-runtime.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/engine-runtime.mjs";
 import {
   injectRuntimePlugin,
   resolveGodotCacheMode,
   shouldAutoBlenderSandbox
-} from "../plugins/grok-build/scripts/lib/provision.mjs";
-import { artifactExcludePathspecs } from "../plugins/grok-build/scripts/lib/worktree.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/provision.mjs";
+import { artifactExcludePathspecs } from "../plugins/turbo-build-plugin/scripts/lib/worktree.mjs";
 import { makeTempDir } from "./helpers.mjs";
 
 const PLUGIN_ROOT = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
   "plugins",
-  "grok-build"
+  "turbo-build-plugin"
 );
 
 function makeProject(files = {}) {
@@ -342,16 +342,16 @@ test("injectRuntimePlugin copies ecosystem packs and is excluded from commit pat
   assert.ok(result.packs.includes("godot-engine"));
   assert.ok(result.packs.includes("blender-addon"));
   assert.ok(result.packs.includes("runtime-core"));
-  assert.ok(fs.existsSync(path.join(wt, ".grok", "plugins", "grok-build-runtime", "plugin.json")));
+  assert.ok(fs.existsSync(path.join(wt, ".grok", "plugins", "turbo-build-runtime", "plugin.json")));
   assert.ok(
     fs.existsSync(
-      path.join(wt, ".grok", "plugins", "grok-build-runtime", "skills", "godot-engine", "SKILL.md")
+      path.join(wt, ".grok", "plugins", "turbo-build-runtime", "skills", "godot-engine", "SKILL.md")
     )
   );
   // tools/ holds grok_check.gd — required for the Godot 4 default plan.
   assert.ok(
     fs.existsSync(
-      path.join(wt, ".grok", "plugins", "grok-build-runtime", "tools", "grok_check.gd")
+      path.join(wt, ".grok", "plugins", "turbo-build-runtime", "tools", "grok_check.gd")
     )
   );
 

@@ -3,7 +3,7 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { resolveExecutable } from "../plugins/grok-build/scripts/lib/which.mjs";
+import { resolveExecutable } from "../plugins/turbo-build-plugin/scripts/lib/which.mjs";
 
 import { FAKE_GROK_LONG_TURN_TEXT, buildEnv, installFakeGrok } from "./fake-grok-fixture.mjs";
 import { makeTempDir, run, writeExecutable } from "./helpers.mjs";
@@ -39,8 +39,8 @@ import {
   resolveSupportedPermissionPrefixes,
   runHeadlessAgent,
   runImport
-} from "../plugins/grok-build/scripts/lib/grok.mjs";
-import { runCommand } from "../plugins/grok-build/scripts/lib/process.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/grok.mjs";
+import { runCommand } from "../plugins/turbo-build-plugin/scripts/lib/process.mjs";
 
 test("resolveGrokBinary prefers GROK_BINARY override", () => {
   const skip = { skipAgentProbe: true };

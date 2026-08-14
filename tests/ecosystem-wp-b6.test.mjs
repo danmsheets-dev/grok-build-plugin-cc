@@ -16,20 +16,20 @@ import {
   detectPrimaryEcosystem,
   filterEcosystems,
   sanitizePythonModuleName
-} from "../plugins/grok-build/scripts/lib/ecosystem.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/ecosystem.mjs";
 import {
   discoverNestedNodeModules,
   planBlenderScriptSandbox,
   planWorktreeLinks
-} from "../plugins/grok-build/scripts/lib/provision.mjs";
-import { resolveOutputFailurePatterns } from "../plugins/grok-build/scripts/lib/verify.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/provision.mjs";
+import { resolveOutputFailurePatterns } from "../plugins/turbo-build-plugin/scripts/lib/verify.mjs";
 import { makeTempDir } from "./helpers.mjs";
 
 const BRIDGE = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
   "plugins",
-  "grok-build",
+  "turbo-build-plugin",
   "scripts",
   "grok-bridge.mjs"
 );

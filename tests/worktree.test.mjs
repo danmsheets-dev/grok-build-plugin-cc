@@ -15,8 +15,8 @@ import {
   resolveMinFreeBytes,
   resolveWorktreePath,
   resolveWorktreeRoot
-} from "../plugins/grok-build/scripts/lib/worktree.mjs";
-import { planWorktreeLinks, provisionWorktree } from "../plugins/grok-build/scripts/lib/provision.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/worktree.mjs";
+import { planWorktreeLinks, provisionWorktree } from "../plugins/turbo-build-plugin/scripts/lib/provision.mjs";
 import { initGitRepo, makeTempDir, run, writeExecutable } from "./helpers.mjs";
 
 /** The link kind provisionWorktree would really use on this platform. */
@@ -155,14 +155,14 @@ test("resolveWorktreePath uses dataDir, same-volume win32 default, or CLAUDE_PLU
   assert.ok(fallback.endsWith(path.join("grok-cc-worktrees", "run-d")));
 });
 
-test("createWorktree makes a real worktree directory and grok-build branch", () => {
+test("createWorktree makes a real worktree directory and turbo-build branch", () => {
   const cwd = makeTempDir("grok-wt-create-");
   const dataDir = makeTempDir("grok-wt-create-data-");
   seedRepo(cwd);
 
   const created = createWorktree({ cwd, runId: "create-1", dataDir });
 
-  assert.equal(created.branchName, "grok-build/create-1");
+  assert.equal(created.branchName, "turbo-build/create-1");
   assert.equal(created.runId, "create-1");
   assert.equal(created.baseRef, "HEAD");
   assert.ok(created.baseSha);
@@ -173,8 +173,8 @@ test("createWorktree makes a real worktree directory and grok-build branch", () 
   assert.equal(list.length, 2);
   assert.ok(listMentionsPath(list, created.worktreePath));
 
-  const branches = run("git", ["branch", "--list", "grok-build/create-1"], { cwd });
-  assert.match(branches.stdout, /grok-build\/create-1/);
+  const branches = run("git", ["branch", "--list", "turbo-build/create-1"], { cwd });
+  assert.match(branches.stdout, /turbo-build\/create-1/);
 
   removeWorktree({
     repoRoot: created.repoRoot,
@@ -364,7 +364,7 @@ test("removeWorktree deletes the directory and the branch", () => {
   assert.equal(fs.existsSync(created.worktreePath), false);
   assert.equal(worktreeListLines(cwd).length, 1);
 
-  const branches = run("git", ["branch", "--list", "grok-build/remove-1"], { cwd });
+  const branches = run("git", ["branch", "--list", "turbo-build/remove-1"], { cwd });
   assert.equal(branches.stdout.trim(), "");
 });
 

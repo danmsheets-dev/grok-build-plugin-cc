@@ -1,0 +1,5 @@
+{
+  "name": "turbo-build-runtime",
+  "version": "0.1.0",
+  "description": "Per-run ecosystem capability pack injected by turbo-build-plugin into isolated worktrees. Not user source — never commit."
+}

@@ -4,15 +4,15 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { buildBoundedVerifyFixPrompt, main } from "../plugins/grok-build/scripts/grok-bridge.mjs";
-import { PROJECT_CONFIG_FILENAME, hashProjectConfig } from "../plugins/grok-build/scripts/lib/project-config.mjs";
+import { buildBoundedVerifyFixPrompt, main } from "../plugins/turbo-build-plugin/scripts/grok-bridge.mjs";
+import { PROJECT_CONFIG_FILENAME, hashProjectConfig } from "../plugins/turbo-build-plugin/scripts/lib/project-config.mjs";
 import { makeTempDir } from "./helpers.mjs";
 
 const BRIDGE = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "..",
   "plugins",
-  "grok-build",
+  "turbo-build-plugin",
   "scripts",
   "grok-bridge.mjs"
 );

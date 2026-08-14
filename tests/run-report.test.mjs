@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { summarizeFinalReport } from "../plugins/grok-build/scripts/grok-bridge.mjs";
+import { summarizeFinalReport } from "../plugins/turbo-build-plugin/scripts/grok-bridge.mjs";
 
 test("summarizeFinalReport takes the run's summary from the report's Result section", () => {
   // The whole reason this exists: firstMeaningfulLine returned the first
   // sentence the model ever emitted, and that string is job.summary - the title
-  // of the run in /grok-build:runs.
+  // of the run in /turbo-build-plugin:runs.
   const report = [
     "## Result",
     "Rebuilt the player scene and re-imported its meshes.",

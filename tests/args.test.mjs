@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { parseArgs, splitRawArgumentString } from "../plugins/grok-build/scripts/lib/args.mjs";
+import { parseArgs, splitRawArgumentString } from "../plugins/turbo-build-plugin/scripts/lib/args.mjs";
 
 test("parseArgs handles value, boolean, and alias options", () => {
   const result = parseArgs(["--cwd", "/tmp", "--json", "-m", "model-x", "remaining"], {
@@ -129,7 +129,7 @@ test("the run command's real option table accepts the verify timing flags", asyn
   // positional and folded into the agent's prompt, which is how a value flag
   // fails least visibly.
   const { TASK_VALUE_OPTIONS } = await import(
-    "../plugins/grok-build/scripts/grok-bridge.mjs"
+    "../plugins/turbo-build-plugin/scripts/grok-bridge.mjs"
   );
 
   const result = parseArgs(
@@ -156,7 +156,7 @@ test("--env is repeatable and splits on the first = only", async () => {
   // the real parser. A Windows path and a base64 token both legitimately
   // contain further `=`, so anything but a first-separator split corrupts them.
   const { TASK_VALUE_OPTIONS, parseEnvAssignments } = await import(
-    "../plugins/grok-build/scripts/grok-bridge.mjs"
+    "../plugins/turbo-build-plugin/scripts/grok-bridge.mjs"
   );
 
   assert.ok(TASK_VALUE_OPTIONS.includes("env"));
@@ -178,7 +178,7 @@ test("--env is repeatable and splits on the first = only", async () => {
 
 test("parseEnvAssignments accepts a single value and rejects a malformed one", async () => {
   const { parseEnvAssignments } = await import(
-    "../plugins/grok-build/scripts/grok-bridge.mjs"
+    "../plugins/turbo-build-plugin/scripts/grok-bridge.mjs"
   );
 
   // parseArgs hands back a bare string for one occurrence and an array for

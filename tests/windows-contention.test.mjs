@@ -23,11 +23,11 @@ import { makeTempDir } from "./helpers.mjs";
 import {
   createJobProgressUpdater,
   createProgressReporter
-} from "../plugins/grok-build/scripts/lib/tracked-jobs.mjs";
-import { readJobFile, resolveJobFile, writeJobFile } from "../plugins/grok-build/scripts/lib/state.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/tracked-jobs.mjs";
+import { readJobFile, resolveJobFile, writeJobFile } from "../plugins/turbo-build-plugin/scripts/lib/state.mjs";
 
 const STATE_MODULE = pathToFileURL(
-  path.resolve("plugins/grok-build/scripts/lib/state.mjs")
+  path.resolve("plugins/turbo-build-plugin/scripts/lib/state.mjs")
 ).href;
 
 /**

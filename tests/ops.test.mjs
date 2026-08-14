@@ -13,18 +13,18 @@ import {
   resolveJobFile,
   upsertJob,
   writeJobFile
-} from "../plugins/grok-build/scripts/lib/state.mjs";
-import { createWorktree } from "../plugins/grok-build/scripts/lib/worktree.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/state.mjs";
+import { createWorktree } from "../plugins/turbo-build-plugin/scripts/lib/worktree.mjs";
 import {
   buildEcosystemChecks,
   normalizeDoctorCheck,
   renderDoctorReport,
   RUN_PASSTHROUGH_FLAGS,
   TASK_VALUE_OPTIONS
-} from "../plugins/grok-build/scripts/grok-bridge.mjs";
+} from "../plugins/turbo-build-plugin/scripts/grok-bridge.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PLUGIN_ROOT = path.join(ROOT, "plugins", "grok-build");
+const PLUGIN_ROOT = path.join(ROOT, "plugins", "turbo-build-plugin");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "grok-bridge.mjs");
 
 function pluginDataEnv(pluginDataDir, binDir, extra = {}) {
@@ -157,7 +157,7 @@ test("doctor status levels default from the legacy ok boolean", () => {
 
 test("doctor reports a failing check but still exits 0", () => {
   // doctor is a report, not a gate: a non-zero exit would render
-  // /grok-build:doctor as a failed command in the Claude Code transcript.
+  // /turbo-build-plugin:doctor as a failed command in the Claude Code transcript.
   const binDir = makeTempDir();
   const pluginDataDir = makeTempDir();
   const repo = makeTempDir();
@@ -807,7 +807,7 @@ test("doctor reports completed unlanded work as awaiting land, not prunable stal
   assert.ok(awaiting, "doctor must include an awaiting land check");
   assert.equal(awaiting.ok, false);
   assert.match(awaiting.detail, /1 run\(s\) awaiting land/);
-  assert.match(awaiting.fix ?? "", /\/grok-build:land/);
+  assert.match(awaiting.fix ?? "", /\/turbo-build-plugin:land/);
   assert.doesNotMatch(awaiting.fix ?? "", /prune/i);
 
   const stale = payload.checks.find((check) => /stale worktrees/i.test(check.name));

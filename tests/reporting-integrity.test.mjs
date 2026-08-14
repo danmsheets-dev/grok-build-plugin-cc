@@ -10,12 +10,12 @@ import {
   inferModelBillingRoute,
   parseModelsOutput,
   READ_ONLY_DENY_RULES
-} from "../plugins/grok-build/scripts/lib/grok.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/grok.mjs";
 import {
   buildBridgeResultBlock,
   buildTaskStatusLines,
   formatUsageLine
-} from "../plugins/grok-build/scripts/lib/render.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/render.mjs";
 import {
   claimJobTerminal,
   isTerminalJobStatus,
@@ -23,12 +23,12 @@ import {
   patchJobIfActive,
   upsertJob,
   writeJobFile
-} from "../plugins/grok-build/scripts/lib/state.mjs";
-import { decideCompletionStatus } from "../plugins/grok-build/scripts/lib/tracked-jobs.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/state.mjs";
+import { decideCompletionStatus } from "../plugins/turbo-build-plugin/scripts/lib/tracked-jobs.mjs";
 import {
   commitWorktreeChanges,
   listCommittedChanges
-} from "../plugins/grok-build/scripts/lib/worktree.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/worktree.mjs";
 import { makeTempDir } from "./helpers.mjs";
 
 function withPluginData(fn) {
@@ -306,7 +306,7 @@ test("buildBridgeResultBlock emits the structured trailer", () => {
         resolvedModel: "grok-4.5-build"
       },
       logFile: "/tmp/run-1.log",
-      worktree: { path: "/tmp/wt", branch: "grok-build/run-1" }
+      worktree: { path: "/tmp/wt", branch: "turbo-build/run-1" }
     },
     null
   );
@@ -317,7 +317,7 @@ test("buildBridgeResultBlock emits the structured trailer", () => {
   assert.match(block, /isolation: ACTIVE \(worktree \/tmp\/wt, branch grok-build\/run-1\)/);
   assert.match(block, /changed files: none/);
   assert.match(block, /tool calls: 0/);
-  assert.match(block, /land: \/grok-build:land run-1/);
+  assert.match(block, /land: \/turbo-build-plugin:land run-1/);
   assert.match(block, /===END-BRIDGE-RESULT===/);
 });
 
@@ -372,7 +372,7 @@ import { buildEnv, installFakeGrok } from "./fake-grok-fixture.mjs";
 import { run } from "./helpers.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const SCRIPT = path.join(ROOT, "plugins", "grok-build", "scripts", "grok-bridge.mjs");
+const SCRIPT = path.join(ROOT, "plugins", "turbo-build-plugin", "scripts", "grok-bridge.mjs");
 
 test("run --help short-circuits without validation errors", () => {
   const result = run("node", [SCRIPT, "run", "--help"], { env: buildEnv(makeTempDir()) });

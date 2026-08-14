@@ -22,11 +22,11 @@ function makeVersionFixture() {
   const root = makeTempDir();
 
   writeJson(path.join(root, "package.json"), {
-    name: "@xai/grok-build-plugin-cc",
+    name: "turbo-build-plugin",
     version: "0.1.0"
   });
-  writeJson(path.join(root, "plugins", "grok-build", ".claude-plugin", "plugin.json"), {
-    name: "grok-build",
+  writeJson(path.join(root, "plugins", "turbo-build-plugin", ".claude-plugin", "plugin.json"), {
+    name: "turbo-build-plugin",
     version: "0.1.0"
   });
   writeJson(path.join(root, ".claude-plugin", "marketplace.json"), {
@@ -35,7 +35,7 @@ function makeVersionFixture() {
     },
     plugins: [
       {
-        name: "grok-build",
+        name: "turbo-build-plugin",
         version: "0.1.0"
       }
     ]
@@ -53,7 +53,7 @@ test("bump-version updates every release manifest", () => {
 
   assert.equal(result.status, 0, result.stderr);
   assert.equal(readJson(path.join(root, "package.json")).version, "1.2.3");
-  assert.equal(readJson(path.join(root, "plugins", "grok-build", ".claude-plugin", "plugin.json")).version, "1.2.3");
+  assert.equal(readJson(path.join(root, "plugins", "turbo-build-plugin", ".claude-plugin", "plugin.json")).version, "1.2.3");
   assert.equal(readJson(path.join(root, ".claude-plugin", "marketplace.json")).metadata.version, "1.2.3");
   assert.equal(readJson(path.join(root, ".claude-plugin", "marketplace.json")).plugins[0].version, "1.2.3");
 });
@@ -61,7 +61,7 @@ test("bump-version updates every release manifest", () => {
 test("bump-version check mode reports stale metadata", () => {
   const root = makeVersionFixture();
   writeJson(path.join(root, "package.json"), {
-    name: "@xai/grok-build-plugin-cc",
+    name: "turbo-build-plugin",
     version: "0.2.0"
   });
 
@@ -70,7 +70,7 @@ test("bump-version check mode reports stale metadata", () => {
   });
 
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /plugins\/grok-build\/\.claude-plugin\/plugin\.json version/);
+  assert.match(result.stderr, /plugins\/turbo-build-plugin\/\.claude-plugin\/plugin\.json version/);
   assert.match(result.stderr, /\.claude-plugin\/marketplace\.json metadata\.version/);
 });
 

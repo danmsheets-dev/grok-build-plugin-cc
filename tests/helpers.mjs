@@ -4,7 +4,7 @@ import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
 
-import { resolveSpawnInvocation } from "../plugins/grok-build/scripts/lib/which.mjs";
+import { resolveSpawnInvocation } from "../plugins/turbo-build-plugin/scripts/lib/which.mjs";
 
 export function harnessTempRoot(...parts) {
   const root = path.join(os.tmpdir(), "grok", ...parts);

@@ -1,8 +1,0 @@
-{
-  "name": "grok-build",
-  "version": "0.6.9",
-  "description": "Grok Build ↔ Claude Code bridge for review, critique, and delegation.",
-  "author": {
-    "name": "xAI"
-  }
-}

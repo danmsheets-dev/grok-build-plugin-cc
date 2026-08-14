@@ -9,7 +9,7 @@ import {
   detectEcosystems,
   detectPrimaryEcosystem,
   resolveEcosystemBinary
-} from "../plugins/grok-build/scripts/lib/ecosystem.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/ecosystem.mjs";
 import { makeTempDir } from "./helpers.mjs";
 
 /**

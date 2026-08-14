@@ -15,7 +15,7 @@ import {
   resolveStateFile,
   saveState,
   withStateLock
-} from "../plugins/grok-build/scripts/lib/state.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/state.mjs";
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   // The temp fallback only applies when CLAUDE_PLUGIN_DATA is unset; clear it so
@@ -156,10 +156,10 @@ test("a job past the cap survives eviction while its worktree still exists on di
     // NOT exist, so mere presence of the field is not what protects a job -
     // only an existing directory does.
     if (index === 0) {
-      record.worktree = { path: worktreeDir, branch: "grok-build/job-0" };
+      record.worktree = { path: worktreeDir, branch: "turbo-build/job-0" };
     }
     if (index === 1) {
-      record.worktree = { path: path.join(workspace, "never-existed"), branch: "grok-build/job-1" };
+      record.worktree = { path: path.join(workspace, "never-existed"), branch: "turbo-build/job-1" };
     }
     fs.writeFileSync(jobFile, JSON.stringify(record, null, 2), "utf8");
     return { ...record, logFile };
@@ -227,7 +227,7 @@ test("loadState returns default state when the file is missing", () => {
   assert.deepEqual(state.config, {});
 });
 
-import { enrichJob, formatRelativeAge } from "../plugins/grok-build/scripts/lib/job-control.mjs";
+import { enrichJob, formatRelativeAge } from "../plugins/turbo-build-plugin/scripts/lib/job-control.mjs";
 
 test("formatRelativeAge renders seconds and minutes", () => {
   const now = Date.parse("2026-07-29T12:00:00.000Z");
@@ -283,12 +283,12 @@ test("enrichJob computes duration for completed-unverified and timed-out", () =>
 });
 
 test("resolveResultJob finds completed-unverified and timed-out runs", async () => {
-  const { resolveResultJob } = await import("../plugins/grok-build/scripts/lib/job-control.mjs");
+  const { resolveResultJob } = await import("../plugins/turbo-build-plugin/scripts/lib/job-control.mjs");
   const {
     generateJobId,
     upsertJob,
     writeJobFile
-  } = await import("../plugins/grok-build/scripts/lib/state.mjs");
+  } = await import("../plugins/turbo-build-plugin/scripts/lib/state.mjs");
 
   const workspace = makeTempDir("grok-result-job-");
   const previous = process.env.CLAUDE_PLUGIN_DATA;
@@ -325,8 +325,8 @@ test("resolveResultJob finds completed-unverified and timed-out runs", async () 
   }
 });
 
-import { classifyJobLiveness, isJobProcessAlive } from "../plugins/grok-build/scripts/lib/job-control.mjs";
-import { startHeartbeat } from "../plugins/grok-build/scripts/lib/tracked-jobs.mjs";
+import { classifyJobLiveness, isJobProcessAlive } from "../plugins/turbo-build-plugin/scripts/lib/job-control.mjs";
+import { startHeartbeat } from "../plugins/turbo-build-plugin/scripts/lib/tracked-jobs.mjs";
 
 test("isJobProcessAlive returns null when a run records no pids", () => {
   assert.equal(isJobProcessAlive({}), null);
@@ -451,7 +451,7 @@ test("withStateLock does NOT reclaim a genuinely live, recent lock", async () =>
   fs.writeFileSync(
     holderScript,
     `import { withStateLock } from ${JSON.stringify(
-      pathToFileURL(path.resolve("plugins/grok-build/scripts/lib/state.mjs")).href
+      pathToFileURL(path.resolve("plugins/turbo-build-plugin/scripts/lib/state.mjs")).href
     )};\n` +
       `withStateLock(${JSON.stringify(workspace)}, () => {\n` +
       `  const end = Date.now() + 1200;\n` +

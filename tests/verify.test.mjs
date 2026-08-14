@@ -4,7 +4,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { makeTempDir } from "./helpers.mjs";
-import { startHeartbeat } from "../plugins/grok-build/scripts/lib/tracked-jobs.mjs";
+import { startHeartbeat } from "../plugins/turbo-build-plugin/scripts/lib/tracked-jobs.mjs";
 import {
   OUTPUT_FAILURE_PATTERNS,
   assertExportSmokeArtifact,
@@ -22,7 +22,7 @@ import {
   resolveVerifyTimeoutMs,
   runVerifyCommand,
   summarizeFailures
-} from "../plugins/grok-build/scripts/lib/verify.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/verify.mjs";
 
 function sleep(ms) {
   return new Promise((resolve) => {
@@ -858,7 +858,7 @@ test("a verify timeout kills the whole process tree, not just the shell", async 
 test("the verify runner keeps a job heartbeat beating while a command runs", async () => {
   // Regression: spawnSync blocked the event loop for the whole command, so
   // startHeartbeat's interval could not fire - up to 900s x 4 attempts of
-  // total silence, during which /grok-build:runs showed a working run as
+  // total silence, during which /turbo-build-plugin:runs showed a working run as
   // having had no activity, i.e. dead. Exactly one beat used to land: the
   // synchronous one startHeartbeat fires before its interval.
   let beats = 0;

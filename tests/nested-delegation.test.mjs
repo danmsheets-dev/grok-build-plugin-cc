@@ -26,37 +26,37 @@ import {
   DEFAULT_MAX_NEST_DEPTH,
   NEST_MCP_SERVER_NAME,
   NESTED_DELEGATION_ENV
-} from "../plugins/grok-build/scripts/lib/nest.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/nest.mjs";
 import {
   collectJobTreeLeafFirst,
   resolveJobKillTargets,
   resolveJobTreeKillTargets,
   claimJobTreeDescendantsCancelled
-} from "../plugins/grok-build/scripts/lib/tracked-jobs.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/tracked-jobs.mjs";
 import {
   generateJobId,
   isTerminalJobStatus,
   upsertJob,
   writeJobFile
-} from "../plugins/grok-build/scripts/lib/state.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/state.mjs";
 import {
   artifactExcludePathspecs,
   createWorktree,
   shortWorktreeId
-} from "../plugins/grok-build/scripts/lib/worktree.mjs";
-import { buildTaskStatusLines } from "../plugins/grok-build/scripts/lib/render.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/worktree.mjs";
+import { buildTaskStatusLines } from "../plugins/turbo-build-plugin/scripts/lib/render.mjs";
 import {
   buildDelegateRunBridgeArgs,
   handleJsonRpcMessage,
   parseJsonRpcLine,
   shapeDelegateResult
-} from "../plugins/grok-build/mcp/grok-build-mcp.mjs";
-import { normalizeReasoningEffort } from "../plugins/grok-build/scripts/grok-bridge.mjs";
+} from "../plugins/turbo-build-plugin/mcp/grok-build-mcp.mjs";
+import { normalizeReasoningEffort } from "../plugins/turbo-build-plugin/scripts/grok-bridge.mjs";
 import { buildEnv, installFakeGrok } from "./fake-grok-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PLUGIN_ROOT = path.join(ROOT, "plugins", "grok-build");
+const PLUGIN_ROOT = path.join(ROOT, "plugins", "turbo-build-plugin");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "grok-bridge.mjs");
 
 /* -------------------------------------------------------------------------
@@ -219,10 +219,10 @@ test("upsertChildEntry and buildChildSummary link by runId", () => {
     status: "completed",
     changedFileCount: 3,
     usage: { costUsd: 0.1, inputTokens: 10, outputTokens: 2 },
-    worktree: { path: "/tmp/w", branch: "grok-build/run-child-1" }
+    worktree: { path: "/tmp/w", branch: "turbo-build/run-child-1" }
   });
   assert.equal(entry.runId, "run-child-1");
-  assert.equal(entry.branch, "grok-build/run-child-1");
+  assert.equal(entry.branch, "turbo-build/run-child-1");
 
   let children = upsertChildEntry([], entry);
   assert.equal(children.length, 1);
@@ -292,7 +292,7 @@ test("writeRuntimeMcpJson is a no-op when nested delegation is disabled", () => 
   });
   assert.equal(result.written, false);
   assert.equal(
-    fs.existsSync(path.join(worktree, ".grok", "plugins", "grok-build-runtime", ".mcp.json")),
+    fs.existsSync(path.join(worktree, ".grok", "plugins", "turbo-build-runtime", ".mcp.json")),
     false
   );
 });
@@ -404,7 +404,7 @@ test("shapeDelegateResult normalises show/wait payloads", () => {
       stopReason: "EndTurn",
       verified: true,
       usage: { costUsd: 0.05, inputTokens: 1, outputTokens: 2 },
-      worktree: { path: "/wt", branch: "grok-build/run-x", changedFileCount: 2 },
+      worktree: { path: "/wt", branch: "turbo-build/run-x", changedFileCount: 2 },
       result: {
         finalReport: "## Result\nDone.",
         changedFiles: { total: 2, entries: ["M\tfoo.js"] }
@@ -415,7 +415,7 @@ test("shapeDelegateResult normalises show/wait payloads", () => {
   assert.equal(shaped.runId, "run-x");
   assert.equal(shaped.status, "completed");
   assert.equal(shaped.verified, true);
-  assert.equal(shaped.branch, "grok-build/run-x");
+  assert.equal(shaped.branch, "turbo-build/run-x");
   assert.equal(shaped.cost, 0.05);
   assert.match(shaped.finalReport, /Done/);
 });
@@ -433,7 +433,7 @@ test("shapeDelegateResult reads finalReport from production {job, storedJob} sha
       usage: { costUsd: 0.12, inputTokens: 10, outputTokens: 4 },
       worktree: {
         path: "/tmp/wt-child",
-        branch: "grok-build/run-child-prod",
+        branch: "turbo-build/run-child-prod",
         changedFileCount: 4
       },
       logFile: "/tmp/logs/run-child-prod.log"
@@ -448,7 +448,7 @@ test("shapeDelegateResult reads finalReport from production {job, storedJob} sha
       usage: { costUsd: 0.12, inputTokens: 10, outputTokens: 4 },
       worktree: {
         path: "/tmp/wt-child",
-        branch: "grok-build/run-child-prod",
+        branch: "turbo-build/run-child-prod",
         changedFileCount: 4
       },
       logFile: "/tmp/logs/run-child-prod.log",
@@ -474,7 +474,7 @@ test("shapeDelegateResult reads finalReport from production {job, storedJob} sha
   assert.equal(shaped.changedFiles.total, 4);
   assert.match(shaped.finalReport, /port the inventory API/);
   assert.equal(shaped.cost, 0.12);
-  assert.equal(shaped.branch, "grok-build/run-child-prod");
+  assert.equal(shaped.branch, "turbo-build/run-child-prod");
 });
 
 test("shapeDelegateResult falls back to storedJob.rendered when result has no report", () => {
@@ -610,7 +610,7 @@ test("buildChildSummary carries structured fan-in fields including finalReport",
       finalReport: "## Result\nNested work done.",
       changedFiles: { total: 2, entries: ["M\ta.js"] }
     },
-    worktree: { path: "/wt", branch: "grok-build/run-c" },
+    worktree: { path: "/wt", branch: "turbo-build/run-c" },
     reservedCostUsd: 0.5
   });
   assert.equal(summary.runId, "run-c");
@@ -903,7 +903,7 @@ test("buildTaskStatusLines includes Nested runs section and own vs nested usage"
         status: "failed",
         changedFileCount: 0,
         usage: { costUsd: 0.2, inputTokens: 50, outputTokens: 10 },
-        branch: "grok-build/run-child"
+        branch: "turbo-build/run-child"
       }
     ]
   });

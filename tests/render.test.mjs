@@ -15,7 +15,7 @@ import {
   renderStoredJobResult,
   renderTaskResult,
   RUN_MANIFEST_SCHEMA_VERSION
-} from "../plugins/grok-build/scripts/lib/render.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/render.mjs";
 
 test("renderReviewResult degrades gracefully when JSON is missing required review fields", () => {
   const output = renderReviewResult(
@@ -408,11 +408,11 @@ test("renderTaskResult surfaces the worktree and a land hint", () => {
     {
       title: "Grok Build Delegate",
       jobId: "run-abc123",
-      worktree: { path: "/tmp/worktrees/run-abc123", branch: "grok-build/run-abc123" }
+      worktree: { path: "/tmp/worktrees/run-abc123", branch: "turbo-build/run-abc123" }
     }
   );
   assert.match(output, /Worktree: \/tmp\/worktrees\/run-abc123 \(branch grok-build\/run-abc123\)/);
-  assert.match(output, /\/grok-build:land run-abc123/);
+  assert.match(output, /\/turbo-build-plugin:land run-abc123/);
 });
 
 test("renderTaskResult explains a failed worktree commit and points at the directory", () => {
@@ -420,7 +420,7 @@ test("renderTaskResult explains a failed worktree commit and points at the direc
   // thrown error to an errorMessage - losing rawOutput, threadId, usage and
   // verify.results for a run that had actually completed. The run now finishes
   // and says what went wrong, because the branch does NOT contain the work and
-  // /grok-build:land would therefore land nothing.
+  // /turbo-build-plugin:land would therefore land nothing.
   const output = renderTaskResult(
     { rawOutput: "Did the work." },
     {
@@ -428,7 +428,7 @@ test("renderTaskResult explains a failed worktree commit and points at the direc
       jobId: "run-commitfail",
       worktree: {
         path: "/tmp/wt/run-commitfail",
-        branch: "grok-build/run-commitfail",
+        branch: "turbo-build/run-commitfail",
         commitError: "git add failed (exit=128): fatal: pathspec magic is not supported by this git"
       }
     }
@@ -445,7 +445,7 @@ test("renderTaskResult stays quiet about the commit when there was no commit err
     {
       title: "Grok Build Delegate",
       jobId: "run-ok",
-      worktree: { path: "/tmp/wt/run-ok", branch: "grok-build/run-ok", commitError: null }
+      worktree: { path: "/tmp/wt/run-ok", branch: "turbo-build/run-ok", commitError: null }
     }
   );
   assert.doesNotMatch(output, /could not commit/);
@@ -521,7 +521,7 @@ test("renderTaskResult can surface all three at once", () => {
       jobId: "run-xyz",
       verified: true,
       verifyNote: "failures unchanged from baseline",
-      worktree: { path: "/tmp/wt", branch: "grok-build/run-xyz" },
+      worktree: { path: "/tmp/wt", branch: "turbo-build/run-xyz" },
       budgetStopped: null
     }
   );
@@ -532,7 +532,7 @@ test("renderTaskResult can surface all three at once", () => {
 });
 
 test("an isolated write run's follow-up hint points at land, not review", () => {
-  // Regression: the hint suggested /grok-build:review --wait for EVERY write
+  // Regression: the hint suggested /turbo-build-plugin:review --wait for EVERY write
   // run, but an isolated run never touches the working tree at all - review
   // would look at the wrong thing entirely and find nothing, since the real
   // changes sit unlanded in the worktree.
@@ -543,10 +543,10 @@ test("an isolated write run's follow-up hint points at land, not review", () => 
     write: true,
     kindLabel: "delegate",
     title: "Grok Build Delegate",
-    worktree: { path: "/tmp/wt/run-iso", branch: "grok-build/run-iso" }
+    worktree: { path: "/tmp/wt/run-iso", branch: "turbo-build/run-iso" }
   });
-  assert.match(output, /Review and land: \/grok-build:land run-iso/);
-  assert.doesNotMatch(output, /\/grok-build:review --wait/);
+  assert.match(output, /Review and land: \/turbo-build-plugin:land run-iso/);
+  assert.doesNotMatch(output, /\/turbo-build-plugin:review --wait/);
 });
 
 test("a non-isolated write run keeps the review/critique hint", () => {
@@ -558,8 +558,8 @@ test("a non-isolated write run keeps the review/critique hint", () => {
     kindLabel: "delegate",
     title: "Grok Build Delegate"
   });
-  assert.match(output, /\/grok-build:review --wait/);
-  assert.match(output, /\/grok-build:critique --wait/);
+  assert.match(output, /\/turbo-build-plugin:review --wait/);
+  assert.match(output, /\/turbo-build-plugin:critique --wait/);
 });
 
 test("renderTaskResult surfaces stderr and the log path when the run said nothing", () => {
@@ -641,7 +641,7 @@ test("buildTaskStatusLines lists what changed before it says where the worktree 
     jobId: "run-godot",
     worktree: {
       path: "/tmp/wt/run-godot",
-      branch: "grok-build/run-godot",
+      branch: "turbo-build/run-godot",
       changedFiles: ["A\tscenes/Player.tscn", "M\tassets/model.glb"]
     },
     changedFiles: {

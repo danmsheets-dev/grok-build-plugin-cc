@@ -1,10 +1,10 @@
-# Grok Build ↔ Claude Code Bridge
+# Turbo Build Plugin
 
-Bridge [Grok Build](https://x.ai) / **Turbo Grok Build** into Claude Code for review, critique, delegation, and session import.
+Claude Code bridge for review, critique, delegation, and session import. Shells out to **Turbo Grok Build** (`turbo`, preferred) or stock `grok`.
 
-**Current plugin version: `0.6.9`.** Full isolation guarantees, verify semantics, and changelog live in [`plugins/grok-build/README.md`](plugins/grok-build/README.md).
+**Current plugin version: `0.7.0`.** Full isolation guarantees, verify semantics, and changelog live in [`plugins/turbo-build-plugin/README.md`](plugins/turbo-build-plugin/README.md).
 
-This repository is a Claude Code marketplace plugin that shells out to a real agent CLI (`turbo` preferred, then `grok`). Run status, results, and stop are owned by the plugin (PID + log files). There is no app-server broker.
+Run status, results, and stop are owned by the plugin (PID + log files). There is no app-server broker. This is an independent fork of the original xAI Grok Build plugin, rebranded and maintained at [danmsheets-dev/turbo-build-plugin](https://github.com/danmsheets-dev/turbo-build-plugin).
 
 ## Requirements
 
@@ -18,15 +18,11 @@ This repository is a Claude Code marketplace plugin that shells out to a real ag
 
 ### GitHub marketplace (release)
 
-This fork ships the **0.6.9** Turbo-ready plugin. In Claude Code:
-
 ```bash
-/plugin marketplace add danmsheets-dev/grok-build-plugin-cc
-/plugin install grok-build@xai-grok-build
+/plugin marketplace add danmsheets-dev/turbo-build-plugin
+/plugin install turbo-build-plugin@turbo-build
 /reload-plugins
 ```
-
-The upstream [xai-org/grok-build-plugin-cc](https://github.com/xai-org/grok-build-plugin-cc) marketplace is the original 0.2.x line.
 
 ### Local install (from a clone)
 
@@ -35,37 +31,37 @@ From this repository root (path must be absolute):
 ```bash
 # Resolve an absolute path to this clone, then add it as a local marketplace
 claude plugin marketplace add "$(pwd)"
-# example: claude plugin marketplace add /absolute/path/to/grok-build-plugin-cc
+# example: claude plugin marketplace add /absolute/path/to/turbo-build-plugin
 
 # Install the plugin from that marketplace
-claude plugin install grok-build@xai-grok-build
+claude plugin install turbo-build-plugin@turbo-build
 ```
 
-Or, when Claude Code is already open, use `/plugin` and add the local marketplace path, then install `grok-build@xai-grok-build`.
+Or, when Claude Code is already open, use `/plugin` and add the local marketplace path, then install `turbo-build-plugin@turbo-build`.
 
 ## Check readiness
 
 ```text
-/grok-build:check
+/turbo-build-plugin:check
 ```
 
 Ready means: Node is available, `grok` is available, and soft auth via `grok models` succeeds.
 
 ## Commands
 
-### `/grok-build:check`
+### `/turbo-build-plugin:check`
 
 Probe Node + Grok CLI availability and authentication.
 
-### `/grok-build:review`
+### `/turbo-build-plugin:review`
 
 Read-only review of local git state:
 
 ```text
-/grok-build:review --wait
-/grok-build:review --background --scope working-tree
-/grok-build:review --base main
-/grok-build:review --wait --model grok-build --effort high
+/turbo-build-plugin:review --wait
+/turbo-build-plugin:review --background --scope working-tree
+/turbo-build-plugin:review --base main
+/turbo-build-plugin:review --wait --model grok-build --effort high
 ```
 
 Runs (read-only):
@@ -79,26 +75,26 @@ turbo -p <prompt> --agent explore --permission-mode plan --sandbox read-only --d
 Optional: pass `--model` / `--effort` (`none|minimal|low|medium|high|xhigh|max|ultra`). If omitted, the CLI chooses defaults.
 Pay-per-token models (`openai/*`) require `GROK_BUILD_ALLOW_PAY_PER_TOKEN=1`.
 
-### `/grok-build:critique`
+### `/turbo-build-plugin:critique`
 
 Same target selection as review, with a design/risk critique prompt and structured JSON output when possible:
 
 ```text
-/grok-build:critique --wait
-/grok-build:critique --base main challenge whether this was the right caching and retry design
-/grok-build:critique --wait --model grok-build --effort high focus on failure modes
+/turbo-build-plugin:critique --wait
+/turbo-build-plugin:critique --base main challenge whether this was the right caching and retry design
+/turbo-build-plugin:critique --wait --model grok-build --effort high focus on failure modes
 ```
 
 Optional: same `--model` / `--effort` flags as review.
 
-### `/grok-build:delegate`
+### `/turbo-build-plugin:delegate`
 
-Delegate investigation or implementation to Grok via the `grok-build:grok-delegate` subagent:
+Delegate investigation or implementation to Grok via the `turbo-build-plugin:turbo-delegate` subagent:
 
 ```text
-/grok-build:delegate investigate the flaky test in auth
-/grok-build:delegate --resume apply the top fix
-/grok-build:delegate --model grok-build --effort high fix the race
+/turbo-build-plugin:delegate investigate the flaky test in auth
+/turbo-build-plugin:delegate --resume apply the top fix
+/turbo-build-plugin:delegate --model grok-build --effort high fix the race
 ```
 
 Write policy layering:
@@ -111,7 +107,7 @@ Write policy layering:
 - Direct `node …/grok-bridge.mjs run "…"` is therefore read-only unless `--write` is passed.
 - `--resume` / `--resume-last` continues the last stored Grok session id via `<cli> -r <id>` (resolved binary, usually `turbo`).
 - Prefer bridge `--background` for long work so runs record both `bridgePid` (Node worker) and `agentPid` (grok child).
-- `/grok-build:stop` terminates **both** process trees when present (agent then bridge/worker).
+- `/turbo-build-plugin:stop` terminates **both** process trees when present (agent then bridge/worker).
 - If you do not pass `--model` or `--effort`, Grok chooses its own defaults.
 
 #### Pre-agent verify baseline
@@ -138,50 +134,50 @@ If a background worker ever does die, it now says why: its interpreter output is
 `<state-dir>/jobs/<run-id>.worker.err`, and the run's `errorMessage` carries the tail of it
 rather than only "Run abandoned; process exited without a terminal claim."
 
-### `/grok-build:import`
+### `/turbo-build-plugin:import`
 
 Import the current Claude transcript into Grok:
 
 ```text
-/grok-build:import
-/grok-build:import --source ~/.claude/projects/.../session.jsonl
+/turbo-build-plugin:import
+/turbo-build-plugin:import --source ~/.claude/projects/.../session.jsonl
 ```
 
 Uses `<cli> import` and prints a resume hint: `<cli> -r <id>` (resolved binary, usually `turbo`).
 
-### `/grok-build:runs`
+### `/turbo-build-plugin:runs`
 
 List active and recent plugin-owned runs:
 
 ```text
-/grok-build:runs
-/grok-build:runs <run-id> --wait
-/grok-build:runs --json
+/turbo-build-plugin:runs
+/turbo-build-plugin:runs <run-id> --wait
+/turbo-build-plugin:runs --json
 ```
 
 `runs --json` emits **schemaVersion 2** (`runs[]` with usage, isolation, stopReason,
 toolCallCount, etc.). The legacy top-level keys `running`, `latestFinished`, and `recent`
 are still present for one minor version (also under `compat`); prefer `runs` + `compat`.
 
-### `/grok-build:show`
+### `/turbo-build-plugin:show`
 
 Show stored output for a finished run:
 
 ```text
-/grok-build:show
-/grok-build:show <run-id>
+/turbo-build-plugin:show
+/turbo-build-plugin:show <run-id>
 ```
 
 Every show result ends with a machine-readable `===BRIDGE-RESULT===` trailer (status,
 isolation, usage, land hint).
 
-### `/grok-build:stop`
+### `/turbo-build-plugin:stop`
 
 Stop an active run by terminating tracked process trees:
 
 ```text
-/grok-build:stop
-/grok-build:stop <run-id>
+/turbo-build-plugin:stop
+/turbo-build-plugin:stop <run-id>
 ```
 
 Kills every distinct pid among `agentPid` (detached grok child) and `bridgePid` / legacy `companionPid` / legacy `pid` (bridge or run-worker). Terminal status is claimed under a locked CAS so a finishing worker cannot overwrite `cancelled` with `completed`.
@@ -205,6 +201,10 @@ Kills every distinct pid among `agentPid` (detached grok child) and `bridgePid` 
 
 State fallback when `CLAUDE_PLUGIN_DATA` is unset: `$TMPDIR/grok-cc-runs`.
 
+## Release notes (0.7.0)
+
+Independent rebrand: plugin id `turbo-build-plugin`, marketplace `turbo-build`, commands `/turbo-build-plugin:*`. GitHub repo is [danmsheets-dev/turbo-build-plugin](https://github.com/danmsheets-dev/turbo-build-plugin). Isolated worktree branches are `turbo-build/<run-id>`.
+
 ## Release notes (0.6.9)
 
 Plugin temps nest under `%TEMP%/grok/plugin-tests`. Land ignores `.grok-subagent-live` / `.grok/` when `allowed_paths` is set. Git invocations force `shell: false` (Windows ref injection).
@@ -224,7 +224,7 @@ Harness hardening for Turbo Grok Build 1.0:
 - CLI identity via `version --json`; deny/allow prefixes from `permissionToolPrefixes` when advertised
 - Windows headless passes `--job-object` by default
 
-See [`plugins/grok-build/README.md`](plugins/grok-build/README.md) for the full changelog.
+See [`plugins/turbo-build-plugin/README.md`](plugins/turbo-build-plugin/README.md) for the full changelog.
 
 ## Development
 

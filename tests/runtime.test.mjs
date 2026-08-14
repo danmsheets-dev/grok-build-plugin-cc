@@ -15,11 +15,11 @@ import {
   resolveStateDir,
   upsertJob,
   writeJobFile
-} from "../plugins/grok-build/scripts/lib/state.mjs";
-import { buildSingleJobSnapshot, buildStatusSnapshot, readStoredJob } from "../plugins/grok-build/scripts/lib/job-control.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/state.mjs";
+import { buildSingleJobSnapshot, buildStatusSnapshot, readStoredJob } from "../plugins/turbo-build-plugin/scripts/lib/job-control.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PLUGIN_ROOT = path.join(ROOT, "plugins", "grok-build");
+const PLUGIN_ROOT = path.join(ROOT, "plugins", "turbo-build-plugin");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "grok-bridge.mjs");
 
 function pluginDataEnv(pluginDataDir, binDir, extra = {}) {
@@ -539,7 +539,7 @@ test("stop terminates a tracked sleeper process and marks run cancelled", () => 
 });
 
 test("enqueueBackgroundJob writes the job file before spawning the worker", async () => {
-  const { enqueueBackgroundJob } = await import("../plugins/grok-build/scripts/grok-bridge.mjs");
+  const { enqueueBackgroundJob } = await import("../plugins/turbo-build-plugin/scripts/grok-bridge.mjs");
   const repo = makeTempDir();
   const pluginDataDir = makeTempDir();
   const previous = process.env.CLAUDE_PLUGIN_DATA;
@@ -605,7 +605,7 @@ function readStoredJobFromDisk(workspaceRoot, jobId) {
 // sensitive word in the middle of the name. It must also stop over-matching
 // names that merely end in the same letters (NODEJS_COMPAT, MONKEY).
 test("redactEnvForRecord catches signing-credential key spellings without over-matching lookalikes", async () => {
-  const { redactEnvForRecord } = await import("../plugins/grok-build/scripts/grok-bridge.mjs");
+  const { redactEnvForRecord } = await import("../plugins/turbo-build-plugin/scripts/grok-bridge.mjs");
 
   const shouldRedact = [
     "KEYSTORE_PASS",
@@ -648,7 +648,7 @@ test("redactEnvForRecord catches signing-credential key spellings without over-m
 // all reachable from `runs --json` / `show --json`, which echo straight back
 // into the Claude Code transcript.
 test("a signing-credential --env value is redacted in the shared index but intact in the job file", async () => {
-  const { enqueueBackgroundJob } = await import("../plugins/grok-build/scripts/grok-bridge.mjs");
+  const { enqueueBackgroundJob } = await import("../plugins/turbo-build-plugin/scripts/grok-bridge.mjs");
   const repo = makeTempDir();
   const pluginDataDir = makeTempDir();
   const previous = process.env.CLAUDE_PLUGIN_DATA;

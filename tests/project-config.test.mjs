@@ -18,7 +18,7 @@ import {
   revokeProjectConfigTrust,
   AUTO_VERIFY_TRUST_STATE_KEY,
   TRUST_STATE_KEY
-} from "../plugins/grok-build/scripts/lib/project-config.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/project-config.mjs";
 import { makeTempDir } from "./helpers.mjs";
 
 /**

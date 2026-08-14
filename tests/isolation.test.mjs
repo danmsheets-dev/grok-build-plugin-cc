@@ -12,19 +12,19 @@ import {
   normalizePathForPermissionRule,
   pathIsInsideOrEqual,
   worktreeContainsSegment
-} from "../plugins/grok-build/scripts/lib/grok.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/grok.mjs";
 import {
   classifyJobLiveness,
   reconcileAbandonedJob,
   shouldReconcileAbandoned
-} from "../plugins/grok-build/scripts/lib/job-control.mjs";
-import { resolveIsolateSetting } from "../plugins/grok-build/scripts/lib/project-config.mjs";
-import { terminateProcessTree } from "../plugins/grok-build/scripts/lib/process.mjs";
-import { decideCompletionStatus } from "../plugins/grok-build/scripts/lib/tracked-jobs.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/job-control.mjs";
+import { resolveIsolateSetting } from "../plugins/turbo-build-plugin/scripts/lib/project-config.mjs";
+import { terminateProcessTree } from "../plugins/turbo-build-plugin/scripts/lib/process.mjs";
+import { decideCompletionStatus } from "../plugins/turbo-build-plugin/scripts/lib/tracked-jobs.mjs";
 import {
   allowNoIsolateFromEnv,
   detectCaller
-} from "../plugins/grok-build/scripts/lib/workspace.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/workspace.mjs";
 import {
   collectWorktreeReparsePaths,
   createWorktree,
@@ -35,12 +35,12 @@ import {
   resolveWorktreePath,
   shortWorktreeId,
   toWin32LongPath
-} from "../plugins/grok-build/scripts/lib/worktree.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/worktree.mjs";
 import {
   formatIsolationHeaderLine,
   loadRunRules,
   runHeadlessAgentWithDurationBudget
-} from "../plugins/grok-build/scripts/grok-bridge.mjs";
+} from "../plugins/turbo-build-plugin/scripts/grok-bridge.mjs";
 import { buildEnv, installFakeGrok } from "./fake-grok-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import {
@@ -52,10 +52,10 @@ import {
   resolveStateDir,
   upsertJob,
   writeJobFile
-} from "../plugins/grok-build/scripts/lib/state.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const PLUGIN_ROOT = path.join(ROOT, "plugins", "grok-build");
+const PLUGIN_ROOT = path.join(ROOT, "plugins", "turbo-build-plugin");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "grok-bridge.mjs");
 
 function pluginDataEnv(pluginDataDir, binDir, extra = {}) {
@@ -198,7 +198,7 @@ test("formatIsolationHeaderLine names ACTIVE/INACTIVE and source", () => {
     formatIsolationHeaderLine({
       active: true,
       worktreePath: "/wt",
-      branch: "grok-build/r1",
+      branch: "turbo-build/r1",
       baseSha: "abcdef123456",
       source: "forced-programmatic"
     }),

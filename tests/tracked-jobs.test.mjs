@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createJobProgressUpdater } from "../plugins/grok-build/scripts/lib/tracked-jobs.mjs";
+import { createJobProgressUpdater } from "../plugins/turbo-build-plugin/scripts/lib/tracked-jobs.mjs";
 
 /**
  * A controllable clock plus a patch spy. Deliberately not node:test's

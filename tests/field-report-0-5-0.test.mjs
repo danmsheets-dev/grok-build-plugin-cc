@@ -13,15 +13,15 @@ import {
   promptForbidsEdits,
   readWorkerCrashDetail,
   resolveWorkerCrashLog
-} from "../plugins/grok-build/scripts/grok-bridge.mjs";
-import { ensureHomeEnv, resetHomeEnvDefaultForTests } from "../plugins/grok-build/scripts/lib/grok.mjs";
-import { reconcileAbandonedJob } from "../plugins/grok-build/scripts/lib/job-control.mjs";
-import { probeBaselines } from "../plugins/grok-build/scripts/lib/verify.mjs";
+} from "../plugins/turbo-build-plugin/scripts/grok-bridge.mjs";
+import { ensureHomeEnv, resetHomeEnvDefaultForTests } from "../plugins/turbo-build-plugin/scripts/lib/grok.mjs";
+import { reconcileAbandonedJob } from "../plugins/turbo-build-plugin/scripts/lib/job-control.mjs";
+import { probeBaselines } from "../plugins/turbo-build-plugin/scripts/lib/verify.mjs";
 import {
   checkUidIntegrity,
   collectImportedUidTokens,
   snapshotUidFiles
-} from "../plugins/grok-build/scripts/lib/engine-runtime.mjs";
+} from "../plugins/turbo-build-plugin/scripts/lib/engine-runtime.mjs";
 
 // ---------------------------------------------------------------------------
 // B: "HOME not set on Windows tool shells"
