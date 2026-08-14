@@ -85,11 +85,19 @@ export function isHyperBinaryName(binary) {
     return false;
   }
   const base = path.basename(raw).toLowerCase();
-  return base === "hyper" || base === "hyper.exe";
+  return (
+    base === "hyper" ||
+    base === "hyper.exe" ||
+    base === "hyper.cmd" ||
+    base === "hyper.bat" ||
+    base === "hyper.ps1"
+  );
 }
 
 // Per-process cache: agent-CLI identity probes (C1). Tests inject a fresh Map.
 const defaultAgentCompatCache = new Map();
+// Per-process cache: full `version --json` identity (rc2+). null = probed, no card.
+const defaultCliIdentityCache = new Map();
 // Per-process cache: permission tool prefixes from `version --json` (rc2+).
 // null entry = probed, CLI did not advertise prefixes (use static fallback).
 const defaultPermissionPrefixCache = new Map();
@@ -103,11 +111,14 @@ export function looksLikeNonAgentTurboVersion(detail) {
   if (!text.trim()) {
     return false;
   }
-  if (/\bturborepo\b/.test(text)) {
+  if (/\bturborepo\b/.test(text) || /\bturbo run\b/.test(text)) {
     return true;
   }
   // Vercel turbo often prints a short "2.x.x" banner without grok/agent markers.
   if (/the build system that makes/.test(text)) {
+    return true;
+  }
+  if (/^\s*\d+\.\d+(\.\d+)?\s*$/.test(text)) {
     return true;
   }
   return false;
@@ -142,6 +153,53 @@ export function parseCliVersionIdentity(stdout) {
   }
 }
 
+/**
+ * One `version --json` probe per binary. Shared by compat, permission
+ * prefixes, confine feature, and check/doctor so a spawn does not pay
+ * three CLI round-trips.
+ *
+ * @returns {object|null}
+ */
+export function probeCliIdentity(binary, options = {}) {
+  const name = String(binary ?? "").trim();
+  if (!name) {
+    return null;
+  }
+  const cache = options.cache ?? defaultCliIdentityCache;
+  if (!options.force && cache.has(name)) {
+    return cache.get(name);
+  }
+  const runCommandImpl = options.runCommandImpl ?? runCommand;
+  let identity = null;
+  try {
+    const result = runCommandImpl(name, ["version", "--json"], {
+      env: options.env,
+      cwd: options.cwd,
+      maxBuffer: 256 * 1024
+    });
+    if (!result.error && (result.status == null || result.status === 0)) {
+      identity = parseCliVersionIdentity(result.stdout);
+    }
+  } catch {
+    identity = null;
+  }
+  cache.set(name, identity);
+  return identity;
+}
+
+/** Test seam: clear identity probe cache. */
+export function resetCliIdentityCacheForTests(cache = defaultCliIdentityCache) {
+  cache.clear();
+}
+
+export function cliIdentityFeatures(identity) {
+  const features = identity?.features;
+  if (!features || typeof features !== "object" || Array.isArray(features)) {
+    return {};
+  }
+  return features;
+}
+
 export function isAgentCompatibleBinary(binary, options = {}) {
   const name = String(binary ?? "").trim();
   if (!name) {
@@ -160,24 +218,35 @@ export function isAgentCompatibleBinary(binary, options = {}) {
   let ok = false;
   try {
     // Prefer Turbo rc2+ machine-readable identity (distinguishes Vercel Turborepo).
-    const jsonVersion = runCommandImpl(name, ["version", "--json"], runOpts);
-    if (!jsonVersion.error && (jsonVersion.status == null || jsonVersion.status === 0)) {
-      const identity = parseCliVersionIdentity(jsonVersion.stdout);
-      if (identity) {
-        // L1: agentCompatible is authoritative when present; cliFamily alone is
-        // only a positive signal when the flag is absent/undefined.
-        if (identity.agentCompatible === false) {
-          ok = false;
-          cache.set(name, ok);
-          return ok;
-        }
-        if (identity.agentCompatible === true || identity.cliFamily === "grok-build") {
-          ok = true;
-          cache.set(name, ok);
-          return ok;
-        }
-        // If JSON parsed but no identity fields (pre-rc2), fall through.
+    const identity = probeCliIdentity(name, {
+      env: options.env,
+      cwd: options.cwd,
+      runCommandImpl,
+      force: options.force
+    });
+    if (identity) {
+      if (identity.agentCompatible === false) {
+        ok = false;
+        cache.set(name, ok);
+        return ok;
       }
+      const product = String(identity.product ?? "").toLowerCase();
+      if (product && product !== "turbo-grok-build" && product !== "grok-build") {
+        ok = false;
+        cache.set(name, ok);
+        return ok;
+      }
+      if (identity.agentCompatible === true || identity.cliFamily === "grok-build") {
+        ok = true;
+        cache.set(name, ok);
+        return ok;
+      }
+    }
+
+    if (isHyperBinaryName(name)) {
+      ok = false;
+      cache.set(name, ok);
+      return ok;
     }
 
     let versionResult = runCommandImpl(name, ["version"], runOpts);
@@ -185,10 +254,11 @@ export function isAgentCompatibleBinary(binary, options = {}) {
       versionResult = runCommandImpl(name, ["--version"], runOpts);
     }
     const versionText = `${versionResult.stdout ?? ""}\n${versionResult.stderr ?? ""}`;
-    if (looksLikeNonAgentTurboVersion(versionText)) {
+    if (looksLikeNonAgentTurboVersion(versionText) || /\bhyper\b/i.test(versionText)) {
       ok = false;
-    } else if (/\b(grok|hyper)\b/i.test(versionText) && !/turborepo/i.test(versionText)) {
-      // Stock grok / Hyper / "turbo … grok" banners.
+    } else if (/\bgrok\b/i.test(versionText) && !/turborepo/i.test(versionText)) {
+      // Stock grok banner (not leftover Hyper). Still require this is not a
+      // short Vercel-style version-only line — already handled above.
       ok = true;
     } else {
       const help = runCommandImpl(name, ["--help"], runOpts);
@@ -232,10 +302,19 @@ export function resolveGrokBinary(env = process.env, options = {}) {
   const override = env?.[BINARY_ENV];
   if (override && String(override).trim()) {
     const value = String(override).trim();
-    // Drop Hyper overrides so a leftover GROK_BINARY=hyper from older docs does
-    // not keep spawning hyper.exe after Turbo became the preferred CLI.
+    // Drop Hyper overrides (including .cmd/.bat shims). Any other override
+    // must still pass the agent-compat probe unless skipAgentProbe is set.
     if (!isHyperBinaryName(value)) {
-      return value;
+      if (
+        options.skipAgentProbe ||
+        isAgentCompatibleBinary(value, {
+          env,
+          runCommandImpl: options.runCommandImpl,
+          cache: options.cache
+        })
+      ) {
+        return value;
+      }
     }
   }
   const candidates = options.candidates ?? DEFAULT_BINARY_CANDIDATES;
@@ -524,11 +603,18 @@ export function getGrokAvailability(cwd, options = {}) {
       // C3: try next candidate (e.g. grok after a Turborepo turbo).
       continue;
     }
+    const identity = probeCliIdentity(binary, {
+      env,
+      cwd,
+      runCommandImpl: options.runCommandImpl
+    });
     return {
       available: true,
       detail,
       binary,
-      brand: detectCliBrand(detail)
+      brand: detectCliBrand(detail),
+      identity,
+      features: cliIdentityFeatures(identity)
     };
   }
 
@@ -1042,20 +1128,18 @@ export function probePermissionToolPrefixes(binary, options = {}) {
   const runCommandImpl = options.runCommandImpl ?? runCommand;
   let prefixes = null;
   try {
-    const result = runCommandImpl(name, ["version", "--json"], {
+    const identity = probeCliIdentity(name, {
       env: options.env,
       cwd: options.cwd,
-      maxBuffer: 256 * 1024
+      runCommandImpl,
+      force: options.force
     });
-    if (!result.error && (result.status == null || result.status === 0)) {
-      const identity = parseCliVersionIdentity(result.stdout);
-      const raw =
-        identity?.permissionToolPrefixes ?? identity?.permission_tool_prefixes ?? null;
-      if (Array.isArray(raw) && raw.length > 0) {
-        const cleaned = raw.map((p) => String(p ?? "").trim()).filter(Boolean);
-        if (cleaned.length > 0) {
-          prefixes = cleaned;
-        }
+    const raw =
+      identity?.permissionToolPrefixes ?? identity?.permission_tool_prefixes ?? null;
+    if (Array.isArray(raw) && raw.length > 0) {
+      const cleaned = raw.map((p) => String(p ?? "").trim()).filter(Boolean);
+      if (cleaned.length > 0) {
+        prefixes = cleaned;
       }
     }
   } catch {
@@ -1330,6 +1414,15 @@ export function cliSupportsConfine(binary, options = {}) {
   let supported = false;
   let probed = false;
   try {
+    const identity = probeCliIdentity(binary, {
+      env: options.env,
+      runCommandImpl
+    });
+    const features = cliIdentityFeatures(identity);
+    if (features.confine === true) {
+      cache.set(key, true);
+      return true;
+    }
     const result = runCommandImpl(binary, ["--help"], {
       env: options.env,
       maxBuffer: 256 * 1024
@@ -1457,7 +1550,16 @@ export function buildHeadlessArgs(prompt, options = {}) {
         ? (options.platform ?? process.platform) === "win32"
         : Boolean(options.jobObject)));
   if (jobObjectOn) {
-    trailing.push("--job-object");
+    const identity = options.binary
+      ? probeCliIdentity(options.binary, {
+          env: options.env,
+          runCommandImpl: options.runCommandImpl
+        })
+      : null;
+    const features = cliIdentityFeatures(identity);
+    if (features.jobObject !== false) {
+      trailing.push("--job-object");
+    }
   }
   // Repeated --deny / --allow. Order does not matter for Hyper - a deny is
   // evaluated before --always-approve either way - but each rule is its own
@@ -1870,6 +1972,9 @@ export function runHeadlessAgent(cwd, options = {}) {
         subagents: result?.subagents ?? [],
         subagentsRollup: result?.subagentsRollup ?? null,
         compaction: result?.compaction ?? [],
+        autoContinueCount: result?.autoContinueCount ?? 0,
+        autoContinues: result?.autoContinues ?? [],
+        thoughts: result?.thoughts ?? [],
         maxTurnsReached: Boolean(result?.maxTurnsReached),
         start: result?.start ?? null,
         streamSchemaVersion: result?.streamSchemaVersion ?? null,

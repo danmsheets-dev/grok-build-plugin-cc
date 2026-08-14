@@ -19,12 +19,17 @@ const MAX_LISTED_FILES = 200;
 const DEFAULT_INLINE_DIFF_MAX_FILES = 2;
 export const DEFAULT_INLINE_DIFF_MAX_BYTES = 256 * 1024;
 
+// Git is directly executable. Repository-derived arguments (branch names,
+// refs) must never pass through a shell — shell:true on Windows concatenates
+// argv without escaping (Node DEP0190), so a ref such as `main&probe.cmd`
+// can run a tracked batch file. shell:false is applied last so callers
+// cannot re-enable the shell.
 export function git(cwd, args, options = {}) {
-  return runCommand("git", args, { cwd, ...options });
+  return runCommand("git", args, { cwd, ...options, shell: false });
 }
 
 export function gitChecked(cwd, args, options = {}) {
-  return runCommandChecked("git", args, { cwd, ...options });
+  return runCommandChecked("git", args, { cwd, ...options, shell: false });
 }
 
 function listUniqueFiles(...groups) {

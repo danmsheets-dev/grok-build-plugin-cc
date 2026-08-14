@@ -628,6 +628,8 @@ export function createStreamTranscript() {
   const warnings = [];
   const questionsSuppressed = [];
   const subagents = [];
+  const thoughts = [];
+  const autoContinues = [];
   // toolCallId → progress label for in-flight tools (phase line).
   const activeTools = new Map();
   let current = "";
@@ -851,7 +853,12 @@ export function createStreamTranscript() {
     compaction.push({
       phase: kind,
       type,
-      message: typeof event.message === "string" ? event.message : null
+      message:
+        typeof event.message === "string"
+          ? event.message
+          : typeof event.error === "string"
+            ? event.error
+            : null
     });
   }
 
@@ -897,12 +904,22 @@ export function createStreamTranscript() {
     const id = event.subagentId ?? event.subagent_id ?? null;
     const status = event.status ?? "completed";
     const existing = id != null ? subagents.find((s) => s.id === id) : null;
+    const extra = {
+      isolation: event.isolation ?? null,
+      isolationFallback: event.isolationFallback ?? event.isolation_fallback ?? null,
+      worktreePath: event.worktreePath ?? event.worktree_path ?? null,
+      worktreeState: event.worktreeState ?? event.worktree_state ?? null,
+      usage: event.usage ?? null,
+      turns: finiteOrNull(event.turns),
+      tokensUsed: finiteOrNull(event.tokensUsed ?? event.tokens_used)
+    };
     if (existing) {
       existing.status = status;
       existing.error = event.error ?? null;
       existing.terminationReason = event.terminationReason ?? event.termination_reason ?? null;
       existing.toolCalls = finiteOrNull(event.toolCalls ?? event.tool_calls);
       existing.durationMs = finiteOrNull(event.durationMs ?? event.duration_ms);
+      Object.assign(existing, extra);
     } else {
       subagents.push({
         id,
@@ -911,10 +928,43 @@ export function createStreamTranscript() {
         error: event.error ?? null,
         terminationReason: event.terminationReason ?? event.termination_reason ?? null,
         toolCalls: finiteOrNull(event.toolCalls ?? event.tool_calls),
-        durationMs: finiteOrNull(event.durationMs ?? event.duration_ms)
+        durationMs: finiteOrNull(event.durationMs ?? event.duration_ms),
+        ...extra
       });
     }
     result.phase = status === "failed" ? "subagent failed" : "subagent done";
+  }
+
+  function patchToolActivity(id, event, progress) {
+    const row =
+      (id && toolActivity.find((t) => t.id === id)) ||
+      toolActivity[toolActivity.length - 1] ||
+      null;
+    if (!row) {
+      return;
+    }
+    if (typeof event.status === "string") {
+      row.status = event.status;
+    }
+    if (progress && progress !== "tool") {
+      row.progress = progress;
+    }
+    if (event.rawInput !== undefined) {
+      row.rawInput = event.rawInput;
+    }
+    if (event.rawOutput !== undefined) {
+      row.rawOutput = event.rawOutput;
+    }
+    if (event.rawInputTruncated != null) {
+      row.rawInputTruncated = event.rawInputTruncated;
+    }
+    if (event.rawOutputTruncated != null) {
+      row.rawOutputTruncated = event.rawOutputTruncated;
+    }
+    const elapsed = finiteOrNull(event.elapsedMs ?? event.elapsed_ms);
+    if (elapsed != null) {
+      row.elapsedMs = elapsed;
+    }
   }
 
   /**
@@ -937,6 +987,7 @@ export function createStreamTranscript() {
       progress
     };
     toolActivity.push(activity);
+    patchToolActivity(id, event, progress);
     if (id) {
       activeTools.set(id, progress);
     } else {
@@ -959,6 +1010,7 @@ export function createStreamTranscript() {
     if (id) {
       activeTools.set(id, progress);
     }
+    patchToolActivity(id, event, progress);
     const status = typeof event.status === "string" ? event.status.toLowerCase() : "";
     if (status === "completed" || status === "failed") {
       if (id) {
@@ -976,6 +1028,7 @@ export function createStreamTranscript() {
     markRecognized();
     toolVocabularySeen = true;
     const id = toolKey(event);
+    patchToolActivity(id, event, describeToolProgress(event));
     if (id) {
       activeTools.delete(id);
     } else if (activeTools.size === 1) {
@@ -1043,6 +1096,9 @@ export function createStreamTranscript() {
       switch (type) {
         case "thought":
           markRecognized();
+          if (typeof event.data === "string" && event.data.trim()) {
+            thoughts.push(event.data);
+          }
           // Do not overwrite an active tool phase with "thinking" — a long tool
           // call is the thing the operator needs to see, not a stale thought.
           if (activeTools.size > 0) {
@@ -1108,6 +1164,12 @@ export function createStreamTranscript() {
         case "auto_continue_completed":
           markRecognized();
           autoContinueCount += 1;
+          autoContinues.push({
+            type,
+            reason: event.reason ?? null,
+            attempt: event.attempt ?? null,
+            totalTokens: event.total_tokens ?? event.totalTokens ?? null
+          });
           result.phase = "auto_continue";
           break;
         case "model_resolved":
@@ -1211,6 +1273,8 @@ export function createStreamTranscript() {
         modelResolved,
         filesChanged,
         autoContinueCount,
+        autoContinues: [...autoContinues],
+        thoughts: [...thoughts],
         streamSchemaVersion,
         structuredOutput,
         structuredOutputError,

@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
-import { readStdinIfPiped } from "./lib/fs.mjs";
+import { isHarnessLandPath, readStdinIfPiped } from "./lib/fs.mjs";
 import {
   collectReviewContext,
   ensureGitRepository,
@@ -300,7 +300,7 @@ function printUsage() {
       "  node scripts/grok-bridge.mjs show [run-id] [--json]",
       "  node scripts/grok-bridge.mjs wait <run-id> [--timeout <seconds>] [--json]",
       "  node scripts/grok-bridge.mjs stop [run-id] [--json]",
-      "  node scripts/grok-bridge.mjs land [run-id] [--preview|--discard] [--json]",
+      "  node scripts/grok-bridge.mjs land [run-id] [--preview|--discard] [--force] [--json]",
       "",
       "Every subcommand accepts --help / -h for its own usage."
     ].join("\n")
@@ -357,8 +357,8 @@ const SUBCOMMAND_HELP = {
     "Block until the run is terminal (or the timeout), then print the same result as show."
   ],
   land: [
-    "Usage: node scripts/grok-bridge.mjs land [run-id] [--preview|--discard] [--into-run <parent-id>] [--json]",
-    "Squash-merge a run's branch. --into-run lands a nested child into the parent's worktree."
+    "Usage: node scripts/grok-bridge.mjs land [run-id] [--preview|--discard] [--force] [--into-run <parent-id>] [--json]",
+    "Squash-merge a run's branch. --into-run lands a nested child into the parent's worktree. --force bypasses the 50-file safety cap."
   ]
 };
 
@@ -2191,6 +2191,25 @@ function buildDoctorReport(cwd, options = {}) {
       : (grok.detail || "not available"),
     fix: grok.available ? null : describeMissingBinary(grok.binary)
   });
+
+  if (grok.available) {
+    const identity = grok.identity;
+    const features = grok.features ?? {};
+    const featureBits = ["headless", "confine", "jobObject", "jsonSchema"]
+      .filter((k) => features[k] === true)
+      .join(",");
+    checks.push({
+      name: "cli identity",
+      ok: true,
+      status: identity ? "ok" : "warn",
+      detail: identity
+        ? `${identity.product ?? grok.brand?.id ?? "unknown"} ${identity.currentVersion ?? grok.detail ?? ""} agentCompatible=${identity.agentCompatible === true} features=${featureBits || "(none advertised)"}`
+        : `${grok.binary} did not advertise version --json identity (pre-rc2). Confine/deny prefix probes fall back to --help.`,
+      fix: identity
+        ? null
+        : "Upgrade Turbo Grok Build to 1.0.0-rc.2+ for machine-readable identity."
+    });
+  }
 
   const auth = getGrokAuthStatus(cwd);
   checks.push({
@@ -4221,23 +4240,36 @@ async function executeTaskRun(request) {
         ...denyPlan.rules
       ];
     }
-    // Turbo/Grok --confine when the feature switch is on (default on).
-    // C6/C9/C20: MCP out-of-tree writes are only gated by --confine. Isolated
-    // runs fail closed when confine cannot be applied (unless weak isolate).
-    if (confineFeatureEnabled(process.env)) {
+    // Isolated writes require --confine unless the operator opts into weak isolate.
+    // GROK_BUILD_CONFINE=0 is not a silent skip — it needs ALLOW_WEAK_ISOLATE=1.
+    const confineWanted = confineFeatureEnabled(process.env);
+    const allowWeakConfine =
+      String(process.env.GROK_BUILD_ALLOW_WEAK_ISOLATE ?? "").trim() === "1" ||
+      String(process.env.GROK_BUILD_ALLOW_WEAK_ISOLATE ?? "")
+        .trim()
+        .toLowerCase() === "true";
+    if (!confineWanted) {
+      const message =
+        "GROK_BUILD_CONFINE=0 disables --confine on an isolated write; MCP/HTTP and Edit/Bash are not path-jailed.";
+      if (!allowWeakConfine) {
+        throw new Error(
+          `Isolated run requires --confine. ${message} ` +
+            "Unset GROK_BUILD_CONFINE, or set GROK_BUILD_ALLOW_WEAK_ISOLATE=1."
+        );
+      }
+      request.onProgress?.({
+        message: `Warning: ${message} Continuing because GROK_BUILD_ALLOW_WEAK_ISOLATE=1.`,
+        phase: "starting"
+      });
+    } else {
       const binary = resolveGrokBinary(process.env);
       if (cliSupportsConfine(binary, { env: process.env })) {
         permissionOptions.confine = created.worktreePath;
       } else {
-        const allowWeak =
-          String(process.env.GROK_BUILD_ALLOW_WEAK_ISOLATE ?? "").trim() === "1" ||
-          String(process.env.GROK_BUILD_ALLOW_WEAK_ISOLATE ?? "")
-            .trim()
-            .toLowerCase() === "true";
         const message =
           `--confine not applied (CLI probe did not advertise --confine on \`${binary}\`); ` +
           "MCP path writes would not be path-jailed.";
-        if (!allowWeak) {
+        if (!allowWeakConfine) {
           throw new Error(
             `Isolated run requires --confine. ${message} ` +
               "Use a Turbo/Grok agent CLI that supports --confine, or set GROK_BUILD_ALLOW_WEAK_ISOLATE=1."
@@ -4317,6 +4349,27 @@ async function executeTaskRun(request) {
     durationKillOptions
   );
   let result = firstAgent.result;
+  if (created && permissionOptions.confine) {
+    const start = result?.start;
+    // Only fail-closed when Turbo actually emitted a start card (schemaVersion
+    // set) with confineRoot omitted. Fake/pre-rc2 streams have no start event.
+    if (start && start.schemaVersion != null && !start.confineRoot) {
+      const allowWeak =
+        String(process.env.GROK_BUILD_ALLOW_WEAK_ISOLATE ?? "").trim() === "1" ||
+        String(process.env.GROK_BUILD_ALLOW_WEAK_ISOLATE ?? "")
+          .trim()
+          .toLowerCase() === "true";
+      const message =
+        "Isolated run advertised --confine but Turbo start.confineRoot is missing; the process is not path-jailed.";
+      if (!allowWeak) {
+        throw new Error(`${message} Set GROK_BUILD_ALLOW_WEAK_ISOLATE=1 to accept weaker isolation.`);
+      }
+      request.onProgress?.({
+        phase: "starting",
+        message: `Warning: ${message} Continuing because GROK_BUILD_ALLOW_WEAK_ISOLATE=1.`
+      });
+    }
+  }
   if (firstAgent.termination?.treeOutlivedKill) {
     request.onProgress?.({
       phase: "finalizing",
@@ -6695,6 +6748,10 @@ async function handleNestRun(argv) {
     [NEST_DEPTH_ENV]: String(childDepth),
     [PARENT_RUN_ID_ENV]: parentRunId
   };
+  // Sibling worktree is outside the parent confine root. Inherited
+  // GROK_CONFINE would refuse to widen and deny every child write.
+  delete childEnv.GROK_CONFINE;
+  delete childEnv.GROK_CONFINE_INHERIT;
 
   if (options.background) {
     ensureGrokAvailable(cwd);
@@ -7044,7 +7101,7 @@ function markJobLanded(workspaceRoot, jobId, storedJob, action) {
 async function handleLand(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd", "into-run"],
-    booleanOptions: ["json", "discard", "preview"]
+    booleanOptions: ["json", "discard", "preview", "force"]
   });
 
   const cwd = resolveCommandCwd(options);
@@ -7148,13 +7205,55 @@ async function handleLand(argv) {
       "--name-only",
       `${baseSha || "HEAD"}...${branchName}`
     ]);
+    if (childFilesRaw.status !== 0) {
+      throw new Error(
+        `land refused: cannot enumerate child files for ${job.id}: ${(childFilesRaw.stderr || childFilesRaw.stdout || "").trim()}`
+      );
+    }
     const childFiles = new Set(
       String(childFilesRaw.stdout || "")
         .split(/\r?\n/)
         .map((line) => line.trim())
         .filter(Boolean)
     );
-    const overlapping = parentDirtyFiles.filter((file) => childFiles.has(file));
+    const fold = process.platform === "win32"
+      ? (p) => String(p).replace(/\\/g, "/").toLowerCase()
+      : (p) => String(p).replace(/\\/g, "/");
+    const childFolded = new Set([...childFiles].map(fold));
+    const overlapping = parentDirtyFiles.filter((file) => childFolded.has(fold(file)));
+    const allowed = storedJob.allowedPaths ?? storedJob.allowed_paths ?? worktree.allowedPaths ?? null;
+    if (Array.isArray(allowed) && allowed.length > 0) {
+      const prefixes = allowed.map((p) => fold(String(p).replace(/\/+$/, "")));
+      const outside = [...childFiles].filter((file) => {
+        if (isHarnessLandPath(file)) {
+          return false;
+        }
+        const n = fold(file);
+        return !prefixes.some((pre) => n === pre || n.startsWith(`${pre}/`));
+      });
+      if (outside.length > 0) {
+        throw new Error(
+          `land refused: ${outside.length} path(s) outside allowed_paths (${outside.slice(0, 8).join(", ")}).`
+        );
+      }
+    }
+    if (childFiles.size > 50 && !options.force) {
+      throw new Error(
+        `land refused: ${childFiles.size} files exceeds the 50-file safety limit. Pass --force to land anyway.`
+      );
+    }
+    if (options.preview) {
+      const payload = {
+        landed: false,
+        preview: true,
+        jobId: job.id,
+        parentRunId: intoRunId,
+        childFiles: [...childFiles],
+        parentDirtyFiles
+      };
+      outputCommandResult(payload, `Preview only: ${childFiles.size} file(s) would land into ${intoRunId}.\n`, options.json);
+      return;
+    }
     if (overlapping.length > 0) {
       const payload = {
         landed: false,
@@ -7335,6 +7434,34 @@ async function handleLand(argv) {
   // Deliberately no cat-file/LFS size accounting: an LFS pointer's own
   // `version`/`oid`/`size` lines are already printed verbatim in the diff body.
   const totalBinaryFiles = countBinaryDiffFiles(repoRoot, diffRange);
+  const landNames = gitChecked(repoRoot, ["diff", "--name-only", diffRange])
+    .stdout.split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const allowedTop = storedJob.allowedPaths ?? storedJob.allowed_paths ?? worktree.allowedPaths ?? null;
+  if (Array.isArray(allowedTop) && allowedTop.length > 0) {
+    const fold = process.platform === "win32"
+      ? (p) => String(p).replace(/\\/g, "/").toLowerCase()
+      : (p) => String(p).replace(/\\/g, "/");
+    const prefixes = allowedTop.map((p) => fold(String(p).replace(/\/+$/, "")));
+    const outside = landNames.filter((file) => {
+      if (isHarnessLandPath(file)) {
+        return false;
+      }
+      const n = fold(file);
+      return !prefixes.some((pre) => n === pre || n.startsWith(`${pre}/`));
+    });
+    if (outside.length > 0) {
+      throw new Error(
+        `land refused: ${outside.length} path(s) outside allowed_paths (${outside.slice(0, 8).join(", ")}).`
+      );
+    }
+  }
+  if (landNames.length > 50 && !options.force && !options.discard) {
+    throw new Error(
+      `land refused: ${landNames.length} files exceeds the 50-file safety limit. Pass --force to land anyway.`
+    );
+  }
 
   // Preview is read-only: show what would land without merging or removing.
   if (options.preview) {

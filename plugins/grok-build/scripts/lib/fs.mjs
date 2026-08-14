@@ -6,8 +6,29 @@ export function ensureAbsolutePath(cwd, maybePath) {
   return path.isAbsolute(maybePath) ? maybePath : path.resolve(cwd, maybePath);
 }
 
-export function createTempDir(prefix = "grok-build-plugin-") {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+/** Official harness temp root (`%TEMP%/grok/...`) so turbo disk temp-grok can reclaim. */
+export function harnessTempRoot(...parts) {
+  const root = path.join(os.tmpdir(), "grok", ...parts);
+  fs.mkdirSync(root, { recursive: true });
+  return root;
+}
+
+export function createTempDir(prefix = "t-") {
+  return fs.mkdtempSync(path.join(harnessTempRoot("plugin-tests"), prefix));
+}
+
+/** Isolation harness files — never payload for land / allowed_paths. */
+export function isHarnessLandPath(rel) {
+  const n = String(rel || "")
+    .replace(/\\/g, "/")
+    .replace(/^\.\//, "");
+  return (
+    n === ".grok-subagent-live" ||
+    n === ".grok" ||
+    n.startsWith(".grok/") ||
+    n === ".grok-restore" ||
+    n.startsWith(".grok-restore/")
+  );
 }
 
 export function readJsonFile(filePath) {

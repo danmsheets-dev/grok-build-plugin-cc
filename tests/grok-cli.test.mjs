@@ -28,7 +28,9 @@ import {
   parsePermissionRulePrefix,
   parseStructuredOutput,
   pickAvailabilityFailureDetail,
+  probeCliIdentity,
   probePermissionToolPrefixes,
+  resetCliIdentityCacheForTests,
   READ_ONLY_DENY_RULES,
   resetAgentCompatCacheForTests,
   resetPermissionPrefixCacheForTests,
@@ -41,8 +43,9 @@ import {
 import { runCommand } from "../plugins/grok-build/scripts/lib/process.mjs";
 
 test("resolveGrokBinary prefers GROK_BINARY override", () => {
-  assert.equal(resolveGrokBinary({ GROK_BINARY: "/custom/grok" }), "/custom/grok");
-  assert.equal(resolveGrokBinary({ GROK_BINARY: "turbo" }), "turbo");
+  const skip = { skipAgentProbe: true };
+  assert.equal(resolveGrokBinary({ GROK_BINARY: "/custom/grok" }, skip), "/custom/grok");
+  assert.equal(resolveGrokBinary({ GROK_BINARY: "turbo" }, skip), "turbo");
 });
 
 test("resolveGrokBinary prefers turbo over grok and never selects hyper", () => {
@@ -92,6 +95,7 @@ test("resolveGrokBinary prefers turbo over grok and never selects hyper", () => 
 
 test("isAgentCompatibleBinary rejects turborepo-shaped version banners (C1)", () => {
   assert.equal(looksLikeNonAgentTurboVersion("turborepo 2.5.4"), true);
+  assert.equal(looksLikeNonAgentTurboVersion("2.5.4"), true);
   assert.equal(looksLikeNonAgentTurboVersion("grok 0.2.83"), false);
   assert.equal(looksLikeNonAgentTurboVersion("turbo 1.0.0-rc.1 (abc)"), false);
 
@@ -447,6 +451,40 @@ test("filterPermissionRulesForCli keeps NotebookEdit/MultiEdit aliases and drops
   assert.ok(args.includes("NotebookEdit(**)"));
   assert.ok(args.includes("MultiEdit(**)"));
   assert.ok(!args.includes("search_replace(**)"));
+});
+
+test("probeCliIdentity caches version --json", () => {
+  resetCliIdentityCacheForTests();
+  const identityCache = new Map();
+  let calls = 0;
+  const runCommandImpl = (bin, args) => {
+    calls += 1;
+    assert.equal(bin, "fake-turbo");
+    assert.deepEqual(args, ["version", "--json"]);
+    return {
+      status: 0,
+      stdout: JSON.stringify({
+        currentVersion: "1.0.0-rc.2",
+        product: "turbo-grok-build",
+        agentCompatible: true,
+        features: { confine: true, jobObject: true },
+        permissionToolPrefixes: ["Edit", "Write", "Bash"]
+      }),
+      stderr: "",
+      error: null
+    };
+  };
+  const identity = probeCliIdentity("fake-turbo", { cache: identityCache, runCommandImpl });
+  assert.equal(identity.product, "turbo-grok-build");
+  assert.equal(identity.agentCompatible, true);
+  const again = probeCliIdentity("fake-turbo", {
+    cache: identityCache,
+    runCommandImpl: () => {
+      throw new Error("should use identity cache");
+    }
+  });
+  assert.equal(again.currentVersion, "1.0.0-rc.2");
+  assert.equal(calls, 1);
 });
 
 test("probePermissionToolPrefixes reads version --json permissionToolPrefixes", () => {

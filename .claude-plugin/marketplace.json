@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "Grok Build ↔ Claude Code bridge plugins for review, critique, and delegation.",
-    "version": "0.6.7"
+    "version": "0.6.9"
   },
   "plugins": [
     {
       "name": "grok-build",
       "description": "Grok Build ↔ Claude Code bridge for review, critique, and delegation.",
-      "version": "0.6.7",
+      "version": "0.6.9",
       "author": {
         "name": "xAI"
       },

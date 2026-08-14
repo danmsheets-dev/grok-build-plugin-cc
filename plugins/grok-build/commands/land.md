@@ -1,6 +1,6 @@
 ---
 description: Review an isolated delegate run's diff, then merge it into your working tree or discard it
-argument-hint: '[run-id] [--discard]'
+argument-hint: '[run-id] [--discard] [--force]'
 disable-model-invocation: true
 allowed-tools: Bash(node:*), Bash(git:*), AskUserQuestion
 ---
@@ -58,3 +58,7 @@ Notes:
   edited the working tree directly and has nothing to land.
 - Always pass `--preview` for the first read-only step. Without it, `land` performs the
   squash-merge immediately.
+- Land refuses more than 50 files. If the user asked to land a large isolated run,
+  add `--force` on the apply step only (never on `--preview`).
+- Isolation harness paths (`.grok-subagent-live`, `.grok/`) are ignored; they are
+  not payload.

@@ -58,6 +58,11 @@ export function runCommand(command, args = [], options = {}) {
     ...(options.maxBuffer === undefined ? {} : { maxBuffer: options.maxBuffer }),
     stdio: options.stdio ?? "pipe",
     windowsHide: true,
+    // Default off. Windows .cmd/.bat go through resolveSpawnInvocation (cmd.exe
+    // /d /s /c with a quoted line), not spawnSync shell:true. Callers that pass
+    // repository-derived argv (especially git refs) must keep this false —
+    // see git.mjs — so shell metacharacters are not expanded.
+    shell: options.shell ?? false,
     // Confirmed dead without this: a 300ms timeout let a 4-second command run
     // to completion, timedOut:false. Any verify command that hangs - a stuck
     // cargo test, pytest, npm test, or Godot headless check - wedged the
@@ -679,6 +684,9 @@ export function terminateProcessTree(pid, options = {}) {
     const methods = [];
     const errorParts = [];
     let lastResult = null;
+    // Snapshot the tree before taskkill. Once the root is dead, CIM parent
+    // queries no longer see reparented grandchildren.
+    const preKillDescendants = listWin32DescendantPidsLeafFirst(pid, runCommandImpl, options);
 
     const recordError = (text) => {
       const trimmed = String(text ?? "").trim();
@@ -738,7 +746,11 @@ export function terminateProcessTree(pid, options = {}) {
     }
 
     sleepMs(settleMs);
-    if (!isAliveImpl(pid)) {
+    const stillLiveKids = (preKillDescendants.length > 0
+      ? preKillDescendants
+      : listWin32DescendantPidsLeafFirst(pid, runCommandImpl, options)
+    ).filter((childPid) => isAliveImpl(childPid));
+    if (!isAliveImpl(pid) && stillLiveKids.length === 0) {
       return {
         attempted: true,
         delivered: true,
@@ -771,7 +783,11 @@ export function terminateProcessTree(pid, options = {}) {
     }
 
     sleepMs(settleMs);
-    if (!isAliveImpl(pid)) {
+    const stillLiveKidsAfterStop = (preKillDescendants.length > 0
+      ? preKillDescendants
+      : listWin32DescendantPidsLeafFirst(pid, runCommandImpl, options)
+    ).filter((childPid) => isAliveImpl(childPid));
+    if (!isAliveImpl(pid) && stillLiveKidsAfterStop.length === 0) {
       return {
         attempted: true,
         delivered: true,
@@ -784,7 +800,9 @@ export function terminateProcessTree(pid, options = {}) {
     // 3) Enumerate descendants leaf-first and Stop-Process each one. taskkill
     // /T sometimes cannot terminate a child ("operation not supported");
     // killing leaves first is the remaining lever.
-    const descendants = listWin32DescendantPidsLeafFirst(pid, runCommandImpl, options);
+    const descendants = stillLiveKidsAfterStop.length > 0
+      ? stillLiveKidsAfterStop
+      : listWin32DescendantPidsLeafFirst(pid, runCommandImpl, options);
     if (descendants.length > 0) {
       methods.push("cim-leaf");
       for (const childPid of descendants) {

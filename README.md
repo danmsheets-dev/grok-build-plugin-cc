@@ -2,7 +2,7 @@
 
 Bridge [Grok Build](https://x.ai) / **Turbo Grok Build** into Claude Code for review, critique, delegation, and session import.
 
-**Current plugin version: `0.6.7`.** Full isolation guarantees, verify semantics, and changelog live in [`plugins/grok-build/README.md`](plugins/grok-build/README.md).
+**Current plugin version: `0.6.9`.** Full isolation guarantees, verify semantics, and changelog live in [`plugins/grok-build/README.md`](plugins/grok-build/README.md).
 
 This repository is a Claude Code marketplace plugin that shells out to a real agent CLI (`turbo` preferred, then `grok`). Run status, results, and stop are owned by the plugin (PID + log files). There is no app-server broker.
 
@@ -14,7 +14,21 @@ This repository is a Claude Code marketplace plugin that shells out to a real ag
   - The bridge probes identity and filters unknown `--deny` / `--allow` prefixes so older CLIs do not hard-abort
 - A logged-in session (`turbo models` / `grok models` succeeds; some forks exit non-zero on a successful listing — the bridge treats a model list as success)
 
-## Local install
+## Install
+
+### GitHub marketplace (release)
+
+This fork ships the **0.6.9** Turbo-ready plugin. In Claude Code:
+
+```bash
+/plugin marketplace add danmsheets-dev/grok-build-plugin-cc
+/plugin install grok-build@xai-grok-build
+/reload-plugins
+```
+
+The upstream [xai-org/grok-build-plugin-cc](https://github.com/xai-org/grok-build-plugin-cc) marketplace is the original 0.2.x line.
+
+### Local install (from a clone)
 
 From this repository root (path must be absolute):
 
@@ -179,6 +193,7 @@ Kills every distinct pid among `agentPid` (detached grok child) and `bridgePid` 
 | `GROK_BINARY` | Optional override for the CLI executable (default resolution: `turbo`, then `grok`; Hyper overrides are ignored) |
 | `GROK_BUILD_JOB_OBJECT` | Windows: set to `0`/`false` to skip passing `--job-object` on headless spawns (default: on for `win32`) |
 | `GROK_BUILD_ALLOW_WEAK_ISOLATE` | Set to `1` to allow isolated write runs when the CLI does not advertise `--confine` (default: refuse) |
+| `GROK_BUILD_CONFINE` | Set to `0`/`false` to skip `--confine`. Isolated writes then require `GROK_BUILD_ALLOW_WEAK_ISOLATE=1` |
 | `GROK_BUILD_ALLOW_PAY_PER_TOKEN` | Set to `1` to allow `openai/*` pay-per-token models |
 | `GROK_CC_SESSION_ID` | Claude session id (set by SessionStart hook) |
 | `GROK_CC_TRANSCRIPT_PATH` | Claude transcript path (set by SessionStart hook) |
@@ -189,6 +204,14 @@ Kills every distinct pid among `agentPid` (detached grok child) and `bridgePid` 
 | `HOME` / `GROK_HOME` | Where the CLI keeps config, credentials and sessions. On Windows the bridge defaults both to `%USERPROFILE%` when neither is set; an explicit value is never overwritten. |
 
 State fallback when `CLAUDE_PLUGIN_DATA` is unset: `$TMPDIR/grok-cc-runs`.
+
+## Release notes (0.6.9)
+
+Plugin temps nest under `%TEMP%/grok/plugin-tests`. Land ignores `.grok-subagent-live` / `.grok/` when `allowed_paths` is set. Git invocations force `shell: false` (Windows ref injection).
+
+## Release notes (0.6.8)
+
+One `turbo version --json` identity probe per process: check/doctor print product + features, confine/job-object/deny prefixes share the card.
 
 ## Release notes (0.6.7)
 

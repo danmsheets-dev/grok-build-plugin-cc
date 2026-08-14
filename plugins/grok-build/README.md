@@ -4,9 +4,10 @@ Delegate coding work, reviews, and critiques to the real `grok` CLI from inside 
 
 ## What isolation does and does not guarantee
 
-**As of 0.3.2, write runs are isolated.** A delegate run started with `--write` executes
-in its own git worktree on a `grok-build/<run-id>` branch, outside your repository.
-Nothing reaches your working tree until you run `/grok-build:land`, which shows you the
+**Write runs are isolated (since 0.3.2; current release 0.6.9).** A delegate run
+started with `--write` executes in its own git worktree on a `grok-build/<run-id>`
+branch, outside your repository. Nothing reaches your working tree until you run
+`/grok-build:land`, which shows you the
 diff first and refuses to merge into a dirty tree.
 
 What isolation **does** guarantee:
@@ -63,6 +64,10 @@ and pick a side per file.
 `/grok-build:land <id> --preview` prints the stat, a `Total: N binary file(s)` count,
 and the diff itself — up to 128 KB. Past that the diff is omitted with the exact
 `git diff` command to run, because a 300 KB diff in a terminal is not a review.
+
+Land refuses more than 50 files unless you pass `--force`. Paths outside a run's
+`allowed_paths` (when set) are refused. Isolation harness files
+(`.grok-subagent-live`, `.grok/`, `.grok-restore/`) are not treated as payload.
 
 The bridge is read-only by default. `--write` is opt-in at the CLI, but the
 `grok-build:grok-delegate` subagent adds `--write` by policy, so `/grok-build:delegate`
@@ -320,6 +325,36 @@ A run also reports what it did to the disk and how it was captured:
   truncated response looks like. If the CLI streams event types this bridge does not know, they are
   named, and if *nothing* in the stream was recognized the raw stdout is shown (last 200 lines)
   under an explicit `showing raw stdout` note rather than being silently discarded.
+
+## Changelog (0.6.9)
+
+- **Temp nest:** `createTempDir` / test `makeTempDir` write under
+  `%TEMP%/grok/plugin-tests` so `turbo disk clean --include temp-grok`
+  can reclaim leaks. Nest prompts go under `%TEMP%/grok/plugin-prompts`.
+- **Land harness:** `.grok-subagent-live` and `.grok/` are ignored by
+  `allowed_paths` checks and are not treated as payload.
+- **Git argv (EXSECRE-1190):** `git` / `gitChecked` force `shell: false` so a
+  ref like `main&probe.cmd` cannot run a tracked batch file on Windows.
+
+## Changelog (0.6.8)
+
+- **One identity probe:** `probeCliIdentity` caches `turbo version --json` and
+  drives agent-compat, `permissionToolPrefixes`, confine support, and
+  `--job-object` (skip when the card says `jobObject: false`).
+- **check / doctor** surface product, version, `agentCompatible`, and
+  advertised features so a pre-rc2 CLI is obvious.
+- **Fail-closed CLI selection:** `GROK_BINARY` is probed (Hyper `.cmd`/`.bat`
+  rejected); short Vercel `2.x.x` banners are not agent-compatible; leftover
+  Hyper banners no longer fail-open.
+- **Streaming honesty:** tool_result I/O, subagent isolation/spend, thoughts,
+  auto_continue reason, and `auto_compact_failed.error` are persisted.
+- **Isolation:** nest prompts write to temp (not the main checkout);
+  nest children unset inherited `GROK_CONFINE`; `GROK_BUILD_CONFINE=0` and
+  missing `start.confineRoot` require `GROK_BUILD_ALLOW_WEAK_ISOLATE=1`.
+- **Stop / land:** descendant snapshot before declaring stop success;
+  PATHEXT on absolute Windows paths; `--into-run --preview` is read-only;
+  land honors `allowed_paths`, Windows case-fold overlap, and a 50-file cap
+  (`--force` to override).
 
 ## Changelog (0.6.7)
 

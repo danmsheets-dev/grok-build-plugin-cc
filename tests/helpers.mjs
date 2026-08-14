@@ -6,8 +6,14 @@ import { spawnSync } from "node:child_process";
 
 import { resolveSpawnInvocation } from "../plugins/grok-build/scripts/lib/which.mjs";
 
-export function makeTempDir(prefix = "grok-build-plugin-test-") {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+export function harnessTempRoot(...parts) {
+  const root = path.join(os.tmpdir(), "grok", ...parts);
+  fs.mkdirSync(root, { recursive: true });
+  return root;
+}
+
+export function makeTempDir(prefix = "t-") {
+  return fs.mkdtempSync(path.join(harnessTempRoot("plugin-tests"), prefix));
 }
 
 export function writeExecutable(filePath, source) {
@@ -22,7 +28,8 @@ export function run(command, args, options = {}) {
     env: options.env,
     encoding: "utf8",
     input: options.input,
-    windowsHide: true
+    windowsHide: true,
+    shell: options.shell ?? false
   });
 }
 

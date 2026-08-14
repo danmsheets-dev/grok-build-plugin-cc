@@ -13,13 +13,36 @@ const WINDOWS_EXECUTABLE_EXTENSIONS = new Set([".exe", ".cmd", ".bat", ".com"]);
  * test fixtures). Those still need `resolveSpawnInvocation` (or equivalent)
  * to run under node on Windows.
  */
+function firstExistingWithPathext(base, env) {
+  const ext = path.extname(base);
+  if (ext && WINDOWS_EXECUTABLE_EXTENSIONS.has(ext.toLowerCase())) {
+    return base;
+  }
+  const extensions = String(env?.PATHEXT ?? ".COM;.EXE;.BAT;.CMD")
+    .split(";")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  for (const entry of extensions) {
+    const suffix = entry.startsWith(".") ? entry : `.${entry}`;
+    const candidate = `${base}${suffix}`;
+    try {
+      if (fs.statSync(candidate).isFile()) {
+        return candidate;
+      }
+    } catch {
+      // keep looking
+    }
+  }
+  return base;
+}
+
 export function resolveExecutable(command, env = process.env, platform = process.platform) {
   const name = String(command ?? "");
-  if (platform !== "win32" || !name || path.isAbsolute(name)) {
+  if (platform !== "win32" || !name) {
     return name;
   }
-  if (name.includes("/") || name.includes("\\")) {
-    return name;
+  if (path.isAbsolute(name) || name.includes("/") || name.includes("\\")) {
+    return firstExistingWithPathext(name, env);
   }
 
   const searchPath = String(env?.PATH ?? env?.Path ?? "");

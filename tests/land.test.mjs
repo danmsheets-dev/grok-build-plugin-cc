@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -12,11 +13,24 @@ import {
   upsertJob,
   writeJobFile
 } from "../plugins/grok-build/scripts/lib/state.mjs";
+import { isHarnessLandPath } from "../plugins/grok-build/scripts/lib/fs.mjs";
 import { createWorktree } from "../plugins/grok-build/scripts/lib/worktree.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "grok-build");
 const SCRIPT = path.join(PLUGIN_ROOT, "scripts", "grok-bridge.mjs");
+
+test("plugin temps nest under %TEMP%/grok/plugin-tests", () => {
+  const dir = makeTempDir("land-nest-");
+  const grokRoot = path.join(os.tmpdir(), "grok", "plugin-tests");
+  assert.ok(
+    dir.replace(/\\/g, "/").startsWith(grokRoot.replace(/\\/g, "/")),
+    `expected ${dir} under ${grokRoot}`
+  );
+  assert.ok(isHarnessLandPath(".grok-subagent-live"));
+  assert.ok(isHarnessLandPath(".grok/notes.txt"));
+  assert.equal(isHarnessLandPath("assets/manifest/cliff.json"), false);
+});
 
 function pluginDataEnv(pluginDataDir, binDir, extra = {}) {
   return buildEnv(binDir, {

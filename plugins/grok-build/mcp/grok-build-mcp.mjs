@@ -14,6 +14,7 @@
 
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import readline from "node:readline";
@@ -136,7 +137,17 @@ function toolError(message, extra = {}) {
 }
 
 function writePromptFile(prompt, workspaceRoot) {
-  const dir = path.join(workspaceRoot, ".grok-build", "nest-prompts");
+  // Never write into the main checkout: isolate+confine would miss this
+  // (no path key on delegate_run) and porcelain excludes .grok-build/.
+  const tmpBase =
+    process.env.CLAUDE_PLUGIN_DATA ||
+    process.env.TMPDIR ||
+    process.env.TEMP ||
+    process.env.TMP ||
+    os.tmpdir();
+  const dir = process.env.CLAUDE_PLUGIN_DATA
+    ? path.join(String(tmpBase), "grok-build-nest-prompts")
+    : path.join(String(tmpBase), "grok", "plugin-prompts");
   fs.mkdirSync(dir, { recursive: true });
   const filePath = path.join(dir, `prompt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.txt`);
   fs.writeFileSync(filePath, String(prompt ?? ""), "utf8");
