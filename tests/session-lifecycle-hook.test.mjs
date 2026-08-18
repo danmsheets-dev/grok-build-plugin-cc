@@ -13,6 +13,7 @@ import {
   upsertJob,
   writeJobFile
 } from "../plugins/turbo-build-plugin/scripts/lib/state.mjs";
+import { sessionEndEndsProcess } from "../plugins/turbo-build-plugin/scripts/session-lifecycle-hook.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const HOOK_SCRIPT = path.join(ROOT, "plugins", "turbo-build-plugin", "scripts", "session-lifecycle-hook.mjs");
@@ -182,4 +183,23 @@ test("SessionEnd retains completed write runs whose worktree still holds unlande
     "retained run is re-keyed off the ended session so a later SessionEnd does not re-process it"
   );
   assert.equal(outcome.indexed?.sessionEnded, true);
+});
+
+// Audit finding 8: the hook never read input.reason, so `/clear` — which frees
+// context but leaves the CLI and its background runs alive — cancelled and
+// taskkilled paid runs and then deleted their job files and logs.
+test("sessionEndEndsProcess distinguishes a real exit from /clear", () => {
+  // A real process exit: kill and clean up as before.
+  for (const reason of ["exit", "logout", "shutdown", "quit", "other", "EXIT"]) {
+    assert.equal(sessionEndEndsProcess(reason), true, `${reason} ends the process`);
+  }
+  // Missing reason is the historical contract and must stay conservative.
+  assert.equal(sessionEndEndsProcess(undefined), true);
+  assert.equal(sessionEndEndsProcess(""), true);
+
+  // /clear and anything unrecognised must NOT kill live runs: detaching a job
+  // from a dead session is recoverable, killing a live one is not.
+  assert.equal(sessionEndEndsProcess("clear"), false);
+  assert.equal(sessionEndEndsProcess("compact"), false);
+  assert.equal(sessionEndEndsProcess("some-future-reason"), false);
 });

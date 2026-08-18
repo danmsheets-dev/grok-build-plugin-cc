@@ -3,6 +3,7 @@ import path from "node:path";
 import process from "node:process";
 
 import { resolveMaxOutputBytes, runCommandAsync } from "./process.mjs";
+import { resolveExecutable } from "./which.mjs";
 
 /**
  * Relative path of the Godot whole-project check script after runtime-plugin
@@ -233,20 +234,79 @@ export function detectOutputFailures(output, patterns, ignorePatterns) {
  * @param {{ onWarning?: (message: string) => void, flags?: string }} [options]
  * @returns {RegExp[]}
  */
+/** Longest accepted pattern source. */
+export const MAX_USER_PATTERN_LENGTH = 200;
+/** Most patterns accepted from one source. */
+export const MAX_USER_PATTERNS = 100;
+/** Budget for the probe that rejects catastrophically-backtracking patterns. */
+const PATTERN_PROBE_BUDGET_MS = 20;
+/**
+ * Probe length, chosen so the probe itself stays cheap.
+ *
+ * Backtracking cost is exponential in this length, so the probe must be short
+ * enough to finish: 28 characters against `(x+x+)+y` takes ~12 s (measured),
+ * 22 takes ~200 ms. That is still an order of magnitude over the budget, so
+ * the bad pattern is caught while a linear one completes in well under 1 ms.
+ */
+const PATTERN_PROBE_LENGTH = 22;
+
+/**
+ * A cheap probe against adversarial input, run once at compile time.
+ *
+ * `verifyFailurePatterns` is `.test()`ed against every output line, so a
+ * nested-quantifier pattern such as `(x+x+)+y` turns a single 30-character
+ * line into ~40 seconds. Measuring one match against a synthetic worst-case
+ * string catches that here instead of during the run.
+ */
+function patternIsAffordable(regex) {
+  const probe = `${"x".repeat(PATTERN_PROBE_LENGTH)}!`;
+  const started = Date.now();
+  try {
+    regex.test(probe);
+  } catch {
+    return false;
+  }
+  return Date.now() - started <= PATTERN_PROBE_BUDGET_MS;
+}
+
 export function compileUserPatterns(rawPatterns, options = {}) {
   const compiled = [];
+  let seen = 0;
   for (const raw of rawPatterns ?? []) {
     const source = String(raw ?? "").trim();
     if (!source) {
       continue;
     }
+    seen += 1;
+    if (seen > MAX_USER_PATTERNS) {
+      options.onWarning?.(
+        `ignoring verify patterns beyond the first ${MAX_USER_PATTERNS}`
+      );
+      break;
+    }
+    if (source.length > MAX_USER_PATTERN_LENGTH) {
+      options.onWarning?.(
+        `ignoring verify pattern longer than ${MAX_USER_PATTERN_LENGTH} characters`
+      );
+      continue;
+    }
+    let regex;
     try {
-      compiled.push(new RegExp(source, options.flags ?? ""));
+      regex = new RegExp(source, options.flags ?? "");
     } catch (error) {
       options.onWarning?.(
         `ignoring invalid verify pattern ${JSON.stringify(source)}: ${error instanceof Error ? error.message : String(error)}`
       );
+      continue;
     }
+    if (!patternIsAffordable(regex)) {
+      options.onWarning?.(
+        `ignoring verify pattern ${JSON.stringify(source)}: it backtracks catastrophically ` +
+          `and would stall every output line`
+      );
+      continue;
+    }
+    compiled.push(regex);
   }
   return compiled;
 }
@@ -327,6 +387,29 @@ export function resolveOutputFailurePatterns(ecosystemIdOrIds, extraPatterns, op
  *   output: string
  * }>}
  */
+/**
+ * Whether the leading binary of a shell command exists on PATH.
+ *
+ * @returns {boolean|null} null when the question does not apply.
+ */
+function resolveLeadingBinaryPresence(command, env, platform) {
+  if (platform !== "win32") {
+    return null;
+  }
+  const first = String(command ?? "").trim().split(/\s+/)[0] ?? "";
+  // Quoted or shell-syntax leading tokens are not a bare binary name.
+  if (!first || /["'`$|&<>()]/.test(first)) {
+    return null;
+  }
+  try {
+    const resolved = resolveExecutable(first, env ?? process.env, platform);
+    // resolveExecutable echoes the input back when nothing matched.
+    return resolved !== first || path.isAbsolute(first);
+  } catch {
+    return null;
+  }
+}
+
 export async function runVerifyCommand(command, cwd, options = {}) {
   const run = options.runCommandImpl ?? runCommandAsync;
   const platform = options.platform ?? process.platform;
@@ -346,6 +429,12 @@ export async function runVerifyCommand(command, cwd, options = {}) {
   // something a user could move, and it is echoed in the overflow message
   // below so the number a run reports is the number it actually used.
   const maxOutputBytes = resolveMaxOutputBytes(options.maxOutputBytes, options.env);
+
+  // Locale-proof half of the missing-binary check: resolve the command's
+  // leading token on PATH before running it. `false` only when we positively
+  // could not find it; `null` means we did not look (non-win32, or an
+  // unparseable command), and the caller's other signals decide.
+  const commandBinaryResolvable = resolveLeadingBinaryPresence(command, options.env, platform);
 
   const result = await run(shell, shellArgs, {
     cwd,
@@ -411,9 +500,20 @@ export async function runVerifyCommand(command, cwd, options = {}) {
   // these messages - a test asserting on cmd.exe's wording, a build log that
   // recovered from a missing optional tool - and then succeeds is still a
   // pass. Nothing that failed to start can exit 0.
+  // Locale-independent signals first. The three text patterns are English-only,
+  // and the sole non-text branch was `status === 127`, which cmd.exe never
+  // returns (it reports its own "not recognized" as exit 1). On a German /
+  // French / Japanese Windows a missing binary was therefore blamed on the
+  // agent, and the bridge spent its entire --verify-attempts budget of PAID fix
+  // turns asking the model to repair a missing installation. 9009 is cmd.exe's
+  // own "command not found"; resolving the leading binary on PATH is the
+  // locale-proof check and is supplied by the caller.
   const commandNotFound =
     status !== 0 &&
-    (status === 127 || NOT_RUNNABLE.some((re) => re.test(`${stdout}\n${stderr}`)));
+    (status === 127 ||
+      status === 9009 ||
+      commandBinaryResolvable === false ||
+      NOT_RUNNABLE.some((re) => re.test(`${stdout}\n${stderr}`)));
 
   // Only consulted on a zero exit: a non-zero status is already a failure, and
   // re-labelling its source would overwrite the more specific attribution the

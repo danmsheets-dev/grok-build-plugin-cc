@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 
 import { getConfig, isTerminalJobStatus, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
@@ -124,6 +125,35 @@ export function formatRelativeAge(isoValue, now = Date.now()) {
  * Returns null when the run records no pids at all, so "unknown" is never
  * mistaken for "dead".
  */
+/**
+ * Whether the job's pids were recorded before the current boot.
+ *
+ * `os.uptime()` is cheap and needs no per-pid bookkeeping: any pid written
+ * before the machine came up cannot still refer to the process that wrote it.
+ * This does not catch same-boot PID reuse, which is far rarer; the honest
+ * fix for that is a per-pid start-time token, noted in the audit as deferred.
+ *
+ * @returns {boolean}
+ */
+function isJobFromPreviousBoot(job, options = {}) {
+  const uptimeSeconds = options.uptimeImpl ? options.uptimeImpl() : os.uptime();
+  if (!Number.isFinite(uptimeSeconds) || uptimeSeconds <= 0) {
+    return false;
+  }
+  const stamp = job.lastEventAt ?? job.updatedAt ?? job.createdAt ?? null;
+  if (!stamp) {
+    return false;
+  }
+  const recordedMs = Date.parse(String(stamp));
+  if (!Number.isFinite(recordedMs)) {
+    return false;
+  }
+  const bootMs = Date.now() - uptimeSeconds * 1000;
+  // One minute of slack: clock skew and a coarse uptime should never make a
+  // genuinely-live run look dead.
+  return recordedMs < bootMs - 60_000;
+}
+
 export function isJobProcessAlive(job = {}, options = {}) {
   const killImpl = options.killImpl ?? process.kill.bind(process);
   const pids = [job.agentPid, job.bridgePid, job.companionPid, job.pid]
@@ -132,6 +162,16 @@ export function isJobProcessAlive(job = {}, options = {}) {
 
   if (pids.length === 0) {
     return null;
+  }
+
+  // A PID alone does not identify a process. When a worker dies without
+  // claiming terminal (reboot, OOM) the record keeps its pids, and Windows
+  // re-allocates PIDs from low numbers after a reboot — so an unrelated
+  // process answers kill(pid, 0), the job reads `alive: true, running` forever,
+  // and `/stop <id>` would taskkill that stranger AND its whole descendant
+  // tree. A run recorded before this boot cannot own any live PID.
+  if (isJobFromPreviousBoot(job, options)) {
+    return false;
   }
 
   for (const pid of new Set(pids)) {

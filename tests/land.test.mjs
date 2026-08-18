@@ -14,7 +14,12 @@ import {
   writeJobFile
 } from "../plugins/turbo-build-plugin/scripts/lib/state.mjs";
 import { isHarnessLandPath } from "../plugins/turbo-build-plugin/scripts/lib/fs.mjs";
-import { createWorktree } from "../plugins/turbo-build-plugin/scripts/lib/worktree.mjs";
+import { createWorktree, RUN_BRANCH_PREFIX } from "../plugins/turbo-build-plugin/scripts/lib/worktree.mjs";
+
+// RUN_BRANCH_PREFIX has no regex metacharacters, so it is safe to use
+// directly; assert against the constant so a rename cannot silently red
+// these guards again (audit finding 19).
+const RUN_BRANCH_RE = new RegExp(RUN_BRANCH_PREFIX);
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "turbo-build-plugin");
@@ -132,7 +137,7 @@ test("land --discard removes the worktree directory and the branch", () => {
 
     assert.equal(fs.existsSync(created.worktreePath), true);
     const branchBefore = run("git", ["branch", "--list", created.branchName], { cwd: repo });
-    assert.match(branchBefore.stdout, /grok-build\//);
+    assert.match(branchBefore.stdout, RUN_BRANCH_RE);
 
     const result = run("node", [SCRIPT, "land", jobId, "--discard", "--json"], {
       cwd: repo,
@@ -258,7 +263,7 @@ test("land --preview returns diff without merging or removing the worktree", () 
     // No mutation: worktree, branch, HEAD, and index must be unchanged.
     assert.equal(fs.existsSync(created.worktreePath), true);
     const branchAfter = run("git", ["branch", "--list", created.branchName], { cwd: repo });
-    assert.match(branchAfter.stdout, /grok-build\//);
+    assert.match(branchAfter.stdout, RUN_BRANCH_RE);
     const headAfter = run("git", ["rev-parse", "HEAD"], { cwd: repo }).stdout.trim();
     assert.equal(headAfter, headBefore);
     const stagedAfter = run("git", ["diff", "--cached", "--name-only"], { cwd: repo }).stdout.trim();
@@ -757,7 +762,7 @@ test("a binary merge conflict rolls the repository back instead of leaving it mi
     assert.equal(fs.existsSync(created.worktreePath), true);
     assert.match(
       run("git", ["branch", "--list", created.branchName], { cwd: repo }).stdout,
-      /grok-build\//
+      RUN_BRANCH_RE
     );
     const stored = JSON.parse(fs.readFileSync(resolveJobFile(repo, jobId), "utf8"));
     assert.ok(stored.worktree, "the job must still carry its worktree descriptor");
@@ -883,7 +888,7 @@ test("land refuses empty squash-merge when worktree has uncommitted work", () =>
       "uncommitted files must not be force-deleted"
     );
     const branchList = run("git", ["branch", "--list", created.branchName], { cwd: repo });
-    assert.match(branchList.stdout, /grok-build\//);
+    assert.match(branchList.stdout, RUN_BRANCH_RE);
   } finally {
     delete process.env.CLAUDE_PLUGIN_DATA;
   }

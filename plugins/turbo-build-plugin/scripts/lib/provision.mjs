@@ -301,16 +301,11 @@ export function fingerprintDir(dirPath, options = {}) {
   const existsSync = options.existsSync ?? fs.existsSync;
   const readdirSync = options.readdirSync ?? fs.readdirSync;
   const statSync = options.statSync ?? fs.statSync;
+  const maxDepth = Number.isFinite(Number(options.maxDepth)) ? Number(options.maxDepth) : 4;
+  const maxEntries = Number.isFinite(Number(options.maxEntries)) ? Number(options.maxEntries) : 5000;
 
   if (!dirPath || !existsSync(dirPath)) {
     return { exists: false, entryCount: 0, maxMtimeMs: 0 };
-  }
-
-  let names;
-  try {
-    names = readdirSync(dirPath);
-  } catch {
-    return { exists: true, entryCount: -1, maxMtimeMs: 0 };
   }
 
   let maxMtimeMs = 0;
@@ -323,18 +318,65 @@ export function fingerprintDir(dirPath, options = {}) {
     // ignore
   }
 
-  for (const name of names) {
+  // Walk BOUNDED levels deep, not just the top.
+  //
+  // A directory's mtime does not change when a file two levels down is
+  // rewritten, so a share-tier junction (say `vendor/`) could take an in-place
+  // edit to `vendor/pkg/src/Foo.php` — landing in the user's real checkout —
+  // and the before/after fingerprints came back byte-identical. Share-tier dirs
+  // are share-tier precisely BECAUSE they are gitignored, so the main-checkout
+  // porcelain scan cannot see them either: this was the only detector.
+  let entryCount = 0;
+  let sizeSum = 0;
+  let unreadable = false;
+  const stack = [{ dir: dirPath, depth: 0 }];
+  while (stack.length > 0 && entryCount < maxEntries) {
+    const { dir, depth } = stack.pop();
+    let names;
     try {
-      const st = statSync(path.join(dirPath, name));
+      names = readdirSync(dir);
+    } catch {
+      unreadable = true;
+      continue;
+    }
+    for (const name of names) {
+      if (entryCount >= maxEntries) {
+        break;
+      }
+      entryCount += 1;
+      const child = path.join(dir, name);
+      let st;
+      try {
+        st = statSync(child);
+      } catch {
+        continue;
+      }
       if (Number.isFinite(st.mtimeMs) && st.mtimeMs > maxMtimeMs) {
         maxMtimeMs = st.mtimeMs;
       }
-    } catch {
-      // skip unreadable entries
+      // Size participates too: an in-place edit that restores the mtime still
+      // changes length.
+      if (Number.isFinite(st.size)) {
+        sizeSum += st.size;
+      }
+      if (depth + 1 < maxDepth) {
+        let isDir = false;
+        try {
+          isDir = st.isDirectory();
+        } catch {
+          isDir = false;
+        }
+        if (isDir) {
+          stack.push({ dir: child, depth: depth + 1 });
+        }
+      }
     }
   }
 
-  return { exists: true, entryCount: names.length, maxMtimeMs };
+  if (unreadable && entryCount === 0) {
+    return { exists: true, entryCount: -1, maxMtimeMs: 0, sizeSum: 0 };
+  }
+  return { exists: true, entryCount, maxMtimeMs, sizeSum };
 }
 
 /**
@@ -383,7 +425,8 @@ export function diffSharedFingerprints(before, after) {
     if (
       a.exists !== b.exists ||
       a.entryCount !== b.entryCount ||
-      a.maxMtimeMs !== b.maxMtimeMs
+      a.maxMtimeMs !== b.maxMtimeMs ||
+      (a.sizeSum ?? 0) !== (b.sizeSum ?? 0)
     ) {
       changed.push(name);
     }
@@ -404,6 +447,27 @@ export function diffSharedFingerprints(before, after) {
  *   policy: Record<string, string>
  * }}
  */
+/**
+ * A `linkDirs` entry must be a plain directory NAME inside the project.
+ *
+ * The value is path.join'd against both the repo root and the worktree with no
+ * containment check, so `"../private-notes"` planted a junction outside the
+ * worktree that teardown never removed.
+ */
+function isContainedLinkDirName(name) {
+  const raw = String(name ?? "").trim();
+  if (!raw || raw === "." || raw === "..") {
+    return false;
+  }
+  if (path.isAbsolute(raw) || /^[A-Za-z]:/.test(raw)) {
+    return false;
+  }
+  if (raw.includes("/") || raw.includes("\\")) {
+    return false;
+  }
+  return path.normalize(raw) === raw;
+}
+
 export function planWorktreeLinks(repoRoot, worktreePath, options = {}) {
   const platform = options.platform ?? process.platform;
   const existsSync = options.existsSync ?? fs.existsSync;
@@ -441,11 +505,24 @@ export function planWorktreeLinks(repoRoot, worktreePath, options = {}) {
 
   // Extra dirs from project config (`linkDirs`) are treated as share-tier
   // additions when not already in the built-in list.
+  //
+  // Each name is path.join'd against BOTH the repo root and the worktree, and
+  // nothing checked containment — `"../private-notes"` planted a junction
+  // outside the worktree that teardown never removed. A link dir is a NAME,
+  // not a path: reject anything that escapes, is absolute, or contains a
+  // separator.
   const extraLinkDirs = Array.isArray(options.linkDirs)
     ? options.linkDirs.map((d) => String(d ?? "").trim()).filter(Boolean)
     : [];
   const dirNames = [...PROVISION_LINK_DIRS];
   for (const name of extraLinkDirs) {
+    if (!isContainedLinkDirName(name)) {
+      notes.push(
+        `ignoring linkDirs entry ${JSON.stringify(name)}: expected a plain directory name ` +
+          `inside the project (no separators, no "..", not absolute)`
+      );
+      continue;
+    }
     if (!dirNames.includes(name)) {
       dirNames.push(name);
     }

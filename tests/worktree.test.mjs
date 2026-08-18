@@ -14,9 +14,17 @@ import {
   removeWorktree,
   resolveMinFreeBytes,
   resolveWorktreePath,
-  resolveWorktreeRoot
+  reconcileOrphanWorktrees,
+  resolveWorktreeRoot,
+  RUN_BRANCH_PREFIX,
+  runBranchName
 } from "../plugins/turbo-build-plugin/scripts/lib/worktree.mjs";
-import { planWorktreeLinks, provisionWorktree } from "../plugins/turbo-build-plugin/scripts/lib/provision.mjs";
+import {
+  diffSharedFingerprints,
+  fingerprintDir,
+  planWorktreeLinks,
+  provisionWorktree
+} from "../plugins/turbo-build-plugin/scripts/lib/provision.mjs";
 import { initGitRepo, makeTempDir, run, writeExecutable } from "./helpers.mjs";
 
 /** The link kind provisionWorktree would really use on this platform. */
@@ -455,6 +463,7 @@ test("commitWorktreeChanges reports error when git status fails instead of clean
     `#!/usr/bin/env node
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { RUN_BRANCH_PREFIX, runBranchName } from "../plugins/turbo-build-plugin/scripts/lib/worktree.mjs";
 const argv = process.argv.slice(2);
 const shimDir = ${JSON.stringify(binDir)};
 if (argv[0] === "status") {
@@ -1105,4 +1114,143 @@ test("a gitignored provisioned link gets no exclude pathspec, so git add succeed
     encoding: "utf8"
   }).stdout;
   assert.doesNotMatch(names, /artifact\.bin/);
+});
+
+// Audit finding 19: the grok-build -> turbo-build rename changed the branch
+// name and left twelve assertions behind, reddening the suite -- including the
+// four prune/land guards that stop --apply destroying uncommitted work. This
+// test is the single place a future rename has to be acknowledged.
+test("run branch prefix is stable and is what createWorktree actually uses", () => {
+  assert.equal(RUN_BRANCH_PREFIX, "turbo-build/");
+  assert.equal(runBranchName("run-abc123"), "turbo-build/run-abc123");
+
+  const cwd = makeTempDir("grok-wt-prefix-");
+  const dataDir = makeTempDir("grok-wt-prefix-data-");
+  seedRepo(cwd);
+  const created = createWorktree({ cwd, runId: "run-prefix-check", dataDir });
+  assert.equal(
+    created.branchName,
+    runBranchName("run-prefix-check"),
+    "createWorktree must mint branches through runBranchName"
+  );
+  assert.ok(created.branchName.startsWith(RUN_BRANCH_PREFIX));
+});
+
+// Audit finding 11: the worktree root is shared per volume, so every project on
+// the drive puts worktrees under it — but orphan-ness was judged only from THIS
+// repo's job records. prune --apply in repo A deleted repo B's live worktree.
+test("the orphan scan never claims another repository's worktree", () => {
+  const repoA = makeTempDir("grok-wt-own-a-");
+  const repoB = makeTempDir("grok-wt-own-b-");
+  seedRepo(repoA);
+  seedRepo(repoB);
+
+  // One shared worktree root, exactly as resolveWorktreeRoot produces on win32.
+  const sharedRoot = makeTempDir("grok-wt-own-root-");
+  const aWt = createWorktree({ cwd: repoA, runId: "own-a", dataDir: sharedRoot });
+  const bWt = createWorktree({ cwd: repoB, runId: "own-b", dataDir: sharedRoot });
+  const scanRoot = path.dirname(aWt.worktreePath);
+  assert.equal(path.dirname(bWt.worktreePath), scanRoot, "both must share one root");
+
+  // A genuine orphan OF REPO A: a directory that still carries A's git link but
+  // is no longer registered (what a crashed run leaves behind).
+  const orphanOfA = path.join(scanRoot, "orphan-of-a");
+  fs.mkdirSync(orphanOfA, { recursive: true });
+  fs.copyFileSync(path.join(aWt.worktreePath, ".git"), path.join(orphanOfA, ".git"));
+
+  // Repo A prunes with no job records: everything here looks unrecorded.
+  const scan = reconcileOrphanWorktrees({ worktreeRoot: scanRoot, knownPaths: [], repoRoot: repoA });
+  const paths = scan.orphans.map((o) => path.resolve(o.path).toLowerCase());
+
+  assert.ok(
+    !paths.includes(path.resolve(bWt.worktreePath).toLowerCase()),
+    "repo B's live worktree must not be listed as an orphan of repo A"
+  );
+  const own = scan.orphans.find(
+    (o) => path.resolve(o.path).toLowerCase() === path.resolve(orphanOfA).toLowerCase()
+  );
+  assert.ok(own, "a directory carrying repo A's git link is still a genuine orphan of A");
+  assert.equal(own.ownershipUnverified, false, "and is provably ours, so prune may remove it");
+});
+
+test("a directory with no git metadata is reported but never auto-removed", () => {
+  const repo = makeTempDir("grok-wt-own-c-");
+  seedRepo(repo);
+  const scanRoot = makeTempDir("grok-wt-own-root2-");
+  fs.mkdirSync(path.join(scanRoot, "not-a-worktree"), { recursive: true });
+  fs.writeFileSync(path.join(scanRoot, "not-a-worktree", "leftover.txt"), "x\n");
+
+  const scan = reconcileOrphanWorktrees({ worktreeRoot: scanRoot, knownPaths: [], repoRoot: repo });
+  assert.equal(scan.orphans.length, 1);
+  assert.equal(
+    scan.orphans[0].ownershipUnverified,
+    true,
+    "no readable git metadata means we cannot prove it is ours"
+  );
+});
+
+// Audit finding 13 (containment half): a linkDirs entry is a directory NAME,
+// but it was path.join'd with no containment check, so "../private-notes"
+// planted a junction outside the worktree that teardown never removed.
+test("linkDirs cannot escape the worktree", () => {
+  const repo = makeTempDir("grok-wt-linkdirs-");
+  const wt = makeTempDir("grok-wt-linkdirs-wt-");
+  fs.mkdirSync(path.join(repo, "vendor"), { recursive: true });
+
+  const plan = planWorktreeLinks(repo, wt, {
+    linkDirs: ["../private-notes", "/etc", "C:\Windows", "a/b", "..", "vendor"]
+  });
+
+  const planned = (plan.links ?? []).map((link) => link.name ?? link.from ?? "");
+  for (const bad of ["../private-notes", "/etc", "C:\Windows", "a/b", ".."]) {
+    assert.ok(
+      !planned.some((entry) => String(entry).includes(bad)),
+      `${bad} must never be planned as a link`
+    );
+  }
+  assert.ok(
+    plan.notes.some((note) => /ignoring linkDirs entry/.test(note)),
+    "the rejection must be reported, not silent"
+  );
+  // Every planned target stays inside the worktree.
+  for (const link of plan.links ?? []) {
+    const to = path.resolve(String(link.to ?? wt));
+    assert.ok(
+      to === path.resolve(wt) || to.startsWith(path.resolve(wt) + path.sep),
+      `link target ${to} escaped the worktree`
+    );
+  }
+});
+
+// Audit finding 18: fingerprintDir stat'ed only the directory and its DIRECT
+// children, and a directory's mtime does not change when a file two levels
+// down is rewritten. A share-tier junction taking an in-place edit to
+// vendor/pkg/src/Foo.php landed in the user's real checkout undetected — and
+// share-tier dirs are gitignored, so the porcelain scan could not see it
+// either. This was the only detector.
+test("a nested in-place write is visible to the shared-dir fingerprint", () => {
+  const dir = makeTempDir("grok-fp-nested-");
+  const deep = path.join(dir, "pkg", "src");
+  fs.mkdirSync(deep, { recursive: true });
+  fs.writeFileSync(path.join(deep, "Foo.php"), "<?php // original\n");
+
+  const before = { vendor: fingerprintDir(dir) };
+  // Rewrite two levels down, exactly as an agent patching a vendored file would.
+  fs.writeFileSync(path.join(deep, "Foo.php"), "<?php // PATCHED BY THE AGENT\n");
+  const after = { vendor: fingerprintDir(dir) };
+
+  assert.deepEqual(
+    diffSharedFingerprints(before, after),
+    ["vendor"],
+    "a write two levels deep must be reported as a shared-dir change"
+  );
+});
+
+test("an unchanged shared dir still reports no change", () => {
+  const dir = makeTempDir("grok-fp-stable-");
+  fs.mkdirSync(path.join(dir, "a", "b"), { recursive: true });
+  fs.writeFileSync(path.join(dir, "a", "b", "keep.txt"), "same\n");
+  const before = { vendor: fingerprintDir(dir) };
+  const after = { vendor: fingerprintDir(dir) };
+  assert.deepEqual(diffSharedFingerprints(before, after), []);
 });

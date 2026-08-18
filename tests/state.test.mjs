@@ -6,15 +6,18 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
-import { makeTempDir } from "./helpers.mjs";
+import { initGitRepo, makeTempDir } from "./helpers.mjs";
 import {
+  listJobs,
   loadState,
   resolveJobFile,
   resolveJobLogFile,
   resolveStateDir,
   resolveStateFile,
   saveState,
-  withStateLock
+  upsertJob,
+  withStateLock,
+  writeJobFile
 } from "../plugins/turbo-build-plugin/scripts/lib/state.mjs";
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
@@ -550,4 +553,41 @@ test("withStateLock reclaims empty/unparseable lock content once it is genuinely
     ran = true;
   });
   assert.equal(ran, true);
+});
+
+// Audit finding 3: eviction unlinks the job file and its live log. Evicting a
+// still-running job made it unreachable by stop/wait/show/runs while its agent
+// kept running and kept spending.
+test("MAX_JOBS eviction never drops a non-terminal job", () => {
+  const cwd = makeTempDir("grok-state-evict-");
+  initGitRepo(cwd);
+
+  // One long-lived running job, then enough newer terminal jobs to push it far
+  // past the cap. No worktree — a --no-isolate run, or one that has not made
+  // its worktree yet, is exactly the case the worktree check misses.
+  const runningJob = {
+    id: "run-still-running",
+    status: "running",
+    updatedAt: "2000-01-01T00:00:00.000Z",
+    createdAt: "2000-01-01T00:00:00.000Z"
+  };
+  upsertJob(cwd, runningJob);
+  writeJobFile(cwd, runningJob.id, runningJob);
+  for (let i = 0; i < 80; i += 1) {
+    upsertJob(cwd, {
+      id: `run-done-${i}`,
+      status: "completed",
+      updatedAt: `2030-01-01T00:00:${String(i).padStart(2, "0")}.000Z`,
+      createdAt: "2030-01-01T00:00:00.000Z"
+    });
+  }
+
+  const jobs = listJobs(cwd);
+  const survivor = jobs.find((job) => job.id === "run-still-running");
+  assert.ok(survivor, "a running job must survive eviction regardless of age");
+  assert.equal(survivor.status, "running");
+  assert.ok(
+    fs.existsSync(resolveJobFile(cwd, "run-still-running")),
+    "its job file must survive too — stop/wait/show read it"
+  );
 });

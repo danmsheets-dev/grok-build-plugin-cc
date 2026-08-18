@@ -258,6 +258,22 @@ export function shortWorktreeId(runId) {
 export const WORKTREE_ROOT_ENV = "GROK_BUILD_WORKTREE_ROOT";
 
 /**
+ * Prefix for every run branch this plugin creates.
+ *
+ * Exported so tests assert against the constant rather than a literal. The
+ * grok-build -> turbo-build rename changed this string and left the test
+ * assertions behind, which reddened the suite — including the four prune/land
+ * guards that stop `--apply` destroying uncommitted work. A future rename must
+ * not be able to do that again.
+ */
+export const RUN_BRANCH_PREFIX = "turbo-build/";
+
+/** Branch name for a run id. */
+export function runBranchName(runId) {
+  return `${RUN_BRANCH_PREFIX}${runId}`;
+}
+
+/**
  * Directory under which NEW worktrees are created (parent of the run id entry).
  *
  * Precedence:
@@ -529,7 +545,7 @@ export function createWorktree({
     throw new Error("runId is required");
   }
 
-  const branchName = `turbo-build/${runId}`;
+  const branchName = runBranchName(runId);
   const worktreePath = worktreePathOverride
     ? path.resolve(String(worktreePathOverride))
     : resolveWorktreePath(runId, { dataDir, env, repoRoot });
@@ -871,6 +887,61 @@ export function removeWorktree({
  * @param {typeof fs.existsSync} [options.existsSyncImpl]
  * @returns {{ orphans: Array<{ path: string, hasUncommittedWork: boolean, detail: string }>, root: string, scanned: number }}
  */
+/**
+ * Common git directory as seen from `cwd`, or null when it is not a worktree.
+ *
+ * Uses the injected `gitImpl` so the orphan scan stays testable.
+ */
+function commonDirFrom(cwd, gitImpl) {
+  let result;
+  try {
+    result = gitImpl(cwd, ["rev-parse", "--git-common-dir"]);
+  } catch {
+    return null;
+  }
+  if (!result || result.status !== 0 || result.error) {
+    return null;
+  }
+  let dir = String(result.stdout ?? "").trim();
+  if (!dir) {
+    return null;
+  }
+  if (!path.isAbsolute(dir)) {
+    dir = path.resolve(cwd, dir);
+  }
+  try {
+    return fs.realpathSync.native(dir);
+  } catch {
+    return path.resolve(dir);
+  }
+}
+
+function samePathValue(a, b) {
+  if (!a || !b) {
+    return false;
+  }
+  return process.platform === "win32"
+    ? path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase()
+    : path.resolve(a) === path.resolve(b);
+}
+
+/**
+ * Whether a candidate directory under the shared worktree root belongs to the
+ * repository being pruned.
+ *
+ * @returns {"this-repo"|"other-repo"|"unknown"}
+ */
+function classifyWorktreeOwnership(childPath, ownCommonDir, gitImpl) {
+  if (!ownCommonDir) {
+    return "unknown";
+  }
+  const childCommonDir = commonDirFrom(childPath, gitImpl);
+  if (!childCommonDir) {
+    return "unknown";
+  }
+  return samePathValue(childCommonDir, ownCommonDir) ? "this-repo" : "other-repo";
+}
+
 export function reconcileOrphanWorktrees({
   worktreeRoot,
   knownPaths = [],
@@ -915,6 +986,9 @@ export function reconcileOrphanWorktrees({
     }
   }
 
+  // Identity of the repository we are pruning FOR.
+  const ownCommonDir = repoRoot ? commonDirFrom(repoRoot, gitImpl) : null;
+
   let children;
   try {
     children = readdirSyncImpl(root, { withFileTypes: true });
@@ -954,13 +1028,31 @@ export function reconcileOrphanWorktrees({
       continue;
     }
 
+    // The worktree root is shared per VOLUME (`H:\gb\w`), so every project on
+    // the drive puts its worktrees here — but orphan-ness is judged from THIS
+    // repo's job records. Without an ownership check, `prune --apply` in repo A
+    // reported repo B's live worktree as "no job record" and deleted it out
+    // from under a running agent.
+    const ownership = classifyWorktreeOwnership(childPath, ownCommonDir, gitImpl);
+    if (ownership === "other-repo") {
+      continue;
+    }
+
     const hasUncommittedWork = worktreeHasUncommittedWorkSafe(childPath, gitImpl);
+    // "unknown" means we could not prove it is ours (no readable git metadata).
+    // Report it so it stays visible, but never auto-delete: a stale directory
+    // costs disk, deleting someone else's work costs their work.
+    const ownershipUnverified = ownership !== "this-repo";
     orphans.push({
       path: childPath,
       hasUncommittedWork,
+      ownershipUnverified,
       detail: hasUncommittedWork
         ? `Orphan worktree at ${childPath} has uncommitted work; not safe to auto-delete.`
-        : `Orphan worktree directory at ${childPath} has no job record.`
+        : ownershipUnverified
+          ? `Directory at ${childPath} has no job record and no readable git metadata; ` +
+            `not auto-removed because it cannot be proven to belong to this repository.`
+          : `Orphan worktree directory at ${childPath} has no job record.`
     });
   }
 

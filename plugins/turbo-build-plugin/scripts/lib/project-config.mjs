@@ -52,6 +52,42 @@ export const AUTO_VERIFY_TRUST_STATE_KEY = "autoVerifyTrustHash";
  * `--env` before building the run's environment - see the comment on
  * `envOverrides` there.
  */
+/**
+ * Clamp `provision` from an UNTRUSTED config so it can only ADD isolation.
+ *
+ * `link: "share"` replaces the mandated private copies with junctions into the
+ * user's real checkout, so every write during the run — including an
+ * `npm install` during verify — lands outside the worktree. `copy` and `none`
+ * move the other way and are safe from any source.
+ *
+ * @param {any} value
+ * @returns {{ value: any, withheld: any }}
+ */
+function clampProvisionForUntrusted(value) {
+  if (!value || typeof value !== "object" || !value.link || typeof value.link !== "object") {
+    return { value, withheld: null };
+  }
+  const keptLink = {};
+  const withheldLink = {};
+  for (const [dir, tier] of Object.entries(value.link)) {
+    if (tier === "copy" || tier === "none") {
+      keptLink[dir] = tier;
+    } else {
+      withheldLink[dir] = tier;
+    }
+  }
+  const next = { ...value };
+  if (Object.keys(keptLink).length > 0) {
+    next.link = keptLink;
+  } else {
+    delete next.link;
+  }
+  return {
+    value: next,
+    withheld: Object.keys(withheldLink).length > 0 ? { link: withheldLink } : null
+  };
+}
+
 export const EXECUTABLE_KEYS = Object.freeze(["verify", "tools", "env"]);
 
 // Full Hyper ladder (HYPER-2). Keep in sync with KNOWN_REASONING_EFFORTS in
@@ -245,13 +281,42 @@ const SCHEMA = Object.freeze({
   verifyTimeoutMultiplier: { normalize: normalizePositiveNumber, expected: "a positive number" },
   baselineTimeoutMs: { normalize: normalizePositiveNumber, expected: "a positive number of milliseconds" },
   verifyMaxOutputBytes: { normalize: normalizePositiveNumber, expected: "a positive number of bytes" },
-  verifyFailurePatterns: { normalize: normalizeStringArray, expected: "an array of regex strings" },
-  verifyIgnorePatterns: { normalize: normalizeStringArray, expected: "an array of regex strings" },
+  // Trust-gated even though they run no command: these decide whether a
+  // FAILURE IS SEEN. `verifyIgnorePatterns: ["."]` made detectOutputFailures
+  // discard every line, so a run printing SCRIPT ERROR while exiting 0
+  // reported "verified: yes"; `verifyFailurePatterns` is compiled with
+  // `new RegExp` and `.test()`ed per line, so a catastrophic pattern from an
+  // untrusted repo is a 40s-per-line stall.
+  verifyFailurePatterns: {
+    normalize: normalizeStringArray,
+    expected: "an array of regex strings",
+    executable: true
+  },
+  verifyIgnorePatterns: {
+    normalize: normalizeStringArray,
+    expected: "an array of regex strings",
+    executable: true
+  },
   isolate: { normalize: normalizeBoolean, expected: "true or false" },
-  linkDirs: { normalize: normalizeStringArray, expected: "an array of directory names" },
+  // Trust-gated because they decide WHERE a run writes. `provision.link`
+  // set to "share" replaces the mandated private copies with junctions into
+  // the user's real checkout, so every write during the run - including an
+  // npm install during verify - lands outside the worktree. `linkDirs` is
+  // path.join'd with no containment check, so it can plant a junction
+  // outside the worktree that teardown never removes.
+  linkDirs: {
+    normalize: normalizeStringArray,
+    expected: "an array of directory names",
+    executable: true
+  },
   provision: {
     normalize: normalizeProvision,
-    expected: "an object with optional copy (boolean), files (string[]), link (per-dir share|copy|env|none)"
+    expected: "an object with optional copy (boolean), files (string[]), link (per-dir share|copy|env|none)",
+    // NOT trust-gated wholesale: `provision.copy` only ever asks for MORE
+    // isolation (a private copy instead of a shared cache), and an untrusted
+    // repo is welcome to ask for that. Only `link` can reduce isolation, so
+    // that sub-key is clamped below.
+    clampUntrusted: clampProvisionForUntrusted
   },
   // Opt-in Godot headless export smoke when export_presets.cfg exists. Never
   // an executable key: it only adds a default verify command shape, and the
@@ -391,6 +456,17 @@ export function loadProjectConfig(root, options = {}) {
     }
     if (field.executable && !trusted) {
       result.untrusted[key] = normalized;
+      continue;
+    }
+    if (!trusted && typeof field.clampUntrusted === "function") {
+      const clamped = field.clampUntrusted(normalized);
+      if (clamped.withheld) {
+        result.untrusted[key] = clamped.withheld;
+      }
+      if (clamped.value === undefined) {
+        continue;
+      }
+      result.config[key] = clamped.value;
       continue;
     }
     result.config[key] = normalized;

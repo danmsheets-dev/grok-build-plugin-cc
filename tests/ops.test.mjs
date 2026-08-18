@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { buildEnv, installFakeGrok } from "./fake-grok-fixture.mjs";
 import { initGitRepo, makeTempDir, run, writeExecutable } from "./helpers.mjs";
 import {
+  allTerminalJobStatuses,
   generateJobId,
   listJobs,
   readJobFile,
@@ -14,14 +15,23 @@ import {
   upsertJob,
   writeJobFile
 } from "../plugins/turbo-build-plugin/scripts/lib/state.mjs";
-import { createWorktree } from "../plugins/turbo-build-plugin/scripts/lib/worktree.mjs";
+import { createWorktree, RUN_BRANCH_PREFIX } from "../plugins/turbo-build-plugin/scripts/lib/worktree.mjs";
 import {
+  AWAITING_LAND_STATUSES,
   buildEcosystemChecks,
   normalizeDoctorCheck,
+  PROTECTED_WORKTREE_STATUSES,
+  SAFE_TO_DISCARD_STATUSES,
   renderDoctorReport,
   RUN_PASSTHROUGH_FLAGS,
   TASK_VALUE_OPTIONS
 } from "../plugins/turbo-build-plugin/scripts/grok-bridge.mjs";
+import { isJobProcessAlive } from "../plugins/turbo-build-plugin/scripts/lib/job-control.mjs";
+
+// RUN_BRANCH_PREFIX has no regex metacharacters, so it is safe to use
+// directly; assert against the constant so a rename cannot silently red
+// these guards again (audit finding 19).
+const RUN_BRANCH_RE = new RegExp(RUN_BRANCH_PREFIX);
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "turbo-build-plugin");
@@ -784,7 +794,7 @@ test("prune plan excludes completed unlanded work by default", () => {
   assert.equal(fs.existsSync(created.worktreePath), true);
 
   const branchList = run("git", ["branch", "--list", created.branchName], { cwd: repo });
-  assert.match(branchList.stdout, /grok-build\//);
+  assert.match(branchList.stdout, RUN_BRANCH_RE);
 });
 
 test("doctor reports completed unlanded work as awaiting land, not prunable staleness", () => {
@@ -852,7 +862,7 @@ test("prune plan also excludes completed-unverified and timed-out unlanded work"
 
     assert.equal(fs.existsSync(created.worktreePath), true, `${status}: worktree must survive --apply`);
     const branchList = run("git", ["branch", "--list", created.branchName], { cwd: repo });
-    assert.match(branchList.stdout, /grok-build\//, `${status}: branch must survive --apply`);
+    assert.match(branchList.stdout, RUN_BRANCH_RE, `${status}: branch must survive --apply`);
   }
 });
 
@@ -966,7 +976,7 @@ test("prune protects a cancelled job with a dirty worktree from --apply", () => 
     "uncommitted work must not be force-deleted"
   );
   const branchList = run("git", ["branch", "--list", created.branchName], { cwd: repo });
-  assert.match(branchList.stdout, /grok-build\//, "branch must survive");
+  assert.match(branchList.stdout, RUN_BRANCH_RE, "branch must survive");
 });
 
 test("prune protects an isolation-breached job with commits from --apply", () => {
@@ -998,7 +1008,7 @@ test("prune protects an isolation-breached job with commits from --apply", () =>
   assert.equal(applied.status, 0, applied.stderr);
   assert.equal(fs.existsSync(created.worktreePath), true, "isolation-breached worktree must survive");
   const branchList = run("git", ["branch", "--list", created.branchName], { cwd: repo });
-  assert.match(branchList.stdout, /grok-build\//, "isolation-breached branch must survive");
+  assert.match(branchList.stdout, RUN_BRANCH_RE, "isolation-breached branch must survive");
 });
 
 test("a trusted project config drives verification end to end", () => {
@@ -1099,4 +1109,57 @@ test("--no-verify opts out of a trusted config's plan", () => {
   assert.equal(payload.verify.plan.disabled, true);
   // A failing command that never ran must not be able to report a verdict.
   assert.equal(payload.verified, null);
+});
+
+// Audit finding 1: `completed-with-failed-children` is terminal but was absent
+// from AWAITING_LAND_STATUSES, so prune reported "nothing awaiting land" for a
+// parent holding committed work and then deleted its worktree and branch.
+test("every terminal status is protected from prune unless explicitly discardable", () => {
+  const terminal = allTerminalJobStatuses();
+  assert.ok(terminal.length > 0);
+  for (const status of terminal) {
+    if (SAFE_TO_DISCARD_STATUSES.has(status)) {
+      continue;
+    }
+    assert.ok(
+      PROTECTED_WORKTREE_STATUSES.has(status),
+      `${status} is terminal but not protected — prune --apply could delete its worktree`
+    );
+  }
+});
+
+test("a parent whose nested child failed still counts as awaiting land", () => {
+  assert.ok(
+    AWAITING_LAND_STATUSES.has("completed-with-failed-children"),
+    "the parent's own committed work is still unlanded when a child fails"
+  );
+  assert.ok(PROTECTED_WORKTREE_STATUSES.has("completed-with-failed-children"));
+});
+
+// Audit finding 24: a PID alone does not identify a process. After a reboot
+// Windows re-allocates PIDs from low numbers, so an unrelated process answered
+// kill(pid, 0) and the job read alive/running forever — and `/stop` would have
+// taskkilled that stranger and its whole descendant tree.
+test("a run recorded before this boot is not reported alive on a recycled pid", () => {
+  const beforeBoot = {
+    id: "run-old",
+    status: "running",
+    pid: 1234,
+    lastEventAt: new Date(Date.now() - 72 * 3600 * 1000).toISOString()
+  };
+  // Machine has been up an hour; the record predates that by days.
+  assert.equal(
+    isJobProcessAlive(beforeBoot, { killImpl: () => true, uptimeImpl: () => 3600 }),
+    false,
+    "a pid written before boot cannot still be that process"
+  );
+
+  // A record from THIS boot still trusts the probe.
+  const thisBoot = { ...beforeBoot, lastEventAt: new Date().toISOString() };
+  assert.equal(
+    isJobProcessAlive(thisBoot, { killImpl: () => true, uptimeImpl: () => 3600 }),
+    true
+  );
+  // And "no pids at all" still reports unknown, not dead.
+  assert.equal(isJobProcessAlive({ id: "x" }, { killImpl: () => true }), null);
 });

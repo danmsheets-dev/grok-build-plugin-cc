@@ -11,6 +11,7 @@ import {
   resolveEcosystemBinary
 } from "../plugins/turbo-build-plugin/scripts/lib/ecosystem.mjs";
 import { makeTempDir } from "./helpers.mjs";
+import { verifyEntryPointCommand } from "../plugins/turbo-build-plugin/scripts/lib/ecosystem.mjs";
 
 /**
  * Write a fixture project. Keys are repo-relative POSIX paths; a key ending in
@@ -562,4 +563,44 @@ test("defaultVerifyCommands returns an empty list for no descriptor", () => {
   assert.deepEqual(defaultVerifyCommands(null), []);
   assert.deepEqual(defaultVerifyCommands(undefined), []);
   assert.deepEqual(defaultVerifyCommands({ id: "unknown-ecosystem" }), []);
+});
+
+// Audit finding 17: verify always runs with cwd = workspace root, so a bare
+// `make test` read the ROOT Makefile. A monorepo's backend/Makefile target
+// never ran and the run still reported "verified".
+test("a nested make/just target names its project directory", () => {
+  const nested = verifyEntryPointCommand(
+    { kind: "make", target: "test" },
+    { projectDir: "backend" }
+  );
+  assert.equal(nested, "make -C backend test");
+
+  const root = verifyEntryPointCommand({ kind: "make", target: "test" }, { projectDir: "." });
+  assert.equal(root, "make test", "a root project stays a bare make");
+
+  const just = verifyEntryPointCommand(
+    { kind: "just", target: "test" },
+    { projectDir: "services/api" }
+  );
+  assert.equal(just, "just --justfile services/api/justfile test");
+});
+
+// Audit finding 29: quoteCommandPath only quotes on whitespace and documents
+// that callers must pre-filter. An ordinary `R&D/` folder reached cmd.exe.
+test("entry points refuse a project path that would reach the shell", () => {
+  for (const projectDir of ["R&D", "proj(copy)", "a^b", "x|y"]) {
+    assert.equal(
+      verifyEntryPointCommand({ kind: "make", target: "test" }, { projectDir }),
+      null,
+      `${projectDir} must not be emitted into a command string`
+    );
+  }
+  assert.equal(
+    verifyEntryPointCommand({ kind: "run_tests.ps1", path: "R&D/run_tests.ps1" }, { projectDir: "R&D" }),
+    null
+  );
+  assert.equal(
+    verifyEntryPointCommand({ kind: "tox.ini", path: "R&D/tox.ini" }, { projectDir: "R&D" }),
+    null
+  );
 });

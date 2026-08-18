@@ -13,7 +13,7 @@ import {
   normalizeUsage,
   parseStreamEventDetailed
 } from "./stream-events.mjs";
-import { resolveExecutable, resolveSpawnInvocation } from "./which.mjs";
+import { cmdLineCanCarry, resolveExecutable, resolveSpawnInvocation } from "./which.mjs";
 
 export const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
@@ -1657,7 +1657,14 @@ export function buildHeadlessArgs(prompt, options = {}) {
   let promptArgs = null;
   const transport = { mode: "inline", promptBytes, budgetBytes, elidedBytes: 0, promptFile: null };
 
-  if (promptBytes <= budgetBytes) {
+  // A cmd.exe shim cannot carry a newline (its line ends there, silently
+  // dropping every flag after it — including --sandbox and --deny) or a
+  // %VARIABLE% reference (cmd substitutes it before the child sees it). Those
+  // are properties of the TEXT, not its size, so the byte budget never caught
+  // them. Route such a prompt through --prompt-file regardless of length.
+  const needsFileTransport = options.cmdShim === true && !cmdLineCanCarry(raw);
+
+  if (promptBytes <= budgetBytes && !needsFileTransport) {
     promptArgs = ["-p", raw];
   } else if (options.promptFileDir) {
     // Preferred over truncating: `--prompt-file` takes the prompt out of argv
@@ -1684,6 +1691,12 @@ export function buildHeadlessArgs(prompt, options = {}) {
 
   return [...leading, ...promptArgs, ...trailing];
 }
+
+/**
+ * How long to wait after the agent exits for its inherited pipes to close
+ * before detaching from them and settling with what was captured.
+ */
+export const HEADLESS_STDIO_DRAIN_MS = 2000;
 
 export function runHeadlessAgent(cwd, options = {}) {
   const binary = options.binary ?? resolveGrokBinary(options.env ?? process.env);
@@ -1877,7 +1890,22 @@ export function runHeadlessAgent(cwd, options = {}) {
       reject(error);
     });
 
-    child.on("close", (code, signal) => {
+    // Settle on `exit` plus a bounded stdio drain, not on `close` alone.
+    //
+    // `close` fires only when every inherited pipe is closed. An agent that
+    // leaves ANY background process holding its stdout/stderr (a dev server or
+    // watcher started from a Bash tool call, an MCP helper) exits 0 while the
+    // pipes stay open, so `close` never arrives: the run never settled, the
+    // heartbeat kept refreshing so it could never be reconciled as abandoned,
+    // and the detached worker leaked while holding the worktree. Same shape as
+    // runCommandAsync's graceTimer, and the transcript is already captured by
+    // the time we get here, so nothing is lost by detaching.
+    let settled = false;
+    const settleFromChild = (code, signal) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
       const status = code ?? (signal ? 1 : 0);
       let result = null;
       if (streaming) {
@@ -1994,6 +2022,24 @@ export function runHeadlessAgent(cwd, options = {}) {
         binary,
         promptTransport
       });
+    };
+
+    child.on("close", settleFromChild);
+    child.on("exit", (code, signal) => {
+      if (settled) {
+        return;
+      }
+      const graceTimer = setTimeout(() => {
+        if (settled) {
+          return;
+        }
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        child.stdin?.destroy();
+        child.unref?.();
+        settleFromChild(code, signal);
+      }, HEADLESS_STDIO_DRAIN_MS);
+      graceTimer.unref?.();
     });
   });
 }

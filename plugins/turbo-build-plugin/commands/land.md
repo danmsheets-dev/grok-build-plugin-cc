@@ -27,7 +27,7 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" land "$ARGUMENTS"
 - Otherwise, first show the user what would land (read-only preview — no merge):
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" land "$ARGUMENTS" --preview --json
+node "${CLAUDE_PLUGIN_ROOT}/scripts/grok-bridge.mjs" land "$ARGUMENTS --preview --json"
 ```
 
 - If that reports an error, return the error verbatim and stop. One error is expected

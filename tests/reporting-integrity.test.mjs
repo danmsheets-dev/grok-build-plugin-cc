@@ -314,7 +314,7 @@ test("buildBridgeResultBlock emits the structured trailer", () => {
   assert.match(block, /status: completed-truncated/);
   assert.match(block, /stopReason: Cancelled/);
   assert.match(block, /verified: n\/a/);
-  assert.match(block, /isolation: ACTIVE \(worktree \/tmp\/wt, branch grok-build\/run-1\)/);
+  assert.match(block, /isolation: ACTIVE \(worktree \/tmp\/wt, branch turbo-build\/run-1\)/);
   assert.match(block, /changed files: none/);
   assert.match(block, /tool calls: 0/);
   assert.match(block, /land: \/turbo-build-plugin:land run-1/);

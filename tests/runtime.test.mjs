@@ -17,6 +17,13 @@ import {
   writeJobFile
 } from "../plugins/turbo-build-plugin/scripts/lib/state.mjs";
 import { buildSingleJobSnapshot, buildStatusSnapshot, readStoredJob } from "../plugins/turbo-build-plugin/scripts/lib/job-control.mjs";
+import { RUN_BRANCH_PREFIX } from "../plugins/turbo-build-plugin/scripts/lib/worktree.mjs";
+
+// RUN_BRANCH_PREFIX has no regex metacharacters, so it is safe to use
+// directly; assert against the constant so a rename cannot silently red
+// these guards again (audit finding 19).
+const RUN_BRANCH_RE = new RegExp(RUN_BRANCH_PREFIX);
+const RUN_BRANCH_RE_ANCHORED = new RegExp("^" + RUN_BRANCH_PREFIX);
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "turbo-build-plugin");
@@ -813,7 +820,7 @@ process.exit(1);
       "worktree descriptor must be patched onto the job before the agent finishes"
     );
     assert.ok(fs.existsSync(found.worktree.path), "worktree path must exist on disk");
-    assert.match(found.worktree.branch, /^grok-build\//);
+    assert.match(found.worktree.branch, RUN_BRANCH_RE_ANCHORED);
     assert.ok(found.worktree.baseSha);
   } finally {
     if (child.pid) {

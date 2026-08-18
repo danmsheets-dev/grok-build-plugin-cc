@@ -411,7 +411,7 @@ test("renderTaskResult surfaces the worktree and a land hint", () => {
       worktree: { path: "/tmp/worktrees/run-abc123", branch: "turbo-build/run-abc123" }
     }
   );
-  assert.match(output, /Worktree: \/tmp\/worktrees\/run-abc123 \(branch grok-build\/run-abc123\)/);
+  assert.match(output, /Worktree: \/tmp\/worktrees\/run-abc123 \(branch turbo-build\/run-abc123\)/);
   assert.match(output, /\/turbo-build-plugin:land run-abc123/);
 });
 

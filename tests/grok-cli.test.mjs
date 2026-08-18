@@ -1013,3 +1013,45 @@ test("a plain non-streaming run is never reported as an unparsed stream", async 
   assert.equal(result.streamParsed, true, "there was no stream to fail at parsing");
   assert.equal(result.finalMessage, "Handled the requested task.");
 });
+
+// Audit finding 15: runHeadlessAgent settled only on 'close', which fires when
+// every inherited pipe is closed. An agent that leaves ANY background process
+// holding stdout/stderr exits 0 while close never arrives — the run never
+// settled, the heartbeat kept it from being reconciled as abandoned, and the
+// worker leaked while holding the worktree.
+test("a pipe-holding grandchild cannot wedge the run forever", async (t) => {
+  const dir = makeTempDir("grok-wedge-");
+  const bin = path.join(dir, "bin");
+  fs.mkdirSync(bin, { recursive: true });
+
+  // Only the real run leaves the grandchild; capability probes must stay clean
+  // or they hang before the code under test is even reached.
+  writeExecutable(
+    path.join(bin, "wedgeagent"),
+    `#!/usr/bin/env node
+// CommonJS on purpose: an extensionless shebang script is run as \`node <file>\`,
+// which defaults to CJS, so \`import\` would be a syntax error and the fixture
+// would exit 1 before ever spawning the grandchild.
+const { spawn } = require("node:child_process");
+const argv = process.argv.slice(2);
+if (argv.includes("-p") || argv.includes("--prompt-file")) {
+  spawn(process.execPath, ["-e", "setTimeout(()=>{}, 60000)"], { stdio: "inherit", detached: true }).unref();
+  console.log(JSON.stringify({ type: "end", subtype: "success" }));
+} else {
+  console.log("--prompt-file -p --output-format --permission-mode");
+}
+process.exit(0);
+`
+  );
+
+  const env = { ...process.env, PATH: `${bin}${path.delimiter}${process.env.PATH}` };
+  const started = Date.now();
+  const result = await runHeadlessAgent(dir, { binary: "wedgeagent", prompt: "hi", env });
+  const elapsed = Date.now() - started;
+
+  assert.equal(result.status, 0);
+  assert.ok(
+    elapsed < 15000,
+    `must settle via the exit + drain path, not hang on close (took ${elapsed}ms)`
+  );
+});

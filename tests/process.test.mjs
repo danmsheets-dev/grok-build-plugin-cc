@@ -14,6 +14,7 @@ import {
   runCommandAsync,
   terminateProcessTree
 } from "../plugins/turbo-build-plugin/scripts/lib/process.mjs";
+import { cmdLineCanCarry, quoteCmdArg } from "../plugins/turbo-build-plugin/scripts/lib/which.mjs";
 
 test("terminateProcessTree uses taskkill on Windows", () => {
   let captured = null;
@@ -670,4 +671,45 @@ test("terminateProcessTree real liveness probe reports survivor when kill is a n
       // already dead
     }
   }
+});
+
+// Audit finding 4: argv for a .cmd shim was built with the C-runtime quoting
+// rule, but the string is parsed by cmd.exe first. cmd tracks quote PARITY
+// rather than backslash escapes, expands %VAR%, treats & | ^ < > as operators,
+// and ends its line at the first newline.
+test("quoteCmdArg neutralises cmd metacharacters instead of letting them act", () => {
+  // & ^ ( ) | < > are inert INSIDE a quoted value, and cmd preserves the quotes
+  // across both of its parses. The bug was that quoteWindowsArg returned short
+  // values bare, exposing them: an ordinary `C:\dev\R&D` repo produced a deny
+  // rule matching nothing.
+  for (const raw of ["Edit(C:/dev/R&D/**)", "Edit(C:/dev/a^b/**)", "a|b", "a>b"]) {
+    const quoted = quoteCmdArg(raw);
+    assert.equal(quoted, `"${raw}"`, `${raw} must be quoted verbatim`);
+  }
+  // A value ending in a backslash still needs the CRT doubling, or the child
+  // receives `trailing"` instead of `trailing\`.
+  assert.equal(quoteCmdArg("trailing\\"), '"trailing\\\\"');
+
+  // Ordinary prose percentages are not variable references and must survive.
+  assert.equal(quoteCmdArg("make it 50% faster"), '"make it 50% faster"');
+});
+
+test("quoteCmdArg refuses what cmd.exe cannot carry, rather than corrupting it", () => {
+  // The damaging case: cmd stops at the newline, so --sandbox/--deny after it
+  // were silently dropped while the run still exited 0.
+  assert.throws(() => quoteCmdArg("LINE ONE\nLINE TWO"), /newline/);
+  assert.throws(() => quoteCmdArg("LINE ONE\r\nLINE TWO"), /newline/);
+  // The leak: cmd substitutes a defined variable before the child sees it.
+  assert.throws(() => quoteCmdArg("prose about %SECRETISH% here"), /%VARIABLE%/);
+  // The injection shape: a quote breaks cmd's parity so a following & runs.
+  assert.throws(() => quoteCmdArg('hello" & echo PWNED & rem '), /cmd metacharacter/);
+  // ...but benign quoted prose is untouched.
+  assert.equal(quoteCmdArg('has "quotes" inside'), '"has \\"quotes\\" inside"');
+});
+
+test("cmdLineCanCarry routes uncarryable prompts to file transport", () => {
+  assert.equal(cmdLineCanCarry("ordinary prompt"), true);
+  assert.equal(cmdLineCanCarry("50% faster"), true);
+  assert.equal(cmdLineCanCarry("two\nlines"), false);
+  assert.equal(cmdLineCanCarry("has %APPDATA% in it"), false);
 });

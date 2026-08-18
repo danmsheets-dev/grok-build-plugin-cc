@@ -840,12 +840,25 @@ export function terminateProcessTree(pid, options = {}) {
 
     // Final verdict polls rather than sampling once — see waitForExit.
     const exited = waitForExit(pid);
+    // Survivors must include live DESCENDANTS, not just the root. The verdict
+    // was structurally incapable of reporting one, so `/stop` wrote
+    // `killTombstone: null` and printed "Stopped <id>." while a child kept
+    // running — and kept a Windows lock on the worktree.
+    //
+    // Re-check only the set we already enumerated. A fresh enumeration here
+    // would be a third CIM query on the kill path and, under load, can surface
+    // unrelated pids that were never ours — which would flip `delivered` to
+    // false for a kill that actually worked.
+    const liveDescendants = descendants.filter(
+      (childPid) => childPid !== pid && isAliveImpl(childPid)
+    );
+    const survivors = [...new Set([...(exited ? [] : [pid]), ...liveDescendants])];
     return {
       attempted: true,
-      delivered: exited,
+      delivered: exited && liveDescendants.length === 0,
       method: methods.join("+") || "taskkill",
       errorText: errorParts.join("; ") || null,
-      survivors: exited ? [] : [pid],
+      survivors,
       result: lastResult
     };
   }

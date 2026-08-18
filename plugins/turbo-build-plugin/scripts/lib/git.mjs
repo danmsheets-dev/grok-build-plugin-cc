@@ -91,6 +91,10 @@ function buildBranchComparison(cwd, baseRef) {
 }
 
 export function ensureGitRepository(cwd) {
+  const cached = readCwdMemo("toplevel", cwd);
+  if (cached) {
+    return cached;
+  }
   const result = git(cwd, ["rev-parse", "--show-toplevel"]);
   const errorCode = result.error && "code" in result.error ? result.error.code : null;
   if (errorCode === "ENOENT") {
@@ -99,7 +103,9 @@ export function ensureGitRepository(cwd) {
   if (result.status !== 0) {
     throw new Error("This command must run inside a Git repository.");
   }
-  return result.stdout.trim();
+  const root = result.stdout.trim();
+  writeCwdMemo("toplevel", cwd, root);
+  return root;
 }
 
 export function getRepoRoot(cwd) {
@@ -117,7 +123,56 @@ export function getRepoRoot(cwd) {
  * @param {string} cwd
  * @returns {string|null}
  */
+/**
+ * Per-process memo for git topology lookups.
+ *
+ * These answers cannot change for a given cwd during one bridge invocation, but
+ * they were re-resolved on every state read/write: `resolveStateDir` calls
+ * `resolveGitCommonDir` and then `resolveMainWorktreeRoot`, which calls it
+ * again. Measured at ~28 `git` spawns and ~1.4 s per state write, which is what
+ * pushed `claimJobTerminal` past the state-lock timeout under nest fan-out
+ * (recording a SUCCESSFUL run as `failed`) and what made the SessionEnd hook
+ * exceed its own 5 s budget.
+ *
+ * Only successful lookups are cached. A directory can become a repository
+ * during a process's life (tests do exactly this); the reverse does not happen,
+ * so a negative answer is never worth keeping.
+ */
+const gitResolutionCache = new Map();
+
+function cwdMemoKey(namespace, cwd) {
+  return `${namespace} ${path.resolve(String(cwd ?? "."))}`;
+}
+
+function readCwdMemo(namespace, cwd) {
+  return gitResolutionCache.get(cwdMemoKey(namespace, cwd)) ?? null;
+}
+
+function writeCwdMemo(namespace, cwd, value) {
+  if (value != null) {
+    gitResolutionCache.set(cwdMemoKey(namespace, cwd), value);
+  }
+  return value;
+}
+
+function memoizeByCwd(namespace, cwd, compute) {
+  const cached = readCwdMemo(namespace, cwd);
+  if (cached != null) {
+    return cached;
+  }
+  return writeCwdMemo(namespace, cwd, compute());
+}
+
+/** Drop the memo (tests that mutate a directory's git-ness in place). */
+export function clearGitResolutionCache() {
+  gitResolutionCache.clear();
+}
+
 export function resolveGitCommonDir(cwd) {
+  return memoizeByCwd("common-dir", cwd, () => resolveGitCommonDirUncached(cwd));
+}
+
+function resolveGitCommonDirUncached(cwd) {
   const result = git(cwd, ["rev-parse", "--git-common-dir"]);
   if (result.status !== 0 || result.error) {
     return null;
@@ -145,6 +200,10 @@ export function resolveGitCommonDir(cwd) {
  * @returns {string}
  */
 export function resolveMainWorktreeRoot(cwd) {
+  return memoizeByCwd("main-root", cwd, () => resolveMainWorktreeRootUncached(cwd));
+}
+
+function resolveMainWorktreeRootUncached(cwd) {
   const common = resolveGitCommonDir(cwd);
   if (common) {
     const base = path.basename(common);
@@ -157,6 +216,40 @@ export function resolveMainWorktreeRoot(cwd) {
   } catch {
     return path.resolve(cwd);
   }
+}
+
+/**
+ * Whether `cwd` sits inside a LINKED worktree rather than the main checkout.
+ *
+ * Job state is keyed on `--git-common-dir`, which every linked worktree shares
+ * with the main checkout, while `ensureGitRepository` returns the *local*
+ * `--show-toplevel`. `land` resolved the job with the former and the merge
+ * target with the latter, so running it from inside run A's worktree squashed
+ * run B into A and then deleted B — the only copy of B's work ended up staged
+ * in a directory about to be thrown away.
+ *
+ * @param {string} cwd
+ * @returns {{ linked: boolean, mainRoot: string, localRoot: string }}
+ */
+export function describeWorktreeContext(cwd) {
+  const mainRoot = resolveMainWorktreeRoot(cwd);
+  let localRoot = mainRoot;
+  try {
+    localRoot = ensureGitRepository(cwd);
+  } catch {
+    localRoot = mainRoot;
+  }
+  const normalize = (value) => {
+    try {
+      return fs.realpathSync.native(value);
+    } catch {
+      return path.resolve(value);
+    }
+  };
+  const a = normalize(mainRoot);
+  const b = normalize(localRoot);
+  const same = process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b;
+  return { linked: !same, mainRoot, localRoot };
 }
 
 export function detectDefaultBranch(cwd) {

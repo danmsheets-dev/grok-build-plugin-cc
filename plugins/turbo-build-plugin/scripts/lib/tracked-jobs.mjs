@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import process from "node:process";
 
+import { addUsage } from "./nest.mjs";
 import { redactSecrets, redactSecretsDeep } from "./redact.mjs";
 import {
   claimJobTerminal,
@@ -392,6 +393,11 @@ export function createJobProgressUpdater(workspaceRoot, jobId, options = {}) {
     }
   };
 
+  // Running total for this job, held in the closure. The updater is the only
+  // writer of `usage` on the active path, so a closure total is both correct
+  // and lock-free.
+  let cumulativeUsage = null;
+
   return (event) => {
     const normalized = normalizeProgressEvent(event);
     const patch = {};
@@ -422,7 +428,13 @@ export function createJobProgressUpdater(workspaceRoot, jobId, options = {}) {
     }
 
     if (normalized.usage) {
-      patch.usage = normalized.usage;
+      // Accumulate across turns instead of replacing. A verify-fix turn used to
+      // overwrite turn 1's figures, so a $4 + $4 run still recorded $4 — and a
+      // later nest-run read that stale total to size the child's budget, over-
+      // granting against the cap. `runs --json` reported the same stale figure
+      // for any live multi-turn run.
+      cumulativeUsage = addUsage(cumulativeUsage, normalized.usage) ?? normalized.usage;
+      patch.usage = cumulativeUsage;
       // R7-5: surface served model mid-run when usage carries it.
       if (normalized.usage.resolvedModel) {
         patch.resolvedModel = normalized.usage.resolvedModel;

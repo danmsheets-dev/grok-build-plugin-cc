@@ -193,3 +193,41 @@ test("parseEnvAssignments accepts a single value and rejects a malformed one", a
   assert.throws(() => parseEnvAssignments("=bar"), /KEY=VALUE/);
   assert.throws(() => parseEnvAssignments(["FOO=bar", "  =x"]), /KEY=VALUE/);
 });
+
+// Audit finding 25: split("=", 2) DISCARDS the remainder, so a --verify value
+// containing a second `=` was silently truncated and a --write run reported
+// "Verified: yes" for a weaker command than the user asked for.
+test("inline --opt=value keeps everything after the first =", () => {
+  const parsed = parseArgs(["--verify=npm test --silent=false"], {
+    valueOptions: new Set(["verify"]),
+    repeatableOptions: new Set(["verify"])
+  });
+  assert.deepEqual(parsed.options.verify, ["npm test --silent=false"]);
+
+  const cargo = parseArgs(["--verify=cargo test --features=engine"], {
+    valueOptions: new Set(["verify"]),
+    repeatableOptions: new Set(["verify"])
+  });
+  assert.deepEqual(cargo.options.verify, ["cargo test --features=engine"]);
+
+  // A value that is itself an assignment must survive intact.
+  const eq = parseArgs(["--define=A=B=C"], { valueOptions: new Set(["define"]) });
+  assert.equal(eq.options.define, "A=B=C");
+});
+
+// Audit finding 27: `\` was escapable, so a UNC path arrived one separator
+// short and path.resolve turned it into a path on the current drive.
+test("a UNC path survives argument splitting", () => {
+  const b = String.fromCharCode(92);
+  assert.deepEqual(
+    splitRawArgumentString(`--cwd ${b}${b}nas${b}team${b}repo --json`),
+    ["--cwd", `${b}${b}nas${b}team${b}repo`, "--json"]
+  );
+  // An ordinary drive path is unaffected.
+  assert.deepEqual(
+    splitRawArgumentString(`--cwd C:${b}Apps${b}repo --json`),
+    ["--cwd", `C:${b}Apps${b}repo`, "--json"]
+  );
+  // And the deliberate escaped-space feature still works.
+  assert.deepEqual(splitRawArgumentString(`keep${b} going`), ["keep going"]);
+});

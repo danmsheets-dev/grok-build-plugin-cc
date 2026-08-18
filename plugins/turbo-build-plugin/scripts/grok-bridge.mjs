@@ -12,6 +12,7 @@ import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { isHarnessLandPath, readStdinIfPiped } from "./lib/fs.mjs";
 import {
   collectReviewContext,
+  describeWorktreeContext,
   ensureGitRepository,
   getCurrentBranch,
   git,
@@ -96,8 +97,10 @@ import {
 import {
   claimJobTerminal,
   generateJobId,
+  allTerminalJobStatuses,
   isTerminalJobStatus,
   listJobs,
+  mergeChildEntry,
   patchJobIfActive,
   readJobFile,
   resolveJobFile,
@@ -268,12 +271,27 @@ const DIFF_STAT_MAX_BYTES = 1024 * 1024;
 // not less. completed-truncated / completed-blind may also hold partial work.
 // completed-noop is included so an empty isolated worktree is still cleaned
 // only by explicit land --discard / prune --include-unlanded, not by accident.
+// Verify-shaping flags a NESTED agent may never set. Kept as one list so a new
+// flag cannot be added to the CLI and silently miss the guard, which is how
+// --verify-ignore stayed open after --verify and --no-verify were closed.
+const AGENT_FORBIDDEN_VERIFY_FLAGS = Object.freeze([
+  "verify",
+  "no-verify",
+  "verify-ignore",
+  "verify-attempts",
+  "no-verify-baseline"
+]);
+
 const AWAITING_LAND_STATUSES = new Set([
   "completed",
   "completed-unverified",
   "completed-truncated",
   "completed-noop",
   "completed-blind",
+  // A parent whose nested child failed still holds its OWN committed work on
+  // its branch. Omitting it here made prune report "nothing awaiting land" and
+  // then delete that work — the false all-clear was the dangerous half.
+  "completed-with-failed-children",
   "timed-out"
 ]);
 
@@ -282,12 +300,16 @@ const AWAITING_LAND_STATUSES = new Set([
 // leak after a successful commit). Content checks (dirty worktree, unmerged
 // commits, unknown git) are the primary gate; these statuses stop doctor
 // from recommending prune --apply as the "stale worktree" fix.
-const PROTECTED_WORKTREE_STATUSES = new Set([
-  ...AWAITING_LAND_STATUSES,
-  "cancelled",
-  "failed",
-  "isolation-breached"
-]);
+// Derived, not hand-listed: every terminal status is protected unless it is
+// explicitly named safe to discard. A new status added to state.mjs is then
+// protected by default, and the burden falls on the person who wants it
+// deletable. The previous hand-written list is what let
+// `completed-with-failed-children` fall through to `--apply`.
+const SAFE_TO_DISCARD_STATUSES = new Set([]);
+
+const PROTECTED_WORKTREE_STATUSES = new Set(
+  allTerminalJobStatuses().filter((status) => !SAFE_TO_DISCARD_STATUSES.has(status))
+);
 
 function printUsage() {
   console.log(
@@ -307,6 +329,7 @@ function printUsage() {
       "      [--verify-max-buffer <megabytes>] [--verify-ignore <regex>]... [--no-verify] [--no-verify-baseline]",
       "      [--env KEY=VALUE]... [--blender-sandbox|--no-blender-sandbox] [--godot-export-smoke]",
       "      [--max-duration <seconds>] [--max-turns <n>] [--max-cost <usd>]",
+      "      [--allowed-paths <repo-relative-prefix>]...",
       "      [--prompt-file <path>] [--cwd|-C <dir>] [--json] [prompt]",
       "    Verify commands run in THE BRIDGE, never the agent, so a run cannot claim success without",
       "    having passed. A run whose verification never passes is reported completed-unverified, never",
@@ -759,7 +782,12 @@ function resolveMaxDurationSeconds(raw) {
   if (Number.isFinite(parsed) && parsed > 0) {
     return parsed;
   }
-  return null;
+  // Same reasoning as resolveMaxDurationSeconds: `--max-cost 5usd` must not
+  // silently mean "no spend ceiling".
+  throw new Error(
+    `Invalid --max-cost ${JSON.stringify(String(raw))}: expected a positive number of USD ` +
+      "(e.g. --max-cost 5). Currency suffixes are not supported."
+  );
 }
 
 function resolveMaxTurns(raw) {
@@ -774,7 +802,14 @@ function resolveMaxTurns(raw) {
   if (Number.isFinite(parsed) && parsed >= 1 && Math.floor(parsed) === parsed) {
     return parsed;
   }
-  return null;
+  // `--max-duration 30m` is NaN. Returning null there disarmed the wall-clock
+  // cap entirely, with no warning and no budget line in the header — the exact
+  // opposite of what the user asked for. --env already throws on a malformed
+  // value in this same file; do the same here.
+  throw new Error(
+    `Invalid --max-duration ${JSON.stringify(String(raw))}: expected a whole number of seconds ` +
+      "(e.g. --max-duration 1800). Units are not supported."
+  );
 }
 
 function resolveMaxCostUsd(raw) {
@@ -839,16 +874,29 @@ export async function runHeadlessAgentWithDurationBudget(
       }
       // C23: progress may not have carried agentPid yet (race before first
       // emit). Optional fallbacks: bridge worker pid, job record, etc.
-      if (getFallbackPids) {
+      //
+      // Only when we have NOTHING else. This block used to run unconditionally,
+      // and the fallbacks include the runner's OWN pid (tracked-jobs records
+      // bridgePid/pid as process.pid) — so a --max-duration timeout killed the
+      // agent and then TerminateProcess'd the bridge mid-handler: no timed-out
+      // result, no partial transcript, no commit, no terminal claim. The work
+      // sat uncommitted at HEAD == baseSha and land refused it.
+      if (targets.length === 0 && getFallbackPids) {
         try {
           for (const pid of getFallbackPids() ?? []) {
             const n = Number(pid);
-            if (Number.isFinite(n) && n > 0 && !targets.includes(n)) {
+            if (Number.isFinite(n) && n > 0 && n !== process.pid && !targets.includes(n)) {
               targets.push(n);
             }
           }
         } catch {
           // ignore fallback errors
+        }
+      }
+      // Belt and braces: never terminate ourselves, whatever the source.
+      for (let i = targets.length - 1; i >= 0; i -= 1) {
+        if (targets[i] === process.pid) {
+          targets.splice(i, 1);
         }
       }
       if (targets.length === 0) {
@@ -1386,7 +1434,22 @@ function normalizeArgv(argv) {
     }
     return splitRawArgumentString(raw);
   }
-  return argv;
+  // A slash command emitting `review --background "$ARGUMENTS"` hands us
+  // `["--background", "--base main --scope branch ..."]`. Splitting only at
+  // length===1 left that second token whole, so parseArgs binned every flag in
+  // it as one unknown key and the review silently ran against the DEFAULT base,
+  // scope and model while reporting that it had started.
+  //
+  // A token that both starts with `--` and contains whitespace is a squashed
+  // flag string; prose never looks like that (and prompts have their own
+  // --prompt-file route), so this cannot re-tokenize a user's text.
+  return argv.flatMap((token) => {
+    const raw = String(token ?? "");
+    if (raw.startsWith("--") && /\s/.test(raw.trim())) {
+      return splitRawArgumentString(raw);
+    }
+    return [raw];
+  });
 }
 
 function parseCommandInput(argv, config = {}) {
@@ -2756,12 +2819,26 @@ function collectPrunePlan(cwd, options = {}) {
     knownPaths,
     repoRoot: workspaceRoot
   });
-  /** @type {{ path: string, hasUncommittedWork: boolean, detail: string }[]} */
+  /** @type {{ path: string, hasUncommittedWork: boolean, ownershipUnverified?: boolean, detail: string }[]} */
   const orphanWorktrees = orphanScan.orphans;
   for (const orphan of orphanWorktrees) {
     if (orphan.hasUncommittedWork && !includeUnlanded) {
       awaitingLand.push({
         jobId: `(orphan)`,
+        branch: null,
+        unmergedCommits: 0,
+        detail: orphan.detail
+      });
+      continue;
+    }
+    // The worktree root is shared per volume, so a directory here may belong to
+    // a different repository. `reconcileOrphanWorktrees` drops the ones it can
+    // prove are foreign; anything it merely cannot vouch for is reported but
+    // never auto-removed, not even under --include-unlanded. A stale directory
+    // costs disk; deleting another project's live worktree costs their work.
+    if (orphan.ownershipUnverified) {
+      awaitingLand.push({
+        jobId: `(unverified)`,
         branch: null,
         unmergedCommits: 0,
         detail: orphan.detail
@@ -4322,7 +4399,10 @@ async function executeTaskRun(request) {
           request.agentPid
         ]) {
           const n = Number(value);
-          if (Number.isFinite(n) && n > 0 && !pids.includes(n)) {
+          // `bridgePid`/`pid` on the job record are the RUNNER's own pid, so a
+          // fallback kill would terminate this process before it could record
+          // the timeout, commit the worktree, or claim a terminal status.
+          if (Number.isFinite(n) && n > 0 && n !== process.pid && !pids.includes(n)) {
             pids.push(n);
           }
         }
@@ -4975,7 +5055,21 @@ async function executeTaskRun(request) {
         const { work, debris: commitDebris } = partitionWorkAndDebris(listed.entries ?? []);
         // Debris is not in the commit by definition; residual uncommitted debris
         // is collected from the worktree working tree below.
-        worktreeSide = { ...capChangedFiles(work), emptyReason: null };
+        //
+        // `listed` was ALREADY capped by listCommittedChanges, so re-capping
+        // its entries recomputed `total` from the sample: a 250-file run
+        // reported "files changed: 200" and persisted `truncated: false` — a
+        // truncated sample presented as the exact count. Carry the upstream
+        // total and truncation forward instead. When the upstream cap fired we
+        // cannot know the work/debris split beyond the sample, so the honest
+        // report is the upper bound plus `truncated: true`.
+        const cappedWorkSide = capChangedFiles(work);
+        worktreeSide = {
+          ...cappedWorkSide,
+          total: listed.truncated ? listed.total : cappedWorkSide.total,
+          truncated: cappedWorkSide.truncated || Boolean(listed.truncated),
+          emptyReason: null
+        };
         void commitDebris;
       }
     } else if (!committed.error) {
@@ -5238,10 +5332,15 @@ async function executeTaskRun(request) {
   // the same rendered trailer the user sees at the end of a foreground run.
   // Only a measured 0 trips completed-noop; a failed/absent manifest stays null
   // so we do not invent "changed nothing" for a run we could not inspect.
+  // `Number(null) === 0`, so the old `Number.isFinite(Number(total))` test was
+  // TRUE for `total: null` and turned "we could not measure" into a measured
+  // zero — the run reported "files changed: 0 / changed nothing", status
+  // completed-noop, and the user's next move was land --discard on real work.
+  // The null check has to come before the numeric one.
   const effectiveChangedFileCount =
     changedFileCount != null
       ? changedFileCount
-      : changedFiles && Number.isFinite(Number(changedFiles.total))
+      : changedFiles && changedFiles.total != null && Number.isFinite(Number(changedFiles.total))
         ? Number(changedFiles.total)
         : null;
   const durationMs = Date.now() - runStartedAtMs;
@@ -5768,25 +5867,15 @@ function linkChildOutcomeToParent(workspaceRoot, parentRunId, childJob) {
   if (!fs.existsSync(parentFile)) {
     return;
   }
-  let parent;
-  try {
-    parent = readJobFile(parentFile);
-  } catch {
-    return;
-  }
-  const children = upsertChildEntry(parent.children, buildChildSummary(childJob));
-  const active = patchJobIfActive(workspaceRoot, parentRunId, { children });
-  if (active.patched) {
-    return;
-  }
-  // Parent already terminal (or missing from the active path): still persist
-  // the linkage so `show <parent>` lists the child after both finished.
-  writeJobFile(workspaceRoot, parentRunId, {
-    ...parent,
-    children,
-    updatedAt: nowIso()
-  });
-  upsertJob(workspaceRoot, { id: parentRunId, children });
+  // Read-merge-write inside ONE lock. Reading `parent.children` outside the
+  // lock and passing the whole array to patchJobIfActive meant two concurrent
+  // children each merged into the same snapshot and the last write erased the
+  // other — a live child then existed that the parent's drain and /stop could
+  // not see. mergeChildEntry also persists for a terminal parent, so `show
+  // <parent>` still lists the child after both finished.
+  mergeChildEntry(workspaceRoot, parentRunId, (children) =>
+    upsertChildEntry(children, buildChildSummary(childJob))
+  );
 }
 
 function buildReviewJobMetadata(reviewName, target) {
@@ -5823,7 +5912,16 @@ function renderQueuedTaskLaunch(payload) {
   return `${lines.join("\n")}\n`;
 }
 
-function createBridgeJob({ prefix, kind, title, workspaceRoot, jobClass, summary, write = false }) {
+function createBridgeJob({
+  prefix,
+  kind,
+  title,
+  workspaceRoot,
+  jobClass,
+  summary,
+  write = false,
+  allowedPaths = null
+}) {
   return createJobRecord({
     id: generateJobId(prefix),
     kind,
@@ -5832,7 +5930,11 @@ function createBridgeJob({ prefix, kind, title, workspaceRoot, jobClass, summary
     workspaceRoot,
     jobClass,
     summary,
-    write
+    write,
+    // Persisted so land's containment gate has something to gate against.
+    // Without a producer the gate was unreachable and README's promise that
+    // "land refuses paths outside allowed_paths" could never hold.
+    ...(allowedPaths && allowedPaths.length > 0 ? { allowedPaths } : {})
   });
 }
 
@@ -5848,7 +5950,43 @@ function createTrackedProgress(job, options = {}) {
   };
 }
 
-function buildTaskJob(workspaceRoot, taskMetadata, write) {
+/**
+ * Repo-relative path prefixes a run may land, from repeatable `--allowed-paths`.
+ *
+ * Normalised to forward slashes and stripped of any escape attempt: an entry
+ * that is absolute or climbs out with `..` would widen the gate rather than
+ * narrow it, which is the opposite of the flag's purpose.
+ *
+ * @param {unknown} raw
+ * @returns {string[]|null} null when the flag was not passed (gate stays off)
+ */
+function normalizeAllowedPaths(raw) {
+  const list = Array.isArray(raw) ? raw : raw == null || raw === "" ? [] : [raw];
+  if (list.length === 0) {
+    return null;
+  }
+  const cleaned = [];
+  for (const entry of list) {
+    const value = String(entry ?? "")
+      .trim()
+      .split("\\")
+      .join("/")
+      .replace(/^\.\//, "");
+    if (!value) {
+      continue;
+    }
+    if (path.isAbsolute(value) || /^[A-Za-z]:/.test(value) || value.split("/").includes("..")) {
+      throw new Error(
+        `Invalid --allowed-paths ${JSON.stringify(String(entry))}: expected a repository-relative ` +
+          `path prefix (no leading slash, no drive letter, no "..").`
+      );
+    }
+    cleaned.push(value.replace(/\/+$/, ""));
+  }
+  return cleaned.length > 0 ? cleaned : null;
+}
+
+function buildTaskJob(workspaceRoot, taskMetadata, write, allowedPaths = null) {
   return createBridgeJob({
     prefix: "run",
     kind: "task",
@@ -5856,7 +5994,8 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
     workspaceRoot,
     jobClass: "task",
     summary: taskMetadata.summary,
-    write
+    write,
+    allowedPaths
   });
 }
 
@@ -6142,11 +6281,16 @@ export function enqueueBackgroundJob(cwd, job, request, options = {}) {
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "effort", "cwd"],
+    valueOptions: ["base", "scope", "model", "effort", "cwd", "focus"],
     booleanOptions: ["json", "background", "wait"],
     aliasMap: {
       m: "model"
-    }
+    },
+    // Fail loudly on an unrecognised flag rather than warning and continuing.
+    // A dropped `--base` silently reviewed the DEFAULT ref while telling the
+    // user the run had started against theirs; for a review, quietly answering
+    // a different question than the one asked is the worst outcome.
+    unknownMode: "error"
   });
 
   const cwd = resolveCommandCwd(options);
@@ -6157,7 +6301,11 @@ async function handleReviewCommand(argv, config) {
   if (!billingGate.allowed) {
     throw new Error(billingGate.message);
   }
-  const focusText = positionals.join(" ").trim();
+  // `--focus` is the unambiguous route for prose. A single argv token gets
+  // re-split by normalizeArgv, so a focus like "focus on the --base of the
+  // refactor" used to bind `base="of"` and silently diff against a bogus ref;
+  // positionals remain supported for the common flag-free case.
+  const focusText = String(options.focus ?? positionals.join(" ")).trim();
   const target = resolveReviewTarget(cwd, {
     base: options.base,
     scope: options.scope
@@ -6235,7 +6383,12 @@ export const TASK_VALUE_OPTIONS = Object.freeze([
   "max-turns",
   "max-cost",
   // Explicit programmatic caller id (also auto-detected from CLAUDECODE etc.).
-  "caller"
+  "caller",
+  // Repeatable. Repo-relative path prefixes this run is allowed to land.
+  // README has always promised that land refuses paths outside allowed_paths,
+  // but nothing ever WROTE the field, so the gate was unreachable and the
+  // promise was false. This is that producer.
+  "allowed-paths"
 ]);
 
 /**
@@ -6281,7 +6434,7 @@ export const RUN_PASSTHROUGH_FLAGS = Object.freeze([
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: [...TASK_VALUE_OPTIONS],
-    repeatableOptions: ["verify", "verify-ignore", "env"],
+    repeatableOptions: ["verify", "verify-ignore", "env", "allowed-paths"],
     booleanOptions: [
       "json",
       "write",
@@ -6321,6 +6474,7 @@ async function handleTask(argv) {
     throw new Error("Choose either --resume/--resume-last or --fresh.");
   }
   const write = Boolean(options.write);
+  const allowedPaths = normalizeAllowedPaths(options["allowed-paths"]);
 
   // Resolved from the workspace root, and BEFORE any worktree exists, so that
   // buildTaskRequest serialises a concrete command list into a background
@@ -6421,7 +6575,7 @@ async function handleTask(argv) {
     ensureGrokAvailable(cwd);
     requireTaskRequest(prompt, resumeLast);
 
-    const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+    const job = buildTaskJob(workspaceRoot, taskMetadata, write, allowedPaths);
     const request = {
       kind: "task",
       ...buildTaskRequest({
@@ -6459,7 +6613,7 @@ async function handleTask(argv) {
     return;
   }
 
-  const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+  const job = buildTaskJob(workspaceRoot, taskMetadata, write, allowedPaths);
   await runForegroundCommand(
     job,
     (progress) =>
@@ -6596,6 +6750,20 @@ async function handleNestRun(argv) {
           "run outside Hyper confinement. The child uses project/ecosystem verify only."
       );
     }
+    // One list, checked in a loop. The guard used to name exactly --verify and
+    // --no-verify, so --verify-ignore passed straight through to
+    // runVerifyCommand's ignorePatterns: a nested child could send
+    // `--verify-ignore ".*"` and make detectOutputFailures return [] for a
+    // project whose tools exit 0 while printing SCRIPT ERROR, so the grandchild
+    // reported "Verified: yes". It also bypassed the config-file trust gate.
+    for (const flag of AGENT_FORBIDDEN_VERIFY_FLAGS) {
+      if (options[flag] !== undefined) {
+        throw new Error(
+          `nest-run refuses --${flag} when called from a nested agent: verify behaviour ` +
+            "is the parent's to decide, and these flags can suppress real failures."
+        );
+      }
+    }
     if (options["no-verify"]) {
       throw new Error(
         "nest-run refuses --no-verify when called from a nested agent; " +
@@ -6694,7 +6862,9 @@ async function handleNestRun(argv) {
       : null);
 
   const taskMetadata = buildTaskRunMetadata({ prompt, resumeLast: false });
-  const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+  // Deliberately null: a nested agent may not set its own containment. The
+  // parent's land gate is the one that matters.
+  const job = buildTaskJob(workspaceRoot, taskMetadata, write, null);
   // Stamp parent linkage on the job record before enqueue so runs can group.
   job.parentRunId = parentRunId;
   job.nestDepth = childDepth;
@@ -7106,6 +7276,42 @@ function markJobLanded(workspaceRoot, jobId, storedJob, action) {
   });
 }
 
+/**
+ * Report a worktree that survived its own removal instead of claiming success.
+ *
+ * `removeWorktree` documents that the caller must surface anything it could not
+ * delete, and prune honours that — but land/discard consumed only
+ * `privateTarget`. On the routine Windows case (an editor, AV scanner, or a
+ * process whose cwd is the worktree) the directory stays, `markJobLanded` nulls
+ * `job.worktree`, and the path is then invisible to every command: prune's
+ * job-backed loop skips it and its orphan scan treats the path as known.
+ * `--discard` was worse — it printed "worktree and branch removed" when neither
+ * was.
+ *
+ * @param {{removed?: boolean, reason?: string|null, orphanedPath?: string|null}} removed
+ * @param {string} jobId
+ * @returns {{ orphaned: true, reason: string|null, path: string|null }|null}
+ */
+function noteWorktreeSurvivedRemoval(removed, jobId) {
+  if (!removed || removed.removed !== false) {
+    return null;
+  }
+  const orphanedPath = removed.orphanedPath ?? null;
+  const reason = removed.reason ?? null;
+  process.stderr.write(
+    `[turbo-build] Warning: could not remove the worktree for ${jobId}.
+` +
+      `  path: ${orphanedPath ?? "(unknown)"}
+` +
+      `  reason: ${reason ?? "(unknown)"}
+` +
+      `  The merge itself succeeded; the directory is still on disk. Close anything ` +
+      `holding it and run \`prune --apply\` to reclaim it.
+`
+  );
+  return { orphaned: true, reason, path: orphanedPath };
+}
+
 async function handleLand(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd", "into-run"],
@@ -7158,11 +7364,32 @@ async function handleLand(argv) {
     );
   }
 
-  const repoRoot = ensureGitRepository(workspaceRoot);
   const branchName = worktree.branch;
   const worktreePath = worktree.path;
   const baseSha = worktree.baseSha;
   const intoRunId = options["into-run"] ? String(options["into-run"]).trim() : "";
+
+  // Jobs resolve through --git-common-dir, which every linked worktree shares,
+  // so `land <B>` from inside run A's worktree used to find B and then merge it
+  // into A via the local --show-toplevel. A was then landed or discarded and
+  // B's only copy went with it. Merge into the MAIN checkout, and refuse
+  // outright when the caller is standing in a linked worktree — the correct
+  // target is genuinely ambiguous there, and --into-run is the explicit way to
+  // say "yes, into this run's branch".
+  const worktreeContext = describeWorktreeContext(workspaceRoot);
+  if (worktreeContext.linked && !intoRunId) {
+    throw new Error(
+      `Refusing to land from inside a linked worktree.\n` +
+        `  cwd worktree: ${worktreeContext.localRoot}\n` +
+        `  main checkout: ${worktreeContext.mainRoot}\n` +
+        `Landing here would merge into the worktree and then delete the source run.\n` +
+        `Run land from ${worktreeContext.mainRoot}, or pass --into-run <parent-id> to ` +
+        `deliberately merge into a run branch.`
+    );
+  }
+  const repoRoot = intoRunId
+    ? ensureGitRepository(workspaceRoot)
+    : worktreeContext.mainRoot;
 
   // Nested land: merge the child branch into the PARENT worktree branch, not
   // the main checkout. Refuses non-landable terminal statuses.
@@ -7313,12 +7540,13 @@ async function handleLand(argv) {
       throw new Error(recovery.message);
     }
 
-    removeWorktree({
+    const removedIntoParent = removeWorktree({
       repoRoot,
       worktreePath,
       branchName,
       deleteBranch: true
     });
+    const orphanIntoParent = noteWorktreeSurvivedRemoval(removedIntoParent, job.id);
     markJobLanded(workspaceRoot, job.id, storedJob, "apply-into-parent");
     linkChildOutcomeToParent(workspaceRoot, intoRunId, {
       id: job.id,
@@ -7336,7 +7564,8 @@ async function handleLand(argv) {
       parentRunId: intoRunId,
       parentWorktree: parentWorktreePath,
       worktree,
-      branch: branchName
+      branch: branchName,
+      worktreeOrphaned: orphanIntoParent
     };
     const text =
       `Landed nested run ${job.id} into parent ${intoRunId} worktree (${parentWorktreePath}).\n` +
@@ -7379,7 +7608,8 @@ async function handleLand(argv) {
       worktree,
       diffStat: null,
       discardedUncommitted: discardDirty,
-      privateTarget: removed.privateTarget ?? null
+      privateTarget: removed.privateTarget ?? null,
+      worktreeOrphaned: noteWorktreeSurvivedRemoval(removed, job.id)
     };
     const dirtyNote =
       discardDirty.length > 0
@@ -7426,7 +7656,26 @@ async function handleLand(argv) {
     );
   }
 
-  const diffRange = `${baseSha}..${branchName}`;
+  // Three-dot, matching what `git merge --squash` will actually stage.
+  //
+  // Two-dot compares baseSha directly to the branch tip, but the apply is a
+  // merge-base squash. If HEAD moved off baseSha since the run started (the
+  // user checked out a release branch, or reset), those disagree: the preview
+  // said "1 file changed", the >50-file refusal never fired, and the merge
+  // staged 61 files. `commands/land.md` makes that preview the approval gate,
+  // so the gate was exactly as wrong as the apply.
+  const diffRange = `${baseSha}...${branchName}`;
+  // The preview is only meaningful if baseSha is still reachable from HEAD.
+  const baseIsAncestor =
+    git(repoRoot, ["merge-base", "--is-ancestor", baseSha, "HEAD"]).status === 0;
+  if (!baseIsAncestor) {
+    process.stderr.write(
+      `[turbo-build] Warning: this run's base commit (${baseSha.slice(0, 8)}) is no longer an ` +
+        `ancestor of HEAD — the branch was moved or reset since the run started. The squash ` +
+        `will use the merge-base, so it may bring in commits this preview does not list. ` +
+        `Verify with: git diff --cached --name-only (after landing) or land --discard.\n`
+    );
+  }
   // gitChecked, not the unchecked git() wrapper: confirmed directly that a
   // stale ref (e.g. a branch already deleted by a prior land or discard)
   // makes `git diff` fail non-zero with empty stdout, and the unchecked
@@ -7574,12 +7823,13 @@ async function handleLand(argv) {
     }
     // Empty branch + clean worktree: nothing to stage. Remove the empty
     // worktree but do not claim a successful land of staged changes.
-    removeWorktree({
+    const removedEmpty = removeWorktree({
       repoRoot,
       worktreePath,
       branchName,
       deleteBranch: true
     });
+    const orphanEmpty = noteWorktreeSurvivedRemoval(removedEmpty, job.id);
     markJobLanded(workspaceRoot, job.id, storedJob, "apply-empty");
     const currentBranch = getCurrentBranch(repoRoot);
     const payload = {
@@ -7589,7 +7839,8 @@ async function handleLand(argv) {
       worktree,
       diffStat: "",
       totalBinaryFiles: 0,
-      ignoredDirtyArtifacts
+      ignoredDirtyArtifacts,
+      worktreeOrphaned: orphanEmpty
     };
     const text =
       `Nothing to land: ${branchName} has no commits beyond base (and the worktree is clean). ` +
@@ -7624,7 +7875,8 @@ async function handleLand(argv) {
     diffStat,
     totalBinaryFiles,
     ignoredDirtyArtifacts,
-    privateTarget: removed.privateTarget ?? null
+    privateTarget: removed.privateTarget ?? null,
+    worktreeOrphaned: noteWorktreeSurvivedRemoval(removed, job.id)
   };
   const text =
     (diffStat ? `${diffStat}\n\n` : "") +
@@ -8351,6 +8603,7 @@ if (isMain) {
 }
 
 export {
+  AWAITING_LAND_STATUSES,
   buildBoundedVerifyFixPrompt,
   buildDoctorReport,
   buildEcosystemChecks,
@@ -8360,6 +8613,8 @@ export {
   loadRunRules,
   main,
   normalizeDoctorCheck,
+  PROTECTED_WORKTREE_STATUSES,
   readStoredJobWithRetry,
-  renderDoctorReport
+  renderDoctorReport,
+  SAFE_TO_DISCARD_STATUSES
 };

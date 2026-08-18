@@ -69,9 +69,14 @@ test("a full config round-trips into the parsed shape", () => {
     })
   );
 
-  const loaded = loadProjectConfig(root);
+  // Load TRUSTED: this test is about the schema round-trip, and several keys
+  // (linkDirs, verifyIgnorePatterns, verifyFailurePatterns) are trust-gated
+  // because they decide what a run may do or whether a failure is seen.
+  const probe = loadProjectConfig(root);
+  const loaded = loadProjectConfig(root, { trustedHash: probe.hash });
 
   assert.equal(loaded.present, true);
+  assert.equal(loaded.trusted, true);
   assert.deepEqual(loaded.errors, []);
   assert.equal(loaded.config.ecosystem, "godot");
   assert.equal(loaded.config.verifyAttempts, 3);
@@ -447,4 +452,58 @@ test("an untrusted config can still choose the import-cache tier", () => {
   assert.equal(loaded.trusted, false);
   assert.deepEqual(loaded.config.provision, { copy: true });
   assert.deepEqual(Object.keys(loaded.untrusted), ["verify"]);
+});
+
+// Audit finding 13: these four keys are not "executable" in the narrow sense,
+// so they were applied from an UNTRUSTED .grok-build.json. Each one changes
+// what a run is allowed to do: two decide whether a failure is even seen, two
+// decide where the run writes.
+test("an untrusted project config cannot disable failure detection or redirect writes", () => {
+  const root = makeTempDir("grok-build-untrusted-");
+  fs.writeFileSync(
+    path.join(root, ".grok-build.json"),
+    JSON.stringify({
+      verifyIgnorePatterns: ["."],
+      verifyFailurePatterns: ["(x+x+)+y"],
+      linkDirs: ["../private-notes"],
+      provision: { link: { node_modules: "share", ".venv": "share" } }
+    }),
+    "utf8"
+  );
+
+  const loaded = loadProjectConfig(root, { trustedHash: null });
+  assert.equal(loaded.trusted, false);
+  for (const key of ["verifyIgnorePatterns", "verifyFailurePatterns", "linkDirs"]) {
+    assert.equal(loaded.config[key], undefined, `${key} must not be active while untrusted`);
+    assert.ok(loaded.untrusted[key] !== undefined, `${key} must be withheld, not silently dropped`);
+  }
+
+  // `provision` is clamped, not blocked: it may only ADD isolation. A "share"
+  // tier would swap the mandated private copies for junctions into the user's
+  // real checkout, so it is withheld while safe sub-keys survive.
+  assert.equal(
+    loaded.config.provision?.link,
+    undefined,
+    "no share-tier link may survive from an untrusted config"
+  );
+  assert.deepEqual(loaded.untrusted.provision, {
+    link: { node_modules: "share", ".venv": "share" }
+  });
+});
+
+test("an untrusted config may still ask for MORE isolation", () => {
+  const root = makeTempDir("grok-build-untrusted-copy-");
+  fs.writeFileSync(
+    path.join(root, ".grok-build.json"),
+    JSON.stringify({ provision: { copy: true, link: { node_modules: "copy", cache: "share" } } }),
+    "utf8"
+  );
+  const loaded = loadProjectConfig(root, { trustedHash: null });
+  assert.equal(loaded.config.provision.copy, true, "copy is strictly safer and stays");
+  assert.deepEqual(
+    loaded.config.provision.link,
+    { node_modules: "copy" },
+    "copy tier survives; share tier does not"
+  );
+  assert.deepEqual(loaded.untrusted.provision, { link: { cache: "share" } });
 });

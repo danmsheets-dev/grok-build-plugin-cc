@@ -379,6 +379,12 @@ export function formatUsageTotals(jobs) {
     if (usage.costUsd != null && Number.isFinite(Number(usage.costUsd))) {
       costUsd += Number(usage.costUsd);
       sawCost = true;
+    } else {
+      // Counted in `runs` but contributing nothing to the total. Without this
+      // the line read "3 runs … $2.0000" as if that were the whole spend. The
+      // per-run formatter has always had a "cost: unavailable" branch; this is
+      // the same honesty at the session level.
+      costPartial = true;
     }
   }
 
@@ -1039,7 +1045,9 @@ export function countChangedFilesForHonesty(meta = {}) {
     const main = Number(changed.mainTree?.total ?? changed.mainTree?.entries?.length ?? 0) || 0;
     return wt + main;
   }
-  if (Number.isFinite(Number(changed.total))) {
+  // Same `Number(null) === 0` trap as the bridge: an unmeasurable manifest must
+  // stay null when a stored run is re-rendered, not become a confident 0.
+  if (changed.total != null && Number.isFinite(Number(changed.total))) {
     return Number(changed.total);
   }
   if (Array.isArray(changed.entries)) {
@@ -1073,6 +1081,9 @@ export function formatVerifyRatioLine(meta = {}) {
     : Array.isArray(meta.verify?.baselines)
       ? meta.verify.baselines
       : null;
+  // `baselineSkipped` reached the manifest but never the human trailer, so
+  // --no-verify-baseline rendered as "baseline 0/N".
+  const baselineSkipped = Boolean(meta.baselineSkipped ?? meta.verify?.baselineSkipped);
 
   if (!results || results.length === 0) {
     // No per-command breakdown — fall back only when we know verification ran.
@@ -1088,7 +1099,11 @@ export function formatVerifyRatioLine(meta = {}) {
   const total = results.length;
   const passed = results.filter((entry) => entry && entry.ok === true).length;
   let line = `verify ${passed}/${total}`;
-  if (baselines && baselines.length > 0) {
+  if (baselineSkipped) {
+    // "baseline 0/N" reads as "all N commands were already broken", which
+    // asserts a measurement that was deliberately not taken.
+    line += " (baseline skipped)";
+  } else if (baselines && baselines.length > 0) {
     const baselineTotal = baselines.length;
     const baselinePassed = baselines.filter((entry) => entry && entry.ok === true).length;
     line += ` (baseline ${baselinePassed}/${baselineTotal})`;

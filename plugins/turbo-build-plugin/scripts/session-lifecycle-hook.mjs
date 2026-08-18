@@ -2,6 +2,7 @@
 
 import fs from "node:fs";
 import process from "node:process";
+import { pathToFileURL } from "node:url";
 
 import { terminateProcessTree } from "./lib/process.mjs";
 import {
@@ -188,9 +189,69 @@ function handleSessionStart(input) {
   appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
 }
 
+/**
+ * SessionEnd reasons that mean the CLI process is actually going away.
+ *
+ * Claude Code also fires SessionEnd for in-process events such as `/clear`,
+ * which frees context but leaves the CLI — and the user's background runs —
+ * very much alive. Treating those like a real exit cancelled and taskkilled
+ * paid runs mid-turn and then deleted their job files and logs, so `/runs`
+ * came back empty. Anything not recognised here is treated as NOT-an-exit:
+ * detaching a job from a dead session is recoverable, killing a live one is
+ * not.
+ */
+const EXIT_REASONS = new Set(["exit", "logout", "shutdown", "quit", "other"]);
+
+export function sessionEndEndsProcess(reason) {
+  if (reason == null || String(reason).trim() === "") {
+    // No reason field at all: the historical contract, and the only safe read
+    // is that the process is exiting.
+    return true;
+  }
+  return EXIT_REASONS.has(String(reason).trim().toLowerCase());
+}
+
 async function handleSessionEnd(input) {
   const cwd = input.cwd || process.cwd();
-  cleanupSessionJobs(cwd, input.session_id || process.env[SESSION_ID_ENV]);
+  const sessionId = input.session_id || process.env[SESSION_ID_ENV];
+  if (!sessionEndEndsProcess(input.reason)) {
+    // `/clear` and friends: keep the work, just stop treating it as owned by a
+    // session id that will never be seen again.
+    detachSessionJobs(cwd, sessionId);
+    return;
+  }
+  cleanupSessionJobs(cwd, sessionId);
+}
+
+/**
+ * Re-key a session's jobs to `sessionId: null` without killing or deleting.
+ *
+ * Mirrors the retention branch of `cleanupSessionJobs`, but applies to every
+ * job rather than only those with a live worktree, and never terminates.
+ */
+function detachSessionJobs(cwd, sessionId) {
+  if (!cwd || !sessionId) {
+    return;
+  }
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const stateFile = resolveStateFile(workspaceRoot);
+  if (!fs.existsSync(stateFile)) {
+    return;
+  }
+  updateState(workspaceRoot, (state) => {
+    state.jobs = state.jobs.map((job) => {
+      if (job.sessionId !== sessionId) {
+        return job;
+      }
+      const detached = { ...job, sessionId: null, sessionEnded: true };
+      try {
+        writeJobFile(workspaceRoot, job.id, detached);
+      } catch {
+        // Index retention is the critical half; job-file best-effort.
+      }
+      return detached;
+    });
+  });
 }
 
 async function main() {
@@ -207,7 +268,15 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-  process.exit(1);
-});
+// Only run the hook when this file IS the entry point. Without the guard,
+// importing it (to unit-test a pure helper) executes main(), which blocks
+// forever reading hook input from stdin.
+const invokedDirectly =
+  process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url;
+
+if (invokedDirectly) {
+  main().catch((error) => {
+    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
+    process.exit(1);
+  });
+}

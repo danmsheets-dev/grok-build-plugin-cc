@@ -202,7 +202,7 @@ test("formatIsolationHeaderLine names ACTIVE/INACTIVE and source", () => {
       baseSha: "abcdef123456",
       source: "forced-programmatic"
     }),
-    /Isolation: ACTIVE \(worktree \/wt, branch grok-build\/r1, base abcdef1\) \[forced-programmatic\]/
+    /Isolation: ACTIVE \(worktree \/wt, branch turbo-build\/r1, base abcdef1\) \[forced-programmatic\]/
   );
   assert.match(
     formatIsolationHeaderLine({
@@ -895,8 +895,36 @@ test("terminateProcessTree reports survivors when process stays alive", () => {
   });
 
   assert.equal(outcome.delivered, false);
-  assert.deepEqual(outcome.survivors, [42]);
+  // Audit finding 23: survivors used to be `exited ? [] : [pid]`, so it could
+  // structurally only ever name the ROOT — even though the live-descendant set
+  // was computed twice on the way here. `/stop` therefore wrote
+  // `killTombstone: null` and printed "Stopped <id>." while a child kept
+  // running and kept a Windows lock on the worktree.
+  assert.deepEqual(
+    [...outcome.survivors].sort((a, b) => a - b),
+    [42, 88, 99],
+    "a live descendant is a survivor, not just the root"
+  );
   assert.ok(outcome.errorText);
+});
+
+test("terminateProcessTree reports a live DESCENDANT even when the root died", () => {
+  // The dangerous half: the root exits, so the old verdict said delivered:true
+  // with no survivors, while a grandchild kept the worktree locked.
+  const outcome = terminateProcessTree(42, {
+    platform: "win32",
+    settleMs: 0,
+    isAliveImpl: (pid) => pid !== 42,
+    runCommandImpl(command, args) {
+      if (command === "powershell" && String(args).includes("Get-CimInstance")) {
+        return { command, args, status: 0, signal: null, stdout: "99", stderr: "", error: null };
+      }
+      return { command, args, status: 0, signal: null, stdout: "", stderr: "", error: null };
+    }
+  });
+
+  assert.deepEqual(outcome.survivors, [99]);
+  assert.equal(outcome.delivered, false, "a surviving descendant is not a delivered kill");
 });
 
 /* -------------------------------------------------------------------------

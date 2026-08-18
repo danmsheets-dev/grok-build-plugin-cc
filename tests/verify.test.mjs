@@ -23,6 +23,7 @@ import {
   runVerifyCommand,
   summarizeFailures
 } from "../plugins/turbo-build-plugin/scripts/lib/verify.mjs";
+import { MAX_USER_PATTERN_LENGTH } from "../plugins/turbo-build-plugin/scripts/lib/verify.mjs";
 
 function sleep(ms) {
   return new Promise((resolve) => {
@@ -1382,4 +1383,34 @@ test("a skipped baseline still yields to a genuine infrastructure fault", () => 
     timedOut: true
   });
   assert.equal(timedOut.reason, "verify-timed-out");
+});
+
+// Audit finding 13 (ReDoS half): verifyFailurePatterns is .test()ed against
+// every output line, so a nested-quantifier pattern turned one 30-char line
+// into ~40 s. Reject it at compile time instead.
+test("compileUserPatterns rejects catastrophically backtracking patterns", () => {
+  const warnings = [];
+  const started = Date.now();
+  const compiled = compileUserPatterns(["(x+x+)+y"], {
+    onWarning: (message) => warnings.push(message)
+  });
+  const elapsed = Date.now() - started;
+
+  assert.deepEqual(compiled, [], "the pattern must not be compiled into the run");
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /backtracks catastrophically/);
+  assert.ok(elapsed < 5000, `rejection must be cheap, took ${elapsed}ms`);
+});
+
+test("compileUserPatterns keeps ordinary patterns and bounds the set", () => {
+  const ok = compileUserPatterns(["SCRIPT ERROR", "^\s*error:"], {});
+  assert.equal(ok.length, 2);
+  assert.ok(ok[0].test("SCRIPT ERROR: Parse Error"));
+
+  const warnings = [];
+  const tooLong = compileUserPatterns(["a".repeat(MAX_USER_PATTERN_LENGTH + 1)], {
+    onWarning: (message) => warnings.push(message)
+  });
+  assert.deepEqual(tooLong, []);
+  assert.match(warnings[0], /longer than/);
 });

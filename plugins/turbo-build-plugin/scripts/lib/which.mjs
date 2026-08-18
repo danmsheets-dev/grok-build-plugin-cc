@@ -114,6 +114,19 @@ function quoteWindowsArg(arg) {
   if (value !== "" && !/[\s"]/.test(value)) {
     return value;
   }
+  return quoteWindowsArgAlways(value);
+}
+
+/**
+ * The CRT quoting rule with no bare-value short-circuit.
+ *
+ * The cmd path needs every value quoted (so `&` and friends stay inert through
+ * cmd's two parses), and it must still get the backslash doubling right — a
+ * value ending in `\` would otherwise escape the closing quote and the child
+ * would receive `trailing"`.
+ */
+function quoteWindowsArgAlways(arg) {
+  const value = String(arg ?? "");
   let result = "";
   let backslashes = 0;
   for (const char of value) {
@@ -133,6 +146,103 @@ function quoteWindowsArg(arg) {
   }
   result += "\\".repeat(backslashes);
   return `"${result}"`;
+}
+
+/**
+ * Thrown when an argument cannot be represented safely on a cmd.exe line.
+ *
+ * Failing loudly is the point. The alternative that shipped was cmd silently
+ * truncating the command line at the first newline, which dropped
+ * `--sandbox read-only`, `--deny Edit(*)` and `--permission-mode plan` while
+ * the run still exited 0 and reported success.
+ */
+export class CmdArgumentError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "CmdArgumentError";
+  }
+}
+
+/**
+ * Quote one argument for **cmd.exe's** grammar, not the C runtime's.
+ *
+ * `quoteWindowsArg` implements the CRT rule, which is right for CreateProcess
+ * but wrong here: the string is handed to `cmd.exe /d /s /c "<line>"`, and cmd
+ * parses first. cmd does not honour backslash escapes — it tracks quote parity
+ * — so a `"` inside a value ends the quoted run and everything after `&` is a
+ * new command. cmd also expands `%VAR%` and treats `& | < > ^` as operators
+ * before the CRT ever sees the line.
+ *
+ * Rules applied here:
+ *  - a `"` inside a quoted value is doubled (`""`), which is cmd's own escape;
+ *  - every value is quoted, never bare, so `&`, `^`, `(`, `)` cannot act;
+ *  - CR/LF is rejected outright — cmd's line ends there and no quoting saves it;
+ *  - `%IDENT%` is rejected, because there is no way to escape it here.
+ *
+ * On the `%` rule specifically, measured rather than assumed: cmd expands
+ * `%NAME%` only when NAME is a *defined* variable. A bare `%` ("50% faster")
+ * and an undefined reference both survive verbatim, so ordinary prose is left
+ * alone; only an identifier-shaped reference is refused. The batch-file escape
+ * `%%` does NOT work on a `cmd /c` line — verified — so rejecting is the only
+ * fail-closed option. Callers with free-form text should use file transport.
+ */
+const CMD_VARIABLE_REFERENCE = /%[A-Za-z_][A-Za-z0-9_]*%/;
+
+/**
+ * Whether a value can round-trip through a `cmd.exe /c` line unchanged.
+ *
+ * Callers use this to choose file transport BEFORE building argv, so a prompt
+ * containing a newline or a `%VAR%` is spilled to `--prompt-file` instead of
+ * failing the run in `quoteCmdArg`.
+ */
+export function cmdLineCanCarry(value) {
+  const text = String(value ?? "");
+  return !/[\r\n]/.test(text) && !CMD_VARIABLE_REFERENCE.test(text);
+}
+
+export function quoteCmdArg(arg) {
+  const value = String(arg ?? "");
+  if (/[\r\n]/.test(value)) {
+    throw new CmdArgumentError(
+      "Argument contains a newline, which cmd.exe cannot carry: everything after " +
+        "the first line would be silently discarded. Pass it via a file instead " +
+        "(--prompt-file / --rules-file)."
+    );
+  }
+  if (CMD_VARIABLE_REFERENCE.test(value)) {
+    throw new CmdArgumentError(
+      "Argument contains a %VARIABLE% reference, which cmd.exe would expand " +
+        "before the child sees it (leaking the variable's value into the " +
+        "argument). Carets do not escape %, because expansion happens first. " +
+        "Pass it via a file instead (--prompt-file / --rules-file)."
+    );
+  }
+  // A `.cmd` shim means the line is parsed TWICE by cmd — once for `/c`, then
+  // again inside the shim when `%*` is expanded — before the child's C runtime
+  // parses it. Measured, not assumed: caret escaping does not survive that,
+  // because the first pass consumes the caret and the second sees a bare
+  // metacharacter.
+  //
+  // What does survive is a cmd-quoted region: quotes are preserved through both
+  // passes, and everything inside them is inert to cmd. So the rule is to
+  // ALWAYS quote. `quoteWindowsArg` returns a short value bare, which is what
+  // exposed `&` in an ordinary Windows path like `C:\dev\R&D` and produced a
+  // deny rule matching nothing.
+  const alwaysQuoted = quoteWindowsArgAlways(value);
+
+  // The one shape that cannot be encoded: an embedded quote breaks cmd's parity
+  // (cmd counts quotes; it does not honour the CRT's `\"`), so a following `&`
+  // starts a new command on the host. Benign quoted text is unaffected — it
+  // only matters when a metacharacter follows.
+  if (value.includes('"') && /[&|<>^]/.test(value)) {
+    throw new CmdArgumentError(
+      "Argument contains both a quote and a cmd metacharacter (& | < > ^). That " +
+        "combination breaks cmd.exe's quote tracking and would execute the rest " +
+        "as a separate command. Pass it via a file instead (--prompt-file / " +
+        "--rules-file)."
+    );
+  }
+  return alwaysQuoted;
 }
 
 function isNodeShebangScript(filePath) {
@@ -182,7 +292,7 @@ export function resolveSpawnInvocation(command, args = [], env = process.env, pl
     // ships a .cmd wrapper for every tool (eslint.cmd, jest.cmd, tsc.cmd...)
     // alongside its POSIX shim, so resolving to it correctly (see above) is
     // not enough on its own - it still has to be routed through cmd.exe.
-    const commandLine = [executable, ...argList].map(quoteWindowsArg).join(" ");
+    const commandLine = [executable, ...argList].map(quoteCmdArg).join(" ");
     return {
       executable: env?.ComSpec || "cmd.exe",
       args: ["/d", "/s", "/c", `"${commandLine}"`],

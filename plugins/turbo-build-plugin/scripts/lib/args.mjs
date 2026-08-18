@@ -32,7 +32,15 @@ export function parseArgs(argv, config = {}) {
     }
 
     if (token.startsWith("--")) {
-      const [rawKey, inlineValue] = token.slice(2).split("=", 2);
+      // indexOf/slice, not split("=", 2): JS's split limit DISCARDS the
+      // remainder rather than keeping it, so `--verify="npm test --silent=false"`
+      // stored `npm test --silent` and a --write run then reported "Verified:
+      // yes" for a weaker command than the user asked for. The layer above
+      // already uses indexOf for exactly this reason.
+      const body = token.slice(2);
+      const eq = body.indexOf("=");
+      const rawKey = eq === -1 ? body : body.slice(0, eq);
+      const inlineValue = eq === -1 ? undefined : body.slice(eq + 1);
       const key = aliasMap[rawKey] ?? rawKey;
 
       if (booleanOptions.has(key)) {
@@ -102,7 +110,19 @@ export function parseArgs(argv, config = {}) {
   return { options, positionals, unknown };
 }
 
-const ESCAPABLE_NEXT = /[\s'"\\]/;
+// Backslash escapes whitespace and quotes — but NOT another backslash.
+//
+// Dropping `\\` fixes UNC paths: `--cwd \\nas\repo` used to arrive one
+// separator short as `\nas\repo`, and path.resolve then turned it into a path
+// on the current drive. Nothing needs `\\` to mean a literal backslash here,
+// because a lone backslash is already literal unless it precedes whitespace or
+// a quote.
+//
+// Escaping whitespace stays: `keep\ going` as one token is deliberate and
+// tested. The consequence is that a Windows path ending in a separator has to
+// be quoted — `--cwd "C:\Apps\repo\" --json` — because `C:\Apps\repo\ --json`
+// is genuinely ambiguous with that feature.
+const ESCAPABLE_NEXT = /[\s'"]/;
 
 export function splitRawArgumentString(raw) {
   const tokens = [];

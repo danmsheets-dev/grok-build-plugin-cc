@@ -352,6 +352,22 @@ export function isTerminalJobStatus(status) {
   return TERMINAL_STATUSES.has(status);
 }
 
+/**
+ * Every terminal status, for callers that must enumerate them exhaustively.
+ *
+ * `prune` used to keep its own hand-written list of statuses whose worktree is
+ * worth protecting, and `completed-with-failed-children` was never added to it
+ * — so a parent run whose nested child failed was reported as "nothing awaiting
+ * land" and then had its committed work deleted by `prune --apply`. Deriving
+ * from this set means a status added here is protected by default, and the
+ * exception list is what has to be justified.
+ *
+ * @returns {string[]}
+ */
+export function allTerminalJobStatuses() {
+  return [...TERMINAL_STATUSES];
+}
+
 /** Fields the shared index must mirror so `runs --json` does not show null for values that only live in jobs/<id>.json. */
 const INDEX_TERMINAL_MIRROR_FIELDS = [
   "usage",
@@ -524,6 +540,42 @@ export function claimJobTerminal(cwd, jobId, nextStatus, patch = {}) {
 }
 
 /** Patch non-terminal job under lock; no-op if missing/terminal. */
+/**
+ * Merge one child entry into a parent's `children` under a SINGLE lock.
+ *
+ * The caller used to read `parent.children` outside any lock, merge in memory,
+ * then hand the whole array to `patchJobIfActive`. With fan-out, child A's
+ * terminal report and the registration of child B both read `[A]`, and the last
+ * write won — erasing B. B stayed live but absent from `parent.children`, so
+ * the parent's drain never waited for or cancelled it and `/stop <parent>`
+ * reported success while B's agent and worktree kept running.
+ *
+ * `mergeChildren` receives the CURRENT array (read inside the lock) and returns
+ * the next one.
+ *
+ * @param {string} cwd
+ * @param {string} parentRunId
+ * @param {(children: any[]) => any[]} mergeChildren
+ * @returns {{ patched: boolean, status: string|null, job: any|null, reason?: string }}
+ */
+export function mergeChildEntry(cwd, parentRunId, mergeChildren) {
+  return withStateLock(cwd, () => {
+    const state = loadState(cwd);
+    const existingFile = readJobFileIfPresent(cwd, parentRunId);
+    const indexJob = state.jobs.find((job) => job.id === parentRunId) ?? null;
+    const existing = existingFile ?? indexJob;
+    if (!existing) {
+      return { patched: false, status: null, job: null, reason: "missing" };
+    }
+    const children = mergeChildren(Array.isArray(existing.children) ? existing.children : []);
+    const next = { ...existing, children, updatedAt: nowIso() };
+    writeJobFile(cwd, parentRunId, next);
+    upsertJobInState(state, { id: parentRunId, children });
+    saveStateUnlocked(cwd, state);
+    return { patched: true, status: next.status ?? null, job: next };
+  });
+}
+
 export function patchJobIfActive(cwd, jobId, patch = {}) {
   return withStateLock(cwd, () => {
     const state = loadState(cwd);
@@ -635,8 +687,70 @@ export function loadState(cwd) {
     fs.renameSync(stateFile, quarantinePath);
   } catch {
   }
+
+  // Rebuild the index from the per-job records rather than reporting an empty
+  // world. `jobs/<id>.json` is written independently of state.json, so after a
+  // truncated index write those files are usually intact — and each one may
+  // name a worktree holding unmerged commits. Throwing (or returning []) made
+  // every one of those permanently unreachable by runs/show/land/prune/doctor,
+  // which is the same "never silently lose unlanded work" invariant the
+  // eviction guard above protects.
+  const rebuilt = rebuildJobsFromDisk(cwd);
+  if (rebuilt.length > 0) {
+    process.stderr?.write?.(
+      `[turbo-build] Bridge state index was corrupt and has been quarantined to ` +
+        `${quarantinePath}; rebuilt ${rebuilt.length} job record(s) from disk.
+`
+    );
+    return { ...defaultState(), jobs: rebuilt };
+  }
+
   throw new Error(
     `Bridge state file is corrupt and was quarantined${quarantinePath ? ` to ${quarantinePath}` : ""}: ${parseError?.message ?? "unparseable"}`
+  );
+}
+
+/**
+ * Read every `jobs/<id>.json` under the state dir, newest first.
+ *
+ * Best-effort by design: an unreadable or malformed individual record is
+ * skipped rather than failing the rebuild.
+ *
+ * @param {string} cwd
+ * @returns {any[]}
+ */
+function rebuildJobsFromDisk(cwd) {
+  const jobs = [];
+  for (const dir of resolveStateDirCandidates(cwd)) {
+    const jobsDir = path.join(dir, JOBS_DIR_NAME);
+    let names;
+    try {
+      names = fs.readdirSync(jobsDir);
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      if (!name.endsWith(".json")) {
+        continue;
+      }
+      try {
+        const parsed = JSON.parse(fs.readFileSync(path.join(jobsDir, name), "utf8"));
+        if (parsed && typeof parsed === "object" && parsed.id) {
+          jobs.push(parsed);
+        }
+      } catch {
+        // Skip this record; the rest of the rebuild is still worth having.
+      }
+    }
+  }
+  const byId = new Map();
+  for (const job of jobs) {
+    if (!byId.has(job.id)) {
+      byId.set(job.id, job);
+    }
+  }
+  return [...byId.values()].sort((left, right) =>
+    String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? ""))
   );
 }
 
@@ -685,7 +799,16 @@ function pruneJobs(jobs) {
   const sorted = [...jobs].sort(
     (left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? ""))
   );
-  return sorted.filter((job, index) => index < MAX_JOBS || jobHasLiveWorktree(job));
+  // A non-terminal job is never evictable, whatever its age. Eviction unlinks
+  // the job file AND its live log, so evicting a running job made it invisible
+  // to stop/wait/show/runs and to the SessionEnd hook — the agent kept running
+  // and kept spending with no way left to reach it. The worktree check below
+  // does not cover it: a --no-isolate run, or one that has not created its
+  // worktree yet, has none.
+  return sorted.filter(
+    (job, index) =>
+      index < MAX_JOBS || jobHasLiveWorktree(job) || !isTerminalJobStatus(job.status)
+  );
 }
 
 function removeFileIfExists(filePath) {

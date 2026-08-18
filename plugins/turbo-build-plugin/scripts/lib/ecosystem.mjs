@@ -125,7 +125,7 @@ function detectRepositoryVerifyEntryPoint(projectAbs, projectDir, io, packageInf
   return null;
 }
 
-function verifyEntryPointCommand(entryPoint, descriptor, options = {}) {
+export function verifyEntryPointCommand(entryPoint, descriptor, options = {}) {
   if (!entryPoint) {
     return null;
   }
@@ -135,13 +135,44 @@ function verifyEntryPointCommand(entryPoint, descriptor, options = {}) {
   const platform = options.platform ?? process.platform;
   switch (entryPoint.kind) {
     case "run_tests.ps1":
+      // quoteCommandPath only quotes on whitespace, and its own contract says
+      // callers must pre-filter with SAFE_COMMAND_PATH_PATTERN. Without that,
+      // an ordinary folder like `R&D/` reached cmd.exe and split the command.
+      if (!SAFE_COMMAND_PATH_PATTERN.test(String(entryPoint.path ?? ""))) {
+        return null;
+      }
       return `${platform === "win32" ? "powershell" : "pwsh"} -NoProfile -ExecutionPolicy Bypass -File ${quoteCommandPath(entryPoint.path)}`;
-    case "make":
-      return `make ${entryPoint.target}`;
-    case "just":
-      return `just ${entryPoint.target}`;
+    case "make": {
+      // `make <target>` with cwd = repo ROOT reads the ROOT Makefile, so a
+      // monorepo's backend/Makefile test target was never run and the run
+      // reported "verified" against a suite that never touched the changed
+      // code. Verify always executes from the workspace root, so the project
+      // directory has to be named explicitly.
+      if (projectDir === ".") {
+        return `make ${entryPoint.target}`;
+      }
+      if (!SAFE_COMMAND_PATH_PATTERN.test(projectDir)) {
+        return null;
+      }
+      return `make -C ${quoteCommandPath(projectDir)} ${entryPoint.target}`;
+    }
+    case "just": {
+      if (projectDir === ".") {
+        return `just ${entryPoint.target}`;
+      }
+      if (!SAFE_COMMAND_PATH_PATTERN.test(projectDir)) {
+        return null;
+      }
+      return `just --justfile ${quoteCommandPath(`${projectDir}/justfile`)} ${entryPoint.target}`;
+    }
     case "tox.ini":
-      return projectDir === "." ? "tox" : `tox -c ${quoteCommandPath(entryPoint.path)}`;
+      if (projectDir === ".") {
+        return "tox";
+      }
+      if (!SAFE_COMMAND_PATH_PATTERN.test(String(entryPoint.path ?? ""))) {
+        return null;
+      }
+      return `tox -c ${quoteCommandPath(entryPoint.path)}`;
     case "npm-script": {
       const pm = descriptor?.packageManager || "npm";
       const prefix = nodePrefixFlag(pm, projectDir);
